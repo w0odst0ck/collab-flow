@@ -29,7 +29,8 @@ jobs:
 
       - name: Deny-list (no private identifiers / secrets)
         run: |
-          if grep -rnE --exclude-dir=.git '/home/[^~]|sk-[A-Za-z0-9]{10}|private-placeholder' scripts/ config/ templates/ tests/ README.md; then
+          # 扫生产区（tests/ 含故意构造的测试 key/临时 HOME，内部已有 L294 自查）
+          if grep -rnE '/home/[^~]|sk-[A-Za-z0-9]{10}|private-placeholder' scripts/ config/ templates/ README.md; then
             echo "私有标识/密钥泄露!"; exit 1
           fi
           echo "deny-list OK"
