@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# flow-config —— collab-flow 配置加载层入口(P1)
+#
+# 职责:解析 defaults + user config → 合并/校验/渲染 DSH_DESIGN_* env → exec dsh-design。
+# 合并优先级:CLI flag > env(已设置) > user config > defaults(§2.5:环境已设即跳过)。
+# 参数与退出码全透传 dsh-design(含 124 超时);配置错误一律 exit 2(fail-closed)。
+#
+# 自身可覆盖 env(测试/安装用):
+#   COLLABFLOW_CONFIG  用户配置路径(默认 $HOME/.config/collabflow/config.yaml)
+#   COLLABFLOW_DEFAULTS 默认配置路径(默认 $ROOT/config/defaults.yaml)
+#   FLOW_DSH_DESIGN    被 exec 的 dsh-design 路径(默认 $ROOT/scripts/dsh-design)
+
+set -uo pipefail   # 不 set -x(红线:防 key 泄露);配置错误由 core 判定后 exit 2
+
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+ROOT="$(dirname "$SCRIPT_DIR")"
+DEFAULTS="${COLLABFLOW_DEFAULTS:-$ROOT/config/defaults.yaml}"
+USERCFG="${COLLABFLOW_CONFIG:-$HOME/.config/collabflow/config.yaml}"
+DSHDESIGN="${FLOW_DSH_DESIGN:-$ROOT/scripts/dsh-design}"
+
+TMP_ENV="$(mktemp)" || { echo "错误: 无法创建临时文件" >&2; exit 2; }
+trap 'rm -f "$TMP_ENV"' EXIT
+
+python3 "$SCRIPT_DIR/flow-config-core.py" render "$DEFAULTS" "$USERCFG" "$TMP_ENV" || exit 2
+chmod 600 "$TMP_ENV"   # 纵深防御：env 文件仅本用户可读
+source "$TMP_ENV"
+rm -f "$TMP_ENV"          # exec 前清理（exec 后 EXIT trap 不触发，避免 /tmp 残留）
+
+exec "$DSHDESIGN" "$@"

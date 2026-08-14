@@ -1,0 +1,15 @@
+# 用户级覆盖示例:复制到 ~/.config/collabflow/config.yaml 后按需修改。
+# 只写与 defaults 的差异;个人/私有信息只允许出现在此文件(私有仓/本地)。
+version: 1
+roles:
+  designer:
+    timeout_s: 3600            # 覆盖默认 1800
+    prices:                    # 启用金额估算(官方价目表校准后填写)
+      input: 2.0
+      output: 8.0
+      cache_read: 0.5
+      reasoning: 2.0
+paths:
+  dsh_bin: /opt/node/bin/dsh   # 覆盖二进制路径
+# 注意:key 字段严禁明文。只能写 ${DEEPSEEK_API_KEY} 引用;
+# 真实 key 放环境变量或 key.source 指向的 dotenv 文件。

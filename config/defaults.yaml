@@ -1,0 +1,39 @@
+# =============================================================================
+# defaults.yaml —— collab-flow 全局默认配置(公开仓,零个人标识)
+#
+# 定位:flow-config 加载层的最低优先级配置源。每个值必须与 scripts/dsh-design
+#       的历史默认一致(兼容性红线)。本文件绝不出现:人名、真实 home 用户名
+#       (一律用 ~)、真实项目路径、明文 key。
+#
+# 合并优先级(P1 实现 user+defaults 两级;project/work-item 留待 P2+):
+#   CLI flag > env(已设置) > user config(~/.config/collabflow/config.yaml) > 本文件
+# =============================================================================
+
+version: 1                     # 配置 schema 主版本;flow-config 拒绝未知主版本
+
+roles:
+  designer:                    # 设计师角色(P1 唯一角色;critic/executor/approver 见 P2+)
+    adapter: dsh-designer      # 适配器名(对应架构 §2.1 RoleAdapter.id)
+    model:
+      pro: deepseek-v4-pro     # 强制 pro 模型(红线:方案必须 pro 产出)
+      flash: deepseek-v4-flash # flash 模型(仅用于「禁止」校验,绝不主动选用)
+      provider: deepseek-official  # 写入 pro.patch.yml 的 config.provider
+    timeout_s: 1800            # dsh 运行超时(秒);pro 推理慢,需放宽
+    permission: read-only      # 沙箱权限;红线:默认只读,仅 workspace-write 可选
+    patch:
+      path: ~/.config/dsh-design/pro.patch.yml  # pro 强制补丁路径(缺失时自愈生成)
+    key:
+      env_ref: ${DEEPSEEK_API_KEY}  # 红线:只允许环境变量引用,禁止明文;P1 仅支持此绑定
+      source: ~/.reasonix/.env      # key 兜底来源(含 DEEPSEEK_API_KEY=... 的 dotenv)
+    prices: null               # 价格表(元/百万 token);null=关闭金额估算(与现状一致)
+                               # 启用示例(发布前以官方价目表校准):
+                               #   prices:
+                               #     input: 2.0
+                               #     output: 8.0
+                               #     cache_read: 0.5
+                               #     reasoning: 2.0
+
+paths:
+  dsh_bin: dsh                 # dsh 可执行(DSH_BIN;可 "npx --yes dsh")
+  dsh_home: ~/.dsh             # dsh 会话根(DSH_HOME;成本统计与模型回验用)
+  stats_script: null           # null → dsh-design 用其旁的 dsh-design-stats.py

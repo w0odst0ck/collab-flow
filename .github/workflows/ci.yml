@@ -1,0 +1,35 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Shell syntax check
+        run: |
+          bash -n scripts/dsh-design scripts/flow-config tests/run-smoke.sh tests/run-config-smoke.sh
+
+      - name: Python compile
+        run: |
+          python3 -m py_compile scripts/flow-config-core.py scripts/dsh-design-stats.py
+
+      - name: Smoke tests (stub, zero API)
+        run: |
+          bash tests/run-smoke.sh
+
+      - name: Config smoke tests (stub, zero API)
+        run: |
+          bash tests/run-config-smoke.sh
+
+      - name: Deny-list (no private identifiers / secrets)
+        run: |
+          if grep -rnE '/home/[^~]|sk-[A-Za-z0-9]{10}|private-placeholder' scripts/ config/ templates/ tests/; then
+            echo "私有标识/密钥泄露!"; exit 1
+          fi
+          echo "deny-list OK"

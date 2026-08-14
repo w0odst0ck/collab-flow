@@ -1,0 +1,459 @@
+#!/usr/bin/env bash
+# dsh-design —— 强制 pro 模型的设计方案生成 CLI（dsh-collab 协作流第一步）
+#
+# 一条命令完成：读简报 → 强制 pro 跑 dsh headless → 方案落盘 designs/ → 打印路径 + token 成本摘要。
+# 实现模式参考 ~/.local/bin/rx：cd realpath 解析、timeout 超时、exit 透传。
+#
+# 用法:
+#   dsh-design [选项] <任务描述 | 简报文件路径 | ->
+#
+# 选项:
+#   -d, --dir <目录>      设计目标项目目录（默认当前目录）。dsh 在此目录内运行（sandbox 根）
+#   -o, --output <目录>   方案输出目录（默认 <项目>/designs）
+#   -n, --name <slug>     输出文件名前缀覆盖（默认 时间戳+任务摘要 slug）
+#   -t, --timeout <秒>    运行超时（默认 1800；pro 推理慢，需放宽）
+#       --permission <m>  dsh 沙箱权限：read-only(默认，红线安全) | workspace-write
+#       --json            摘要以单行 JSON 打印（供流水线机器消费）
+#       --no-cost         跳过成本统计（仍做模型回验；仅落盘 + 打印路径）
+#       --list            列出最近 designs（读 manifest）
+#       --last            打印最近一份方案全文
+#       --cost <方案.md>  查询某历史方案的 token 成本
+#   -h, --help
+#
+# 环境变量: DSH_BIN（默认 dsh）、DSH_HOME（默认 ~/.dsh）、DSH_DESIGN_PRO_PATCH、
+#           DSH_DESIGN_TIMEOUT、DSH_DESIGN_PERMISSION、DSH_DESIGN_PRICES（可选价格表，元/百万 token）
+#
+# 退出码: 0 成功 / 1 dsh 失败或模型回验失败 / 2 用法或前置错误 / 124 超时（透传 timeout）
+#
+# 红线: key 只经 export 注入子进程环境，绝不 echo/落盘/打印值；日志与 manifest 过滤 key；
+#       模型强制 pro（前置 grep 补丁 + 事后解析 request/header 回验，回验失败 fail-closed 不落盘）。
+
+set -uo pipefail   # 故意不 set -e（需手动处理 rc）；不 set -x（红线：防 key 泄露）
+
+# ---------- 路径与常量 ----------
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+STATS_PY="${DSH_DESIGN_STATS:-$SCRIPT_DIR/dsh-design-stats.py}"
+
+usage() {
+  sed -n '2,32p' "$0" | sed 's/^# \{0,1\}//'
+}
+
+fail() { # code msg  —— 前置/用法错误（exit 2 类）与运行失败共用
+  local code="$1"; shift
+  echo "错误: $*" >&2
+  [[ "${JSON_MODE:-0}" == "1" ]] && { python3 - "$*" <<'PY' 2>/dev/null || true
+import json, sys
+print(json.dumps({"status": "failed", "error": sys.argv[1]}, ensure_ascii=False))
+PY
+  }
+  exit "$code"
+}
+
+# ---------- 可配置常量（P1；默认值与历史行为一致，flow-config 经 env 注入） ----------
+PRO_MODEL="${DSH_DESIGN_PRO_MODEL:-deepseek-v4-pro}"
+FLASH_MODEL="${DSH_DESIGN_FLASH_MODEL:-deepseek-v4-flash}"
+PROVIDER="${DSH_DESIGN_PROVIDER:-deepseek-official}"
+KEY_FILE="${DSH_DESIGN_KEY_FILE:-$HOME/.reasonix/.env}"
+DSH_HOME="${DSH_HOME:-$HOME/.dsh}"     # 修正：补全 usage 已声明的默认（未设时从「回验降级」变「正常回验」）
+# 防注入：模型/provider 名限定安全字符集（供下方 grep/heredoc 使用）
+[[ "$PRO_MODEL" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]] || fail 2 "非法 pro 模型名: $PRO_MODEL"
+[[ "$FLASH_MODEL" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]] || fail 2 "非法 flash 模型名: $FLASH_MODEL"
+[[ "$PROVIDER" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]] || fail 2 "非法 provider: $PROVIDER"
+
+# ---------- 参数解析（getopt，GNU 版本） ----------
+OPTS="$(getopt -o d:o:n:t:h -l dir:,output:,name:,timeout:,permission:,json,no-cost,list,last,cost:,help -n dsh-design -- "$@")" || { usage >&2; exit 2; }
+eval set -- "$OPTS"   # getopt 输出已正确引用，此处 eval 安全
+
+DIR=""; OUT=""; NAME=""; TIMEOUT="${DSH_DESIGN_TIMEOUT:-1800}"; PERM=""
+JSON_MODE=0; NO_COST=0; LIST=0; LAST=0; COST=""
+while true; do
+  case "$1" in
+    -d|--dir)        DIR="$2"; shift 2 ;;
+    -o|--output)     OUT="$2"; shift 2 ;;
+    -n|--name)       NAME="$2"; shift 2 ;;
+    -t|--timeout)    TIMEOUT="$2"; shift 2 ;;
+    --permission)    PERM="$2"; shift 2 ;;
+    --json)          JSON_MODE=1; shift ;;
+    --no-cost)       NO_COST=1; shift ;;
+    --list)          LIST=1; shift ;;
+    --last)          LAST=1; shift ;;
+    --cost)          COST="$2"; shift 2 ;;
+    -h|--help)       usage; exit 0 ;;
+    --)              shift; break ;;
+    *)               break ;;
+  esac
+done
+INPUT="${1:-}"
+
+[[ "$TIMEOUT" =~ ^[0-9]+$ ]] || fail 2 "timeout 必须是整数秒: $TIMEOUT"
+PERM="${PERM:-${DSH_DESIGN_PERMISSION:-read-only}}"
+[[ "$PERM" == "read-only" || "$PERM" == "workspace-write" ]] || fail 2 "permission 只能是 read-only 或 workspace-write: $PERM"
+
+SUB_CNT=$(( LIST + LAST + $([[ -n "$COST" ]] && echo 1 || echo 0) ))
+[[ "$SUB_CNT" -le 1 ]] || fail 2 "--list/--last/--cost 互斥，只能选一个"
+
+# ---------- 项目目录 / 输出目录 / manifest（子命令与主流程共用） ----------
+PROJECT="$(readlink -f "${DIR:-$PWD}")"
+[[ -d "$PROJECT" ]] || fail 2 "项目目录不存在: ${DIR:-$PWD}"
+OUT_DIR="$(readlink -f "${OUT:-$PROJECT/designs}")"
+MANIFEST_DIR="$OUT_DIR/.dsh-design"
+MANIFEST="$MANIFEST_DIR/manifest.jsonl"
+
+# ---------- 查询子命令（不读 key、不调 dsh） ----------
+cmd_list() {
+  [[ -f "$MANIFEST" ]] || { echo "无记录（$MANIFEST 不存在）"; return 0; }
+  echo "# dsh-design 运行记录: $MANIFEST"
+  tail -10 "$MANIFEST" | python3 -c '
+import json, sys
+for line in sys.stdin:
+    line = line.strip()
+    if not line: continue
+    try: r = json.loads(line)
+    except Exception: continue
+    print(f"{r.get(\"ts\",\"\")}  {str(r.get(\"status\",\"\")):8s}  {str(r.get(\"duration_s\",\"\")):>6s}s  {(r.get(\"model\") or \"-\"):16s}  {r.get(\"output\") or \"-\"}")
+'
+}
+cmd_last() {
+  [[ -f "$MANIFEST" ]] || fail 2 "manifest 不存在: $MANIFEST"
+  local out
+  out="$(python3 -c '
+import json, sys
+last = None
+for line in sys.stdin:
+    line = line.strip()
+    if not line: continue
+    try: r = json.loads(line)
+    except Exception: continue
+    if r.get("status") == "ok": last = r.get("output")
+print(last or "")
+' < "$MANIFEST")"
+  [[ -n "$out" ]] || fail 2 "无成功记录（manifest 中无 status=ok 的运行）"
+  local f="$OUT_DIR/$out"
+  [[ -f "$f" ]] || fail 2 "方案文件不存在: $f"
+  cat "$f"
+}
+cmd_cost() { # <md> —— 查询历史方案成本
+  local target="$1" want
+  want="$(basename "$target")"
+  [[ -f "$MANIFEST" ]] || fail 2 "manifest 不存在: $MANIFEST"
+  local line
+  line="$(python3 - "$want" <<'PY'
+import json, sys
+want = sys.argv[1]
+for line in sys.stdin:
+    line = line.strip()
+    if not line: continue
+    try: r = json.loads(line)
+    except Exception: continue
+    if r.get("output") == want:
+        print(json.dumps(r, ensure_ascii=False)); break
+PY
+  < "$MANIFEST")"
+  [[ -n "$line" ]] || fail 2 "manifest 无记录: $want"
+  echo "方案: $want"
+  python3 - "$line" <<'PY'
+import json, sys
+r = json.loads(sys.argv[1])
+u = r.get("usage")
+print(f"模型: {r.get('model') or 'N/A'}   会话: {r.get('session') or 'N/A'}")
+if u:
+    print(f"token: input={u.get('inputTokens',0)}  output={u.get('outputTokens',0)}  cache_read={u.get('cacheReadTokens',0)}  reasoning={u.get('reasoningTokens',0)}  total={sum(u.values())}")
+else:
+    print("token: N/A")
+print(f"状态: {r.get('status')}  用时: {r.get('duration_s')}s  时间: {r.get('ts')}")
+PY
+}
+
+if [[ "$LIST" == "1" ]]; then cmd_list; exit 0; fi
+if [[ "$LAST" == "1" ]]; then cmd_last; exit 0; fi
+if [[ -n "$COST" ]]; then cmd_cost "$COST"; exit 0; fi
+
+# ---------- 前置校验（任一失败 → exit 2，绝不调用 dsh） ----------
+# 1) API key：环境已有直接用；否则从 ~/.reasonix/.env 提取并 export（只注入子进程环境，绝不 echo/落盘/打印值）
+KEY="${DEEPSEEK_API_KEY:-}"
+if [[ -z "$KEY" && -f "$KEY_FILE" ]]; then
+  KEY="$(sed -n -e 's/^[[:space:]]*export[[:space:]]\+//' -e 's/^DEEPSEEK_API_KEY[[:space:]]*=[[:space:]]*//p' "$KEY_FILE" | tail -1)"
+  KEY="${KEY%\"}"; KEY="${KEY#\"}"; KEY="${KEY%\'}"; KEY="${KEY#\'}"
+  if [[ -n "$KEY" ]]; then export DEEPSEEK_API_KEY="$KEY"; fi
+fi
+[[ -n "$KEY" ]] || fail 2 "缺少 DEEPSEEK_API_KEY（未在环境/~/.reasonix/.env 找到）"
+
+# 2) 简报输入消歧：已存在文件 → cat 读入；'-' → stdin；否则任务字符串；空输入报错
+BRIEF=""; BRIEF_SRC=""
+if [[ -z "$INPUT" ]]; then
+  fail 2 "缺少输入：<任务描述 | 简报文件路径 | ->"
+elif [[ "$INPUT" == "-" ]]; then
+  BRIEF="$(cat)" || fail 2 "读取 stdin 失败"
+  BRIEF_SRC="stdin"
+elif [[ -e "$INPUT" ]]; then
+  [[ -f "$INPUT" ]] || fail 2 "简报路径不是普通文件: $INPUT"
+  BRIEF="$(cat "$INPUT")" || fail 2 "读取简报失败: $INPUT"
+  BRIEF_SRC="$INPUT"
+elif [[ "$INPUT" =~ ^(/|\./|\.\./|~/) ]] || [[ "$INPUT" == *.md || "$INPUT" == *.txt || "$INPUT" == *.yaml || "$INPUT" == *.yml ]]; then
+  fail 2 "简报文件不存在: $INPUT"
+else
+  BRIEF="$INPUT"
+  BRIEF_SRC="string"
+fi
+[[ -n "$(printf '%s' "$BRIEF" | tr -d '[:space:]')" ]] || fail 2 "简报为空"
+
+# 3) pro 补丁：定位 → 缺失自愈生成 → grep 强制校验（含 pro 且不含 flash，fail-closed）
+PATCH="${DSH_DESIGN_PRO_PATCH:-$HOME/.config/dsh-design/pro.patch.yml}"
+if [[ ! -f "$PATCH" ]]; then
+  mkdir -p "$(dirname "$PATCH")" || fail 2 "无法创建补丁目录: $(dirname "$PATCH")"
+  cat > "$PATCH" <<YAML || fail 2 "无法写入补丁: $PATCH"
+# dsh-design 强制 pro 模型补丁 —— 请勿改回 flash
+# 覆盖 dsh-base 的 agent-default-model 行：整行 config 被替换，最后写入者生效。
+- id: agent-default-model
+  config:
+    provider: $PROVIDER
+    model: $PRO_MODEL
+YAML
+fi
+PATCH_ABS="$(readlink -f "$PATCH")"
+PRO_MODEL_RE="${PRO_MODEL//./\\.}"
+FLASH_MODEL_RE="${FLASH_MODEL//./\\.}"
+if ! grep -qE "^[[:space:]]*model:[[:space:]]*$PRO_MODEL_RE" "$PATCH_ABS" \
+   || grep -qE "^[[:space:]]*model:[[:space:]]*$FLASH_MODEL_RE" "$PATCH_ABS"; then
+  fail 2 "pro 补丁校验失败: $PATCH_ABS（需含 model: $PRO_MODEL 且不含 flash）"
+fi
+
+# ---------- 简报准备（纯文本拼装，不产生中间文件） ----------
+PROMPT="$(cat <<EOF
+你是一名资深方案架构师。基于下面的任务简报，输出一份完整、可落地、可测试的方案设计。
+要求：
+- 最终回复就是方案 markdown 本身（以 # 标题开头），不要输出其它说明文字；
+- 不要调用任何写文件/执行类工具——你只产出文本，由外部封装工具负责落盘；
+- 不要执行方案，不要改动项目代码/数据/配置；
+- 你的产出是「designer 设计 → critic 审查 → executor 执行」协作流的第一步，必须实现就绪、可被审查。
+
+任务简报：
+-----
+$BRIEF
+-----
+EOF
+)"
+
+# ---------- 调用 dsh（强制 pro + read-only 沙箱） ----------
+command -v timeout >/dev/null 2>&1 || fail 2 "需要 timeout（coreutils）"
+# DSH_BIN 默认 dsh；可设 "npx --yes dsh"（含空格时按词拆分）
+read -r -a DSH_CMD <<< "${DSH_BIN:-dsh}"
+[[ ${#DSH_CMD[@]} -gt 0 ]] || fail 2 "DSH_BIN 为空"
+TMP_OUT="$(mktemp)"; TMP_ERR="$(mktemp)"
+trap 'rm -f "$TMP_OUT" "$TMP_ERR"' EXIT
+
+cd "$PROJECT" || fail 2 "无法进入项目目录: $PROJECT"
+before=$(date +%s)
+# 注：-- "$PROMPT" 为参数透传形式（实测可用）；若遇透传问题可回退 "--profile headless "$PROMPT""（两种实测均可）。
+DSH_PERMISSION_MODE="$PERM" \
+  timeout "$TIMEOUT" "${DSH_CMD[@]}" --profile headless --patch "$PATCH_ABS" -- "$PROMPT" \
+  1>"$TMP_OUT" 2>"$TMP_ERR"
+rc=$?
+now=$(date +%s); DUR=$(( now - before ))
+
+# ---------- key 过滤（stderr/日志全路径 redact，绝不打印 key 值） ----------
+redact() { # <text> —— 过滤文本中的 key 值；无 python3 时输出占位符（绝不回退原文）
+  if [[ -n "${KEY:-}" ]] && command -v python3 >/dev/null 2>&1; then
+    printf '%s' "$1" | python3 - "$KEY" <<'PY'
+import sys
+key = sys.argv[1]
+data = sys.stdin.buffer.read().decode("utf-8", "replace")
+print(data.replace(key, "[REDACTED]"), end="")
+PY
+  else
+    printf '%s' "[REDACTED]"
+  fi
+}
+
+# ---------- manifest 写入（成功/失败共用；usage=null 表示无成本数据） ----------
+TS_ISO="$(date +"%Y-%m-%dT%H:%M:%S%:z")"
+write_manifest() { # status [error]
+  local status="$1" err="${2:-}"
+  local rec
+  rec="$(python3 - "$TS_ISO" "$OUT_BASENAME" "$BRIEF_SRC" "${MODEL:-}" "${SESSION:-}" \
+         "${TOK_IN:-}" "${TOK_OUT:-}" "${TOK_CACHE:-}" "${TOK_REASON:-}" "$DUR" "$status" "$err" <<'PY'
+import json, sys
+ts, out, brief, model, sess, ti, to, tc, tr, dur, status, err = sys.argv[1:]
+usage = None
+if ti.isdigit():
+    def _i(x):
+        return int(x) if str(x).isdigit() else 0
+    usage = {"inputTokens": _i(ti), "outputTokens": _i(to),
+             "cacheReadTokens": _i(tc), "reasoningTokens": _i(tr)}
+rec = {"ts": ts, "output": out, "brief": brief, "model": model or None,
+       "session": sess or None, "usage": usage, "status": status,
+       "duration_s": int(float(dur))}
+if err:
+    rec["error"] = err
+print(json.dumps(rec, ensure_ascii=False))
+PY
+  )" || rec=""
+  if [[ -n "$rec" ]]; then
+    mkdir -p "$MANIFEST_DIR" 2>/dev/null
+    if command -v flock >/dev/null 2>&1; then
+      { flock 9; printf '%s\n' "$rec" >> "$MANIFEST" 2>/dev/null; } 9>"$MANIFEST.lock"         || echo "警告: 无法写入 manifest: $MANIFEST" >&2
+    else
+      printf '%s\n' "$rec" >> "$MANIFEST" 2>/dev/null || echo "警告: 无法写入 manifest: $MANIFEST" >&2
+    fi
+  fi
+}
+
+# ---------- 结果处理 ----------
+if [[ $rc -ne 0 ]]; then
+  MSG=""
+  if [[ $rc -eq 124 ]]; then MSG="运行超时（${TIMEOUT}s）"
+  else MSG="dsh 运行失败（exit $rc）"; fi
+  echo "错误: $MSG" >&2
+  if [[ -s "$TMP_ERR" ]]; then
+    echo "--- dsh stderr 尾部 ---" >&2
+    redact "$(tail -5 "$TMP_ERR")" >&2
+  fi
+  OUT_BASENAME=""; MODEL=""; SESSION=""; TOK_IN=""; TOK_OUT=""; TOK_CACHE=""; TOK_REASON=""
+  write_manifest "failed" "$MSG"
+  [[ "$JSON_MODE" == "1" ]] && { python3 - "$MSG" <<'PY'
+import json, sys
+print(json.dumps({"status": "failed", "error": sys.argv[1]}, ensure_ascii=False))
+PY
+  }
+  [[ $rc -eq 124 ]] && exit 124 || exit 1
+fi
+
+if [[ ! -s "$TMP_OUT" ]]; then
+  MSG="dsh 未产出方案文本"
+  echo "错误: $MSG" >&2
+  if [[ -s "$TMP_ERR" ]]; then
+    echo "--- dsh stderr 尾部 ---" >&2
+    redact "$(tail -5 "$TMP_ERR")" >&2
+  fi
+  OUT_BASENAME=""; MODEL=""; SESSION=""; TOK_IN=""; TOK_OUT=""; TOK_CACHE=""; TOK_REASON=""
+  write_manifest "failed" "$MSG"
+  [[ "$JSON_MODE" == "1" ]] && { python3 - "$MSG" <<'PY'
+import json, sys
+print(json.dumps({"status": "failed", "error": sys.argv[1]}, ensure_ascii=False))
+PY
+  }
+  exit 1
+fi
+
+# 成功：成本统计 + 模型回验（--no-cost 仍回验，红线兜底；只抑制 usage 展示/落盘）
+MODEL=""; SESSION=""; TOTAL=""; TOK_IN=""; TOK_OUT=""; TOK_CACHE=""; TOK_REASON=""; TURNS=""
+if command -v zstd >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1 && [[ -f "$STATS_PY" ]]; then
+  STATS_JSON="$("$STATS_PY" "$DSH_HOME" "$PROJECT" "$before" 2>/dev/null)" || STATS_JSON=""
+  if [[ -n "$STATS_JSON" ]]; then
+    IFS='|' read -r MODEL SESSION TOTAL TOK_IN TOK_OUT TOK_CACHE TOK_REASON TURNS < <(python3 - "$STATS_JSON" <<'PY'
+import json, sys
+try:
+    d = json.loads(sys.argv[1])
+except Exception:
+    d = {"error": "bad_json"}
+u = d.get("usage") or {}
+print("|".join([
+    str(d.get("model") or ""),
+    str(d.get("session") or ""),
+    str(d.get("total") or ""),
+    str(u.get("inputTokens") if u.get("inputTokens") is not None else ""),
+    str(u.get("outputTokens") if u.get("outputTokens") is not None else ""),
+    str(u.get("cacheReadTokens") if u.get("cacheReadTokens") is not None else ""),
+    str(u.get("reasoningTokens") if u.get("reasoningTokens") is not None else ""),
+    str(d.get("turns") or ""),
+]))
+PY
+    ) || { MODEL=""; SESSION=""; TOTAL=""; TOK_IN=""; TOK_OUT=""; TOK_CACHE=""; TOK_REASON=""; TURNS=""; }
+  fi
+fi
+
+# 模型回验：实际生效模型非 pro → fail-closed（不落盘、不宣称 pro 设计）
+# 回验不可用（缺 zstd/python3/stats.py）→ 显式警告 + manifest 标记 unverified，不静默放行
+if [[ -z "$MODEL" ]]; then
+  echo "警告: 模型回验不可用（缺 zstd/python3/stats.py），无法确认 $PRO_MODEL" >&2
+  MODEL="unverified"
+fi
+if [[ -n "$MODEL" && "$MODEL" != "$PRO_MODEL" && "$MODEL" != "unverified" ]]; then
+  MSG="模型回验失败: 实际 $MODEL ≠ $PRO_MODEL（不落盘）"
+  echo "错误: $MSG" >&2
+  OUT_BASENAME=""; SESSION="$SESSION"
+  write_manifest "failed" "$MSG"
+  [[ "$JSON_MODE" == "1" ]] && { python3 - "$MSG" <<'PY'
+import json, sys
+print(json.dumps({"status": "failed", "error": sys.argv[1]}, ensure_ascii=False))
+PY
+  }
+  exit 1
+fi
+
+# 落盘 designs/<ts>-<slug>.md（ts 含纳秒防同秒并发；slug 为 ASCII 安全，无摘要用任务序号）
+mkdir -p "$OUT_DIR" || fail 2 "输出目录不可写: $OUT_DIR"
+[[ -w "$OUT_DIR" ]] || fail 2 "输出目录不可写: $OUT_DIR"
+
+make_slug() { # <摘要> —— 中文/特殊字符转 ASCII slug（文件系统安全）；空则用任务序号
+  local s="$1" slug
+  slug="$(printf '%s' "$s" | tr -c 'A-Za-z0-9' '-' | tr -s '-' | sed 's/^-\+//; s/-\+$//')"
+  slug="${slug:0:40}"
+  [[ -z "$slug" ]] && slug="task-$RANDOM"
+  printf '%s' "$slug"
+}
+if [[ -n "$NAME" ]]; then
+  SLUG="$(make_slug "$NAME")"
+else
+  case "$BRIEF_SRC" in
+    stdin)  SUMM="stdin" ;;
+    string) SUMM="$INPUT" ;;
+    *)      SUMM="$(basename "$INPUT")"; SUMM="${SUMM%.*}" ;;
+  esac
+  SLUG="$(make_slug "$SUMM")"
+fi
+TS="$(date +%Y%m%d-%H%M%S-%N)"
+OUT_FILE="$OUT_DIR/$TS-$SLUG.md"
+# stdout 原文去末尾换行后补单个换行（避免多余空行）
+printf '%s\n' "$(<"$TMP_OUT")" > "$OUT_FILE" || { rm -f "$OUT_FILE"; fail 2 "写入方案失败: $OUT_FILE"; }
+OUT_BASENAME="$(basename "$OUT_FILE")"
+
+# 成功记录 + 摘要
+[[ "$NO_COST" == "1" ]] && { TOTAL=""; TOK_IN=""; TOK_OUT=""; TOK_CACHE=""; TOK_REASON=""; }
+write_manifest "ok"
+
+if [[ "$JSON_MODE" == "1" ]]; then
+  python3 - "$OUT_FILE" "$MODEL" "$SESSION" "$TOK_IN" "$TOK_OUT" "$TOK_CACHE" "$TOK_REASON" "$TOTAL" "$DUR" "$TURNS" <<'PY'
+import json, sys
+d, m, s, ti, to, tc, tr, total, dur, turns = sys.argv[1:]
+usage = None
+if ti.isdigit():
+    def _i(x):
+        return int(x) if str(x).isdigit() else 0
+    usage = {"inputTokens": _i(ti), "outputTokens": _i(to),
+             "cacheReadTokens": _i(tc), "reasoningTokens": _i(tr)}
+print(json.dumps({"design": d, "model": m or None, "session": s or None,
+                  "usage": usage, "total": int(total) if total.isdigit() else None,
+                  "duration_s": int(float(dur)), "turns": int(turns) if turns.isdigit() else None},
+                 ensure_ascii=False))
+PY
+else
+  echo "方案: $OUT_FILE"
+  if [[ -n "$MODEL" ]]; then
+    echo "模型: $MODEL   会话: $SESSION"
+  else
+    echo "模型: N/A（会话未找到，成本统计不可用）"
+  fi
+  if [[ -n "$TOTAL" ]]; then
+    echo "token: input=$TOK_IN  output=$TOK_OUT  cache_read=$TOK_CACHE  reasoning=$TOK_REASON  total=$TOTAL"
+    if [[ -n "${DSH_DESIGN_PRICES:-}" ]]; then
+      AMOUNT="$(python3 - "$DSH_DESIGN_PRICES" "$TOK_IN" "$TOK_OUT" "$TOK_CACHE" "$TOK_REASON" <<'PY' 2>/dev/null || true
+import json, sys
+try:
+    p = json.loads(sys.argv[1])
+    ti, to, tc, tr = map(int, sys.argv[2:6])
+    amt = (ti * p.get("input", 0) + to * p.get("output", 0)
+           + tc * p.get("cache_read", 0) + tr * p.get("reasoning", 0)) / 1e6
+    print(f"{amt:.4f}")
+except Exception:
+    pass
+PY
+      )"
+      [[ -n "$AMOUNT" ]] && echo "金额: ¥$AMOUNT（DSH_DESIGN_PRICES 估算）"
+    fi
+  else
+    echo "token: N/A"
+  fi
+  echo "DESIGN=$OUT_FILE"
+fi
+exit 0
