@@ -13,11 +13,15 @@ jobs:
 
       - name: Shell syntax check
         run: |
-          bash -n scripts/dsh-design scripts/flow-config tests/run-smoke.sh tests/run-config-smoke.sh
+          bash -n scripts/dsh-design scripts/flow-config scripts/flow tests/run-smoke.sh tests/run-config-smoke.sh tests/run-flow-smoke.sh
 
       - name: Python compile
         run: |
-          python3 -m py_compile scripts/flow-config-core.py scripts/dsh-design-stats.py
+          python3 -m py_compile scripts/flow-config-core.py scripts/dsh-design-stats.py scripts/flow-core.py
+
+      - name: Work-item unit tests (state machine + store)
+        run: |
+          python3 -m unittest discover tests
 
       - name: Smoke tests (stub, zero API)
         run: |
@@ -26,6 +30,10 @@ jobs:
       - name: Config smoke tests (stub, zero API)
         run: |
           bash tests/run-config-smoke.sh
+
+      - name: Work-item flow smoke tests (stub, zero API)
+        run: |
+          bash tests/run-flow-smoke.sh
 
       - name: Deny-list (no private identifiers / secrets)
         run: |
