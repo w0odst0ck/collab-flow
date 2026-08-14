@@ -29,7 +29,7 @@ jobs:
 
       - name: Deny-list (no private identifiers / secrets)
         run: |
-          if grep -rnE '/home/[^~]|sk-[A-Za-z0-9]{10}|private-placeholder' scripts/ config/ templates/ tests/; then
+          if grep -rnE --exclude-dir=.git '/home/[^~]|sk-[A-Za-z0-9]{10}|private-placeholder' scripts/ config/ templates/ tests/ README.md; then
             echo "私有标识/密钥泄露!"; exit 1
           fi
           echo "deny-list OK"
