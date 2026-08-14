@@ -8,7 +8,7 @@
 set -uo pipefail
 # 中间产物(.run.out/.run.err/.diff.*/.status)用完即清,不残留到 executor/ 工件目录
 TMP_ARTIFACTS=()
-cleanup() { [[ ${#TMP_ARTIFACTS[@]} -gt 0 ]] && rm -f "${TMP_ARTIFACTS[@]}"; }
+cleanup() { rm -f "${TMP_ARTIFACTS[@]}" 2>/dev/null; }
 trap cleanup EXIT   # 不 set -e;不 set -x(防 key)
 
 TASKBOOK=""; WORKDIR=""; OUT=""; TIMEOUT="1800"
@@ -45,7 +45,9 @@ redact() {
 
 STARTED_AT="$(date +"%Y-%m-%dT%H:%M:%S%:z")"
 before=$(date +%s)
-timeout "$TIMEOUT" rx run -y "$TASKBOOK_CONTENT" >"$OUT/.run.out" 2>"$OUT/.run.err"
+# rx 接口: rx <项目目录> "任务书"(rx 内部自行 cd + 调 reasonix run -y);
+# 不能用 `rx run -y`(会把 run 当项目目录)。
+timeout "$TIMEOUT" rx "$WORKDIR" "$TASKBOOK_CONTENT" >"$OUT/.run.out" 2>"$OUT/.run.err"
 rc=$?
 DUR=$(( $(date +%s) - before ))
 FINISHED_AT="$(date +"%Y-%m-%dT%H:%M:%S%:z")"
@@ -53,10 +55,18 @@ FINISHED_AT="$(date +"%Y-%m-%dT%H:%M:%S%:z")"
 REDACTED_LOGS="$(redact "$(tail -c 2000 "$OUT/.run.err" 2>/dev/null)")"
 
 # git diff(HEAD vs 工作树)+ --stat/--name-only + untracked
-git diff HEAD >"$OUT/diff.patch" 2>/dev/null || true
-git diff --stat >"$OUT/.diff.stat" 2>/dev/null || true
-git diff --name-only >"$OUT/.diff.names" 2>/dev/null || true
-git status --porcelain >"$OUT/.status" 2>/dev/null || true
+# 独立 git 仓判定: rev-parse --show-toplevel 必须恰好等于 workdir(不得向上匹配,
+# 否则 workspace 树内项目会误判为仓导致 diff 污染 workspace)。非仓时按目录时间戳扫描产出物。
+TOPLVL="$(git -C "$WORKDIR" rev-parse --show-toplevel 2>/dev/null || true)"
+if [[ -n "$TOPLVL" && "$(readlink -f "$TOPLVL")" == "$WORKDIR" ]]; then
+  git -C "$WORKDIR" diff HEAD >"$OUT/diff.patch" 2>/dev/null || true
+  git -C "$WORKDIR" diff --stat >"$OUT/.diff.stat" 2>/dev/null || true
+  git -C "$WORKDIR" diff --name-only >"$OUT/.diff.names" 2>/dev/null || true
+  git -C "$WORKDIR" status --porcelain >"$OUT/.status" 2>/dev/null || true
+else
+  : >"$OUT/diff.patch"; : >"$OUT/.diff.stat"; : >"$OUT/.status"
+  find "$WORKDIR/intel" -type f \( -name '*.py' -o -name '*.md' -o -name '*.json' -o -name '*.jsonl' -o -name '*.toml' \) 2>/dev/null | sed "s|$WORKDIR/||" | sort >"$OUT/.diff.names" || : >"$OUT/.diff.names"
+fi
 
 STATUS="ok"
 [[ $rc -eq 1 ]] && STATUS="failed"
@@ -83,10 +93,9 @@ if os.path.isfile(os.path.join(out, ".diff.stat")):
         m = re.search(r"(\d+) deletion", l)
         if m:
             dels = int(m.group(1))
-for _p in (out + "/.run.out", out + "/.run.err", out + "/.diff.patch",
-               out + "/.diff.stat", out + "/.diff.names", out + "/.status"):
+for _p in (out + "/.run.out", out + "/.run.err", out + "/.diff.stat", out + "/.diff.names", out + "/.status"):
     if os.path.isfile(_p):
-        TMP_ARTIFACTS.append(_p)
+        pass  # 中间产物由 bash cleanup 清理;此处不得引用 bash 数组(会 NameError)
 rec = {"schema_version": 1, "executor": "reasonix", "status": status, "exit_code": int(rc),
        "duration_s": int(dur),
        "diff": {"files_changed": len(changed), "insertions": ins, "deletions": dels,

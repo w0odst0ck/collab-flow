@@ -1081,7 +1081,14 @@ def _collect_changed_files(result):
 
 
 def _matches_any(path, patterns):
-    return any(fnmatch.fnmatch(path, p) for p in patterns)
+    """路径匹配：pattern 以 / 结尾时匹配该目录整棵子树（fnmatch 对目录前缀不生效）。"""
+    for p in patterns:
+        if p.endswith("/"):
+            if path == p.rstrip("/") or path.startswith(p):
+                return True
+        elif fnmatch.fnmatch(path, p):
+            return True
+    return False
 
 
 def check_diff_scope(wi_dir, result, cli_scope_file=None):
