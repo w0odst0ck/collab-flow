@@ -48,3 +48,8 @@ gates:
   test: true                   # 测试门(executor/verify.json 三条件)恒开
   takeover_after_same_defect: 2  # 同类缺陷达到该阈值 → takeover(接管)
   iteration_limit: 3           # 打回迭代上限(预留)
+executor:                      # P3 新增;全标量(执行器默认策略)
+  default: reasonix            # 默认执行器(flow workitem execute 未指定 --executor 时)
+  timeout_s: 1800              # 默认超时兜底(实际以 spec.invoke.timeout_s 为主,--timeout 可覆盖)
+  diff_scope: null             # 默认不设全局 scope;scope 来自 taskbook 前置块或 --scope,缺失即 fail-closed
+

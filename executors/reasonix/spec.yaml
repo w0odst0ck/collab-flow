@@ -1,0 +1,30 @@
+# executors/reasonix/spec.yaml —— 默认执行器契约(受限 YAML:映射 + list-of-mapping + 标量)
+#
+# 被 flow-core.py 的 parse_yaml 解析(§P3 §3.1);禁用流式集合/锚点。
+# runtime.os 为能力声明(reasonix Linux-only,P4 执行面 preflight 复用);
+# invoke.sandbox 对 executor 必须 workspace-write(read-only 非法)。
+id: reasonix
+version: "1.0.0"
+runtime:
+  os: linux
+  shell: bash
+capabilities:
+  execute: true
+  plan: false
+  cost_report: true
+invoke:
+  binary: rx
+  args_template: run -y "TASKBOOK_CONTENT"
+  timeout_s: 1800
+  sandbox: workspace-write
+input:
+  taskbook: file
+  workdir: dir
+output:
+  result_manifest: result.json
+  diff: diff.patch
+  cost: cost.json
+exit_codes:
+  ok: 0
+  failed: 1
+  timeout: 124

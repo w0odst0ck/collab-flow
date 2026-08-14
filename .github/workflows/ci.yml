@@ -14,6 +14,12 @@ jobs:
       - name: Shell syntax check
         run: |
           bash -n scripts/dsh-design scripts/flow-config scripts/flow tests/run-smoke.sh tests/run-config-smoke.sh tests/run-flow-smoke.sh
+          bash -n executors/reasonix/wrapper.sh executors/stub/wrapper.sh tests/run-executor-smoke.sh
+
+      - name: ShellCheck (new scripts)
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+          shellcheck --severity=error scripts/flow executors/reasonix/wrapper.sh executors/stub/wrapper.sh tests/run-executor-smoke.sh
 
       - name: Python compile
         run: |
@@ -35,10 +41,14 @@ jobs:
         run: |
           bash tests/run-flow-smoke.sh
 
+      - name: Executor + verify smoke tests (stub, zero API)
+        run: |
+          bash tests/run-executor-smoke.sh
+
       - name: Deny-list (no private identifiers / secrets)
         run: |
           # 扫生产区（tests/ 含故意构造的测试 key/临时 HOME，内部已有 L294 自查）
-          if grep -rnE '/home/[^~]|sk-[A-Za-z0-9]{10}|private-placeholder' scripts/ config/ templates/ README.md; then
+          if grep -rnE '/home/[^~]|sk-[A-Za-z0-9]{10}|private-placeholder' scripts/ config/ templates/ executors/ README.md; then
             echo "私有标识/密钥泄露!"; exit 1
           fi
           echo "deny-list OK"

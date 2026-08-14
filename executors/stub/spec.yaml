@@ -1,0 +1,29 @@
+# executors/stub/spec.yaml —— 契约测试 stub(零 API,与 reasonix 同构)
+#
+# 仅用于 E 系列契约测试与 C 系列冒烟;wrapper 不调用任何真实二进制,
+# 行为受 STUB_EXECUTOR_* 环境变量控制(§P3 §5.1)。
+id: stub
+version: "1.0.0"
+runtime:
+  os: linux
+  shell: bash
+capabilities:
+  execute: true
+  plan: false
+  cost_report: false
+invoke:
+  binary: stub
+  args_template: ""
+  timeout_s: 30
+  sandbox: workspace-write
+input:
+  taskbook: file
+  workdir: dir
+output:
+  result_manifest: result.json
+  diff: diff.patch
+  cost: cost.json
+exit_codes:
+  ok: 0
+  failed: 1
+  timeout: 124

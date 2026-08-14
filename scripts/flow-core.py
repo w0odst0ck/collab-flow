@@ -16,12 +16,15 @@
       id 白名单正则硬编码;meta 写入前过 deny-list;transition()/evaluate_guard() 零 I/O。
 """
 
+import fnmatch
 import json
 import os
 import re
 import secrets
 import shutil
+import subprocess
 import sys
+import tempfile
 from datetime import datetime, timedelta, timezone
 
 try:
@@ -237,7 +240,7 @@ def _parse_list_item(lines, idx, dash_indent, src, first):
 
 
 def _parse_list(lines, idx, indent, src):
-    """解析 list-of-mapping;返回 (node, 下一行下标)。"""
+    """解析 list-of-mapping 或 list-of-scalar;返回 (node, 下一行下标)。"""
     n = len(lines)
     items = []
     while idx < n:
@@ -258,12 +261,18 @@ def _parse_list(lines, idx, indent, src):
             break
         rest = content[1:]
         if rest == "" or rest == " ":
-            raise StoreError(f"{src}:{idx + 1}: 序列项需为 mapping('- key: value')")
+            raise StoreError(f"{src}:{idx + 1}: 序列项需为 mapping('- key: value') 或标量('- value')")
         if not rest.startswith(" "):
-            raise StoreError(f"{src}:{idx + 1}: 序列项需为 mapping('- key: value')")
+            raise StoreError(f"{src}:{idx + 1}: 序列项需为 mapping('- key: value') 或标量('- value')")
         check_rejected(content, src, idx + 1)
-        item, idx = _parse_list_item(lines, idx, cur, src, rest[1:])
-        items.append(item)
+        item_content = rest[1:]
+        if find_key_colon(item_content) is None:
+            # list-of-scalar(向后兼容扩展,P3):`- 标量`(§4.1 diff_scope allow/deny)
+            items.append(parse_scalar(split_comment(item_content).strip(), src, idx + 1))
+            idx += 1
+        else:
+            item, idx = _parse_list_item(lines, idx, cur, src, item_content)
+            items.append(item)
     return items, idx
 
 
@@ -773,6 +782,7 @@ def load_config():
         merged = _merge(merged, parse_yaml(read_file(user_path), user_path))
     workitem = dict(merged.get("workitem") or {})
     gates = dict(merged.get("gates") or {})
+    executor = dict(merged.get("executor") or {})
 
     # env 覆盖(§7.1):环境已设即覆盖
     ttl = _env_int("FLOW_LOCK_TTL_S")
@@ -786,7 +796,9 @@ def load_config():
         gates["iteration_limit"] = limit
     if os.environ.get("FLOW_PLANE_ID"):
         workitem["plane_id"] = os.environ["FLOW_PLANE_ID"]
-    return {"workitem": workitem, "gates": gates}
+    if os.environ.get("FLOW_EXECUTOR"):
+        executor["default"] = os.environ["FLOW_EXECUTOR"]
+    return {"workitem": workitem, "gates": gates, "executor": executor}
 
 
 def data_dir():
@@ -811,6 +823,410 @@ def resolve_wi_dir(wi_id, cfg):
     if not os.path.isdir(wi_dir) or not os.path.isfile(os.path.join(wi_dir, "status.yaml")):
         raise WorkitemError(f"work-item 不存在: {wi_id}")
     return wi_dir
+
+
+# ---------------------------------------------------------------------------
+# 共享转移辅助(P3):锁内 读→判→transition→append_event→save_status_atomic
+# ---------------------------------------------------------------------------
+
+def _do_transition(wi_dir, from_state, to, event, overrides, meta, cfg, force=False):
+    """共享转移辅助(§P3 §2.1):复用 cmd_transition 的读-判-转移-落盘路径。
+
+    调用方负责加 with_workitem_lock 与输出/退出码;本函数在锁内完成:
+    读 status → 判逻辑锁 → build_ctx → transition() 纯判定 → append_event(seq 镜像)
+    → save_status_atomic。from_state 为 None 时不校验前置状态(交由 transition 判定形状)。
+    返回 {"ok": True, "from", "to", "event", "guard", "seq"} 或
+         {"ok": False, "reason", "detail", "guard"}。
+    """
+    status = load_status(wi_dir)
+    now = now_dt()
+    if is_locked(status, now):
+        raise Locked(status["locked_by"])
+    actual = status["state"]
+    if from_state is not None and actual != from_state:
+        raise UsageError(f"前置状态不符: 期望 {from_state}, 实际 {actual}")
+    ctx = build_ctx(wi_dir, event, overrides, cfg)
+    if event == "verify_fail" and ctx.get("route") is None:
+        ctx["route"] = "design" if to == "designed" else "impl"
+    r = transition(actual, event, ctx, force=force)
+    if not r["ok"]:
+        return {"ok": False, "reason": r["reason"], "detail": r.get("detail"),
+                "guard": r.get("guard")}
+    apply_effects(status, r["effects"])
+    status["state"] = r["to"]
+    status["updated_at"] = now.isoformat(timespec="seconds")
+    status["locked_by"] = None
+    status["lock_expires_at"] = None
+    meta_full = dict(meta or {})
+    if force:
+        meta_full["forced"] = True
+    if event in ("translate", "feedback", "takeover"):
+        meta_full["verdict"] = ctx.get("verdict")
+    if event == "verify_fail":
+        meta_full["route"] = ctx.get("route")
+    seq = append_event(wi_dir, {"ts": now.isoformat(timespec="seconds"), "event": event,
+                                "from": actual, "to": r["to"], "actor": actor(cfg),
+                                "guard": r["guard"], "reason": None, "meta": meta_full})
+    status["event_seq"] = seq
+    save_status_atomic(wi_dir, status)
+    return {"ok": True, "from": actual, "to": r["to"], "event": event,
+            "guard": r["guard"], "seq": seq}
+
+
+def _atomic_write(path, text):
+    """原子写(P3):temp + fsync + os.replace,读方永不观察半写。"""
+    tmp = f"{path}.tmp.{os.getpid()}.{secrets.token_hex(4)}"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+
+
+def workdir():
+    """执行面工作目录(§P3 §2.1):FLOW_WORKDIR 可覆盖,默认 cwd(项目仓根)。"""
+    return os.environ.get("FLOW_WORKDIR") or os.getcwd()
+
+
+# ---------------------------------------------------------------------------
+# executor 适配层(P3 §3):load_executor_spec / run_executor
+# ---------------------------------------------------------------------------
+
+def executors_dir():
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(script_dir, "..", "executors")
+
+
+def _current_os():
+    if sys.platform.startswith("linux"):
+        return "linux"
+    if sys.platform == "darwin":
+        return "darwin"
+    if sys.platform.startswith("win"):
+        return "windows"
+    return sys.platform
+
+
+def load_executor_spec(name, exec_dir=None):
+    """读并校验 executor spec(§3.1);任何非法 → StoreError(fail-closed,exit 2)。
+
+    校验: id 合法 / runtime.os 匹配当前平台 / invoke.sandbox == workspace-write
+    (read-only 对 executor 非法) / invoke.binary 非空 / invoke.timeout_s 正整数。
+    """
+    base = exec_dir or executors_dir()
+    spec_path = os.path.join(base, name, "spec.yaml")
+    if not os.path.isfile(spec_path):
+        raise StoreError(f"执行器 spec 不存在: {name}")
+    try:
+        spec = parse_yaml(read_file(spec_path), spec_path)
+    except StoreError:
+        raise
+    if not isinstance(spec, dict):
+        raise StoreError(f"{spec_path}: 顶层必须是映射")
+    sid = spec.get("id")
+    if not isinstance(sid, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", sid):
+        raise StoreError(f"{spec_path}: 非法 id {sid!r}")
+    rt = spec.get("runtime") or {}
+    spec_os = rt.get("os")
+    if not isinstance(spec_os, str) or not spec_os:
+        raise StoreError(f"{spec_path}: 缺少 runtime.os")
+    if spec_os != _current_os():
+        raise StoreError(f"执行器 {name} 声明 os={spec_os} 与当前平台 {_current_os()} 不匹配")
+    inv = spec.get("invoke") or {}
+    if inv.get("sandbox") != "workspace-write":
+        raise StoreError(f"执行器 {name} sandbox 必须 workspace-write(read-only 非法)")
+    if not isinstance(inv.get("binary"), str) or not inv["binary"]:
+        raise StoreError(f"{spec_path}: 缺少 invoke.binary")
+    to = inv.get("timeout_s")
+    if not isinstance(to, int) or isinstance(to, bool) or to <= 0:
+        raise StoreError(f"{spec_path}: invoke.timeout_s 必须是正整数")
+    return spec
+
+
+def run_executor(wrapper, taskbook_path, workdir_path, out_dir, timeout):
+    """调用 executor wrapper(§3.2 契约):<wrapper> --taskbook --workdir --out --timeout。
+
+    返回退出码(0/1/124 透传);wrapper 运行期间不持有 workitem 锁。
+    外层超时 = 执行器 timeout + 60s 缓冲(防 wrapper 自身挂起,如 git 卡死)。
+    """
+    cmd = [wrapper, "--taskbook", taskbook_path, "--workdir", workdir_path,
+           "--out", out_dir, "--timeout", str(timeout)]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True,
+                              timeout=timeout + 60)
+    except subprocess.TimeoutExpired:
+        return 124
+    except OSError as e:
+        raise UsageError(f"执行器 wrapper 调用失败: {wrapper}: {e.strerror or e}")
+    return proc.returncode
+
+
+# ---------------------------------------------------------------------------
+# verify --auto 辅助(P3 §4):测试命令 / diff scope / 错误表
+# ---------------------------------------------------------------------------
+
+def parse_flow_block(wi_dir):
+    """解析 taskbook.md 的 ```flow 前置块;无/不可解析 → None(触发回退,fail-closed)。"""
+    path = os.path.join(wi_dir, "taskbook.md")
+    if not os.path.isfile(path):
+        return None
+    text = read_file(path)
+    m = re.search(r"```flow\s*\n(.*?)```", text, re.DOTALL)
+    if not m:
+        return None
+    try:
+        node = parse_yaml(m.group(1), f"{path}:```flow")
+    except StoreError:
+        return None
+    return node if isinstance(node, dict) else None
+
+
+def _probe_test_command(wdir):
+    """惯例探测(§4.1 第 4 层):只读文件保守匹配,绝不执行 make/npm(审查补充意见 2)。"""
+    makefile = os.path.join(wdir, "Makefile")
+    if os.path.isfile(makefile):
+        text = read_file(makefile)
+        if re.search(r"^test\s*:", text, re.M):
+            return "make test"
+        if re.search(r"^check\s*:", text, re.M):
+            return "make check"
+    pkg = os.path.join(wdir, "package.json")
+    if os.path.isfile(pkg):
+        try:
+            data = json.loads(read_file(pkg))
+        except (ValueError, OSError):
+            data = None
+        if isinstance(data, dict) and isinstance(data.get("scripts"), dict) \
+                and data["scripts"].get("test"):
+            return "npm test"
+    for fname in ("pytest.ini", "pyproject.toml", "setup.cfg"):
+        p = os.path.join(wdir, fname)
+        if os.path.isfile(p) and re.search(r"pytest|\[tool\.pytest", read_file(p)):
+            return "pytest"
+    if os.path.isdir(os.path.join(wdir, "tests")):
+        return "python3 -m unittest discover tests"
+    return None
+
+
+def resolve_test_command(wi_dir, wdir, cli_command=None, result=None):
+    """测试命令分层解析(§4.1):--test-command > result.json > 前置块 > 惯例 > 无。
+
+    返回 {"command": str|None, "source": str|None, "reason": str|None};
+    无来源 → reason="command_unresolved"(fail-closed)。test_command 必须是非空字符串。
+    """
+    if isinstance(cli_command, str) and cli_command:
+        return {"command": cli_command, "source": "cli", "reason": None}
+    if isinstance(result, dict) and isinstance(result.get("test_command"), str) \
+            and result["test_command"]:
+        return {"command": result["test_command"], "source": "result.json", "reason": None}
+    fb = parse_flow_block(wi_dir)
+    if isinstance(fb, dict) and isinstance(fb.get("test_command"), str) \
+            and fb["test_command"]:
+        return {"command": fb["test_command"], "source": "taskbook", "reason": None}
+    detected = _probe_test_command(wdir)
+    if detected:
+        return {"command": detected, "source": "convention", "reason": None}
+    return {"command": None, "source": None, "reason": "command_unresolved"}
+
+
+def _scope_from_node(node):
+    if not isinstance(node, dict):
+        return [], [], False
+    allow = node.get("allow") or []
+    deny = node.get("deny") or []
+    if not isinstance(allow, list) or not isinstance(deny, list):
+        raise StoreError("diff_scope.allow/deny 必须是序列")
+    allow = [str(x) for x in allow]
+    deny = [str(x) for x in deny]
+    return allow, deny, bool(allow or deny)
+
+
+def _resolve_scope(wi_dir, cli_scope_file=None):
+    """scope 解析优先级(§4.2):--scope FILE > 前置块 diff_scope > 无声明。"""
+    if cli_scope_file:
+        if not os.path.isfile(cli_scope_file):
+            raise UsageError(f"--scope 文件不存在: {cli_scope_file}")
+        try:
+            node = parse_yaml(read_file(cli_scope_file), cli_scope_file)
+        except StoreError as e:
+            raise UsageError(f"--scope 文件解析失败: {e}")
+        return _scope_from_node(node)
+    fb = parse_flow_block(wi_dir)
+    if isinstance(fb, dict) and isinstance(fb.get("diff_scope"), dict):
+        return _scope_from_node(fb["diff_scope"])
+    return [], [], False
+
+
+def _collect_changed_files(result):
+    """changed = changed_files ∪ untracked_files(过滤 .flow/ .git/)。"""
+    diff = result.get("diff") or {}
+    files = list(diff.get("changed_files") or [])
+    for f in (diff.get("untracked_files") or []):
+        if f not in files:
+            files.append(f)
+    out = []
+    for f in files:
+        s = str(f).lstrip("/")
+        if s.startswith(".flow/") or s.startswith(".git/") or s == "":
+            continue
+        out.append(s)
+    return out
+
+
+def _matches_any(path, patterns):
+    return any(fnmatch.fnmatch(path, p) for p in patterns)
+
+
+def check_diff_scope(wi_dir, result, cli_scope_file=None):
+    """diff 范围核对(§4.2):deny 命中 → out_of_scope;allow 存在则必须匹配。
+
+    返回 {"match", "scope_verdict", "reason", "out_of_scope", "changed_files",
+          "allow", "deny"}。
+    """
+    changed = _collect_changed_files(result)
+    try:
+        allow, deny, declared = _resolve_scope(wi_dir, cli_scope_file)
+    except UsageError:
+        raise
+    except StoreError:
+        raise
+    if not declared:
+        return {"match": False, "scope_verdict": "undeclared", "reason": "scope_undeclared",
+                "out_of_scope": [], "changed_files": changed, "allow": allow, "deny": deny}
+    out_of_scope = []
+    for f in changed:
+        if _matches_any(f, deny):
+            out_of_scope.append(f)
+            continue
+        if allow and not _matches_any(f, allow):
+            out_of_scope.append(f)
+    match = len(out_of_scope) == 0
+    verdict = "in_scope" if match else "out_of_scope"
+    return {"match": match, "scope_verdict": verdict,
+            "reason": None if match else "out_of_scope", "out_of_scope": out_of_scope,
+            "changed_files": changed, "allow": allow, "deny": deny}
+
+
+def _parse_error_table(text):
+    """解析 design.md 的 markdown 错误处理表(§4.3):首列 E\\d+ 识别行。
+
+    对分隔行/列数不一致容忍;整表无 E 行 → None(error_table_missing)。
+    """
+    rows = []
+    for line in text.splitlines():
+        s = line.strip()
+        if not s.startswith("|"):
+            continue
+        cells = [c.strip() for c in s.strip("|").split("|")]
+        if not cells:
+            continue
+        eid = cells[0]
+        if not re.fullmatch(r"E\d+", eid):
+            continue
+        handle = cells[2] if len(cells) > 2 else ""
+        test = cells[3] if len(cells) > 3 else ""
+        scenario = cells[1] if len(cells) > 1 else ""
+        rows.append({"id": eid, "scenario": scenario, "handle": handle, "test": test})
+    return rows if rows else None
+
+
+def check_error_table(wi_dir):
+    """错误处理表核对(§4.3):结构覆盖自动(处理+测试覆盖非空)。
+
+    返回 {"match", "reason", "total", "covered", "uncovered", "human_review"}。
+    """
+    path = os.path.join(wi_dir, "design.md")
+    empty = {"match": False, "reason": "error_table_missing", "total": 0,
+             "covered": 0, "uncovered": [], "human_review": []}
+    if not os.path.isfile(path):
+        return empty
+    rows = _parse_error_table(read_file(path))
+    if rows is None:
+        return empty
+    uncovered = [r["id"] for r in rows if not (r["handle"].strip() and r["test"].strip())]
+    covered = len(rows) - len(uncovered)
+    match = len(uncovered) == 0
+    return {"match": match, "reason": None if match else "uncovered", "total": len(rows),
+            "covered": covered, "uncovered": uncovered, "human_review": []}
+
+
+def _derive_route(tests_result, diff_result, errors_result):
+    """route 推导(§4.4 表):--route 未显式时按失败条件推导。"""
+    if not tests_result.get("pass"):
+        if tests_result.get("reason") == "command_unresolved":
+            return "design"
+        return "impl"
+    if not diff_result.get("match"):
+        if diff_result.get("reason") == "scope_undeclared":
+            return "design"
+        return "impl"
+    if not errors_result.get("match"):
+        return "design"
+    return "impl"
+
+
+def _git_available(wdir):
+    try:
+        proc = subprocess.run(["git", "-C", wdir, "rev-parse", "HEAD"],
+                              capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return proc.returncode == 0
+
+
+def _run_tests(wdir, command):
+    """在 workdir 运行测试命令;返回 {"pass", "exit_code", "output_tail", "reason"}。"""
+    try:
+        proc = subprocess.run(command, shell=True, cwd=wdir,
+                              capture_output=True, text=True)
+    except OSError as e:
+        return {"pass": False, "exit_code": None, "output_tail": str(e), "reason": "command_failed"}
+    rc = proc.returncode
+    tail = ((proc.stdout or "") + (proc.stderr or ""))[-2000:]
+    reason = "timeout" if rc == 124 else (None if rc == 0 else "test_failed")
+    return {"pass": rc == 0, "exit_code": rc, "output_tail": tail, "reason": reason}
+
+
+def _write_verify_md(wi_dir, verify):
+    """写 verify.md(人读结论,§P3 §1.2/§4.4)。"""
+    d = verify.get("details") or {}
+    t = d.get("tests") or {}
+    df = d.get("diff") or {}
+    et = d.get("error_table") or {}
+    lines = [
+        "# 测试门结论",
+        "",
+        f"- tests_pass: {verify.get('tests_pass')}",
+        f"- diff_match: {verify.get('diff_match')}",
+        f"- error_table_match: {verify.get('error_table_match')}",
+        f"- route: {verify.get('route')}",
+        f"- checked_at: {verify.get('checked_at')}",
+        "",
+        "## 测试",
+        f"- command: {t.get('command')}",
+        f"- exit_code: {t.get('exit_code')}",
+        f"- reason: {t.get('reason')}",
+        "",
+        "## diff",
+        f"- scope_verdict: {df.get('scope_verdict')}",
+        f"- out_of_scope: {df.get('out_of_scope')}",
+        f"- changed_files: {df.get('changed_files')}",
+        "",
+        "## 错误表",
+        f"- total: {et.get('total')}  covered: {et.get('covered')}  uncovered: {et.get('uncovered')}",
+        "",
+        "## 人工复核（advisory）",
+        "- 语义正确性归 critic：处理是否正确、测试是否真正触发该错误，请人工复核。",
+        "",
+    ]
+    _atomic_write(os.path.join(wi_dir, "verify.md"), "".join(lines))
 
 
 # ---------------------------------------------------------------------------
@@ -994,44 +1410,21 @@ def cmd_transition(args, cfg):
             overrides["route"] = route_arg
         if opts.get("approve"):
             overrides["approve_confirmed"] = True
-        ctx = build_ctx(wi_dir, ev, overrides, cfg)
-        if ev == "verify_fail" and ctx.get("route") is None:
-            ctx["route"] = "design" if to == "designed" else "impl"
-        r = transition(from_state, ev, ctx, force=force)
-        if not r["ok"]:
-            if r["reason"].startswith("guard_failed:"):
+        res = _do_transition(wi_dir, from_state, to, ev, overrides, {}, cfg, force=force)
+        if not res["ok"]:
+            if res["reason"].startswith("guard_failed:"):
                 if json_mode:
                     emit_err({"status": "failed", "id": wi_id, "from": from_state,
-                              "to": to, "error": r["reason"], "detail": r.get("detail")})
+                              "to": to, "error": res["reason"], "detail": res.get("detail")})
                 else:
-                    print(f"错误: {r['reason']} ({r.get('detail')})", file=sys.stderr)
+                    print(f"错误: {res['reason']} ({res.get('detail')})", file=sys.stderr)
                 return 1
-            return fail(2, r["reason"], r.get("detail"), json_mode)
-        # 应用 effects + 清隐式短锁(§4.3)
-        apply_effects(status, r["effects"])
-        status["state"] = r["to"]
-        status["updated_at"] = now.isoformat(timespec="seconds")
-        status["locked_by"] = None
-        status["lock_expires_at"] = None
-        meta = {}
-        if force:
-            meta["forced"] = True
-        if ev in ("translate", "feedback", "takeover"):
-            meta["verdict"] = ctx.get("verdict")
-        if ev == "verify_fail":
-            meta["route"] = ctx.get("route")
-        # 顺序:append_event 先取 seq → 镜像进 status → 原子写(status 含最新 seq)。
-        # status 写失败时 events 已追加,由下次 transition 的 seq 漂移检测以 events 为准自愈(§4.2)。
-        seq = append_event(wi_dir, {"ts": now.isoformat(timespec="seconds"), "event": ev,
-                                    "from": from_state, "to": r["to"], "actor": actor(cfg),
-                                    "guard": r["guard"], "reason": None, "meta": meta})
-        status["event_seq"] = seq
-        save_status_atomic(wi_dir, status)
+            return fail(2, res["reason"], res.get("detail"), json_mode)
         if json_mode:
-            emit({"status": "ok", "id": wi_id, "from": from_state, "to": to,
-                  "event": ev, "guard": r["guard"], "event_seq": seq})
+            emit({"status": "ok", "id": wi_id, "from": res["from"], "to": res["to"],
+                  "event": res["event"], "guard": res["guard"], "event_seq": res["seq"]})
         else:
-            print(f"{wi_id}: {from_state} → {to} (event={ev}, guard={r['guard']}, seq={seq})")
+            print(f"{wi_id}: {res['from']} → {res['to']} (event={res['event']}, guard={res['guard']}, seq={res['seq']})")
         return 0
 
     try:
@@ -1224,12 +1617,14 @@ def cmd_guard(args, cfg):
 
 
 def cmd_verify(args, cfg):
-    pos, opts = scan_args(args, {"tests", "diff", "errors", "route"})
+    pos, opts = scan_args(args, {"tests", "diff", "errors", "route", "test-command", "scope"})
     if not pos:
         raise UsageError("verify 缺少 <id>")
     wi_id = pos[0]
     json_mode = bool(opts.get("json"))
     wi_dir = resolve_wi_dir(wi_id, cfg)
+    if opts.get("auto"):
+        return _cmd_verify_auto(wi_id, wi_dir, opts, json_mode, cfg)
     tests = _parse_bool(opts["tests"]) if "tests" in opts else True
     diff = _parse_bool(opts["diff"]) if "diff" in opts else True
     errors = _parse_bool(opts["errors"]) if "errors" in opts else True
@@ -1287,6 +1682,333 @@ def cmd_decision(args, cfg):
 
 
 # ---------------------------------------------------------------------------
+# P3 命令:design / execute / verify --auto(§P3 §2)
+# ---------------------------------------------------------------------------
+
+def cmd_design(args, cfg):
+    pos, opts = scan_args(args, set())
+    if not pos:
+        raise UsageError("design 缺少 <id>")
+    wi_id = pos[0]
+    if len(pos) > 1:
+        raise UsageError("design 多余参数")
+    json_mode = bool(opts.get("json"))
+    force = bool(opts.get("force"))
+    wi_dir = resolve_wi_dir(wi_id, cfg)
+
+    status = load_status(wi_dir)
+    if not force and status["state"] != "created":
+        return fail(2, f"前置状态不符: design 需要 state=created 实际 {status['state']}", None, json_mode)
+    brief_path = os.path.join(wi_dir, "brief.md")
+    if not file_nonempty(brief_path):
+        return fail(2, "brief.md 为空或缺失", None, json_mode)
+
+    # 复用 P1:flow-config 渲染 defaults+user → exec dsh-design(pro/read-only/回验/redact 继承)
+    flow_config = os.path.join(os.path.dirname(os.path.abspath(__file__)), "flow-config")
+    wdir = workdir()
+    tmp_out = tempfile.mkdtemp(prefix="flow-design-")
+    try:
+        proc = subprocess.run([flow_config, "-d", wdir, "-o", tmp_out, "--json", brief_path],
+                              capture_output=True, text=True)
+    except OSError as e:
+        shutil.rmtree(tmp_out, ignore_errors=True)
+        return fail(2, f"无法调用 flow-config: {e}", None, json_mode)
+
+    if proc.returncode == 124:
+        shutil.rmtree(tmp_out, ignore_errors=True)
+        return fail(124, "设计超时", None, json_mode)
+    if proc.returncode != 0:
+        shutil.rmtree(tmp_out, ignore_errors=True)
+        detail = (proc.stderr or "").strip().splitlines()
+        return fail(1, "dsh-design 失败", detail[-1] if detail else None, json_mode)
+
+    try:
+        info = json.loads(proc.stdout.strip().splitlines()[-1])
+    except (ValueError, IndexError):
+        shutil.rmtree(tmp_out, ignore_errors=True)
+        return fail(1, "dsh-design 输出非 JSON", None, json_mode)
+    if not isinstance(info, dict):
+        shutil.rmtree(tmp_out, ignore_errors=True)
+        return fail(1, "dsh-design 输出非 JSON 对象", None, json_mode)
+    design_src = info.get("design")
+    if not design_src or not os.path.isfile(design_src):
+        shutil.rmtree(tmp_out, ignore_errors=True)
+        return fail(1, "dsh-design 未产出方案文件", None, json_mode)
+    content = read_file(design_src)
+    if not content.strip():
+        shutil.rmtree(tmp_out, ignore_errors=True)
+        return fail(1, "dsh-design 产出空方案", None, json_mode)
+
+    # 原子落盘 design.md + design-result.json(审查补充意见 1:force 重跑同步覆盖)
+    _atomic_write(os.path.join(wi_dir, "design.md"), content)
+    design_result = {"schema_version": 1, "adapter": "dsh-designer",
+                     "model": info.get("model"), "session": info.get("session"),
+                     "usage": info.get("usage"), "duration_s": info.get("duration_s"),
+                     "source": os.path.basename(design_src), "checked_at": now_iso()}
+    _atomic_write(os.path.join(wi_dir, "design-result.json"),
+                  json.dumps(design_result, ensure_ascii=False, separators=(",", ":")))
+    shutil.rmtree(tmp_out, ignore_errors=True)
+
+    meta = {"adapter": "dsh-designer", "model": info.get("model")}
+
+    def _do():
+        s = load_status(wi_dir)
+        if s["state"] != "created":
+            # force 重跑且已非 created:仅覆盖文件,不转移
+            return {"ok": True, "from": s["state"], "to": s["state"], "event": "design",
+                    "guard": None, "seq": None, "no_transition": True}
+        return _do_transition(wi_dir, "created", "designed", "design", {}, meta, cfg, force=force)
+
+    try:
+        res = with_workitem_lock(wi_dir, _do)
+    except Locked as e:
+        return fail(2, f"锁被他人持有: {e}", None, json_mode)
+    if not res["ok"]:
+        return fail(1 if res["reason"].startswith("guard_failed:") else 2,
+                    res["reason"], res.get("detail"), json_mode)
+    design_rel = os.path.relpath(os.path.join(wi_dir, "design.md"), wdir)
+    if json_mode:
+        emit({"status": "ok", "id": wi_id, "from": res["from"], "to": res["to"],
+              "event": "design", "guard": res.get("guard"), "design": design_rel,
+              "model": info.get("model"), "usage": info.get("usage"),
+              "duration_s": info.get("duration_s")})
+    else:
+        print(f"{wi_id}: design → {design_rel} (model={info.get('model')})")
+    return 0
+
+
+def cmd_execute(args, cfg):
+    pos, opts = scan_args(args, {"executor", "timeout"})
+    if not pos:
+        raise UsageError("execute 缺少 <id>")
+    wi_id = pos[0]
+    if len(pos) > 1:
+        raise UsageError("execute 多余参数")
+    json_mode = bool(opts.get("json"))
+    force = bool(opts.get("force"))
+    executor_name = opts.get("executor") or cfg["executor"].get("default", "reasonix")
+    wi_dir = resolve_wi_dir(wi_id, cfg)
+
+    status = load_status(wi_dir)
+    if not force and status["state"] != "translated":
+        return fail(2, f"前置状态不符: execute 需要 state=translated 实际 {status['state']}", None, json_mode)
+    taskbook_path = os.path.join(wi_dir, "taskbook.md")
+    if not file_nonempty(taskbook_path):
+        return fail(2, "taskbook.md 为空或缺失", None, json_mode)
+    wdir = workdir()
+    if not _git_available(wdir):
+        return fail(2, "需要 git", None, json_mode)
+
+    try:
+        spec = load_executor_spec(executor_name)
+    except StoreError as e:
+        return fail(2, str(e), None, json_mode)
+
+    if opts.get("timeout") is not None:
+        try:
+            timeout = int(opts["timeout"])
+        except ValueError:
+            return fail(2, f"非法 --timeout: {opts['timeout']}", None, json_mode)
+        if timeout <= 0:
+            return fail(2, f"--timeout 必须是正整数: {timeout}", None, json_mode)
+    else:
+        timeout = int(spec["invoke"].get("timeout_s", 1800))
+
+    out_dir = os.path.join(wi_dir, "executor")
+    os.makedirs(out_dir, exist_ok=True)
+    wrapper = os.path.join(executors_dir(), executor_name, "wrapper.sh")
+    if not os.path.isfile(wrapper):
+        return fail(2, f"执行器 wrapper 缺失: {executor_name}", None, json_mode)
+
+    # 调 wrapper(执行器子进程运行期间不持 workitem 锁)
+    run_executor(wrapper, taskbook_path, wdir, out_dir, timeout)
+
+    result_path = os.path.join(out_dir, "result.json")
+    if not os.path.isfile(result_path):
+        return fail(2, "executor/result.json 缺失", None, json_mode)
+    try:
+        raw = read_file(result_path)
+    except OSError as e:
+        return fail(2, f"executor/result.json 不可读: {e}", None, json_mode)
+    if DENY_RE.search(raw):
+        return fail(2, "executor/result.json 含疑似 secret", None, json_mode)
+    try:
+        result = json.loads(raw)
+    except ValueError as e:
+        return fail(2, f"executor/result.json 损坏: {e}", None, json_mode)
+    if not isinstance(result, dict):
+        return fail(2, "executor/result.json 顶层必须是映射", None, json_mode)
+
+    st = result.get("status")
+    if st == "ok" and not os.path.isfile(os.path.join(out_dir, "diff.patch")):
+        return fail(2, "executor/diff.patch 缺失", None, json_mode)
+    if st == "ok":
+        meta = {"executor": executor_name, "duration_s": result.get("duration_s")}
+
+        def _do():
+            s = load_status(wi_dir)
+            if s["state"] != "translated":
+                return {"ok": True, "from": s["state"], "to": s["state"], "event": "execute",
+                        "guard": None, "seq": None, "no_transition": True}
+            return _do_transition(wi_dir, "translated", "executed", "execute", {}, meta, cfg, force=force)
+
+        try:
+            res = with_workitem_lock(wi_dir, _do)
+        except Locked as e:
+            return fail(2, f"锁被他人持有: {e}", None, json_mode)
+        if not res["ok"]:
+            return fail(1 if res["reason"].startswith("guard_failed:") else 2,
+                        res["reason"], res.get("detail"), json_mode)
+        if json_mode:
+            emit({"status": "ok", "id": wi_id, "from": res["from"], "to": res["to"],
+                  "event": "execute", "guard": res.get("guard"), "executor": executor_name,
+                  "exit_code": result.get("exit_code", 0), "diff": result.get("diff")})
+        else:
+            print(f"{wi_id}: execute → executed (executor={executor_name}, exit={result.get('exit_code')})")
+        return 0
+    if st == "failed":
+        if json_mode:
+            emit_err({"status": "failed", "id": wi_id, "error": "执行器失败",
+                      "detail": result.get("redacted_logs") or result.get("error")})
+        else:
+            print("错误: 执行器失败", file=sys.stderr)
+        return 1
+    if st == "timeout":
+        return fail(124, "执行器超时", None, json_mode)
+    return fail(2, f"非法 result.status: {st!r}", None, json_mode)
+
+
+def _cmd_verify_auto(wi_id, wi_dir, opts, json_mode, cfg):
+    no_transition = bool(opts.get("no-transition"))
+    route_override = opts.get("route")
+    if route_override is not None and route_override not in ROUTES:
+        return fail(2, f"非法 --route: {route_override}", None, json_mode)
+
+    status = load_status(wi_dir)
+    if status["state"] != "executed":
+        return fail(2, f"前置状态不符: verify --auto 需要 state=executed 实际 {status['state']}（先 flow workitem execute）", None, json_mode)
+    result_path = os.path.join(wi_dir, "executor", "result.json")
+    diff_path = os.path.join(wi_dir, "executor", "diff.patch")
+    if not os.path.isfile(result_path):
+        return fail(2, "executor/result.json 缺失", None, json_mode)
+    if not os.path.isfile(diff_path):
+        return fail(2, "executor/diff.patch 缺失", None, json_mode)
+    try:
+        result = json.loads(read_file(result_path))
+    except (ValueError, OSError) as e:
+        return fail(2, f"executor/result.json 损坏: {e}", None, json_mode)
+    if not isinstance(result, dict):
+        return fail(2, "executor/result.json 顶层必须是映射", None, json_mode)
+
+    wdir = workdir()
+
+    # 1) tests(§4.1)
+    tc = resolve_test_command(wi_dir, wdir, cli_command=opts.get("test-command"), result=result)
+    if tc["command"] is None:
+        tests_result = {"pass": False, "command": None, "exit_code": None,
+                        "output_tail": "", "reason": "command_unresolved", "source": None}
+    else:
+        run = _run_tests(wdir, tc["command"])
+        tests_result = {"pass": run["pass"], "command": tc["command"],
+                        "exit_code": run.get("exit_code"), "output_tail": run.get("output_tail", ""),
+                        "reason": run.get("reason"), "source": tc["source"]}
+    tests_pass = tests_result["pass"]
+
+    # 2) diff(§4.2)
+    try:
+        diff_result = check_diff_scope(wi_dir, result, cli_scope_file=opts.get("scope"))
+    except (UsageError, StoreError) as e:
+        return fail(2, str(e), None, json_mode)
+    diff_match = diff_result["match"]
+
+    # 3) errors(§4.3)
+    errors_result = check_error_table(wi_dir)
+    error_table_match = errors_result["match"]
+
+    gate_pass = tests_pass and diff_match and error_table_match
+
+    # 4) route 推导(§4.4)
+    route = route_override
+    if route is None and not gate_pass:
+        route = _derive_route(tests_result, diff_result, errors_result)
+
+    # 5) 写 verify.json + verify.md
+    verify = {"schema_version": 1, "tests_pass": tests_pass, "diff_match": diff_match,
+              "error_table_match": error_table_match, "route": route if not gate_pass else None,
+              "checked_at": now_iso(),
+              "details": {
+                  "tests": {"command": tests_result.get("command"), "exit_code": tests_result.get("exit_code"),
+                            "output_tail": tests_result.get("output_tail", ""),
+                            "reason": tests_result.get("reason"), "source": tests_result.get("source")},
+                  "diff": {"scope_verdict": diff_result["scope_verdict"],
+                           "out_of_scope": diff_result["out_of_scope"],
+                           "changed_files": diff_result["changed_files"],
+                           "allow": diff_result["allow"], "deny": diff_result["deny"],
+                           "reason": diff_result["reason"]},
+                  "error_table": {"total": errors_result["total"], "covered": errors_result["covered"],
+                                  "uncovered": errors_result["uncovered"],
+                                  "human_review": errors_result["human_review"],
+                                  "reason": errors_result["reason"]},
+              }}
+    os.makedirs(os.path.join(wi_dir, "executor"), exist_ok=True)
+    _atomic_write(os.path.join(wi_dir, "executor", "verify.json"),
+                  json.dumps(verify, ensure_ascii=False, separators=(",", ":")))
+    _write_verify_md(wi_dir, verify)
+
+    if no_transition:
+        if json_mode:
+            emit({"status": "ok" if gate_pass else "failed", "id": wi_id,
+                  "gate": {"tests_pass": tests_pass, "diff_match": diff_match,
+                           "error_table_match": error_table_match}, "no_transition": True})
+        else:
+            print(f"{wi_id}: 测试门 {'通过' if gate_pass else '失败'}（--no-transition 不转移）")
+        return 0 if gate_pass else 1
+
+    if gate_pass:
+        def _do():
+            return _do_transition(wi_dir, "executed", "verified", "verify", {}, {}, cfg)
+        try:
+            res = with_workitem_lock(wi_dir, _do)
+        except Locked as e:
+            return fail(2, f"锁被他人持有: {e}", None, json_mode)
+        if not res["ok"]:
+            return fail(1 if res["reason"].startswith("guard_failed:") else 2,
+                        res["reason"], res.get("detail"), json_mode)
+        if json_mode:
+            emit({"status": "ok", "id": wi_id,
+                  "gate": {"tests_pass": tests_pass, "diff_match": diff_match,
+                           "error_table_match": error_table_match},
+                  "transition": {"from": res["from"], "to": res["to"], "event": "verify",
+                                 "guard": res["guard"]}})
+        else:
+            print(f"{wi_id}: 测试门通过 → verified")
+        return 0
+
+    # 门未过 → 按 route 打回
+    to = "designed" if route == "design" else "executed"
+
+    def _do_fail():
+        return _do_transition(wi_dir, "executed", to, "verify_fail",
+                              {"route": route}, {"route": route}, cfg)
+    try:
+        res = with_workitem_lock(wi_dir, _do_fail)
+    except Locked as e:
+        return fail(2, f"锁被他人持有: {e}", None, json_mode)
+    if not res["ok"]:
+        return fail(1 if res["reason"].startswith("guard_failed:") else 2,
+                    res["reason"], res.get("detail"), json_mode)
+    if json_mode:
+        emit_err({"status": "failed", "id": wi_id,
+                  "gate": {"tests_pass": tests_pass, "diff_match": diff_match,
+                           "error_table_match": error_table_match},
+                  "route": route,
+                  "transition": {"from": res["from"], "to": res["to"], "event": "verify_fail"}})
+    else:
+        print(f"{wi_id}: 门未过 → {res['to']} (route={route})", file=sys.stderr)
+    return 1
+
+
+# ---------------------------------------------------------------------------
 # 主流程
 # ---------------------------------------------------------------------------
 
@@ -1302,7 +2024,9 @@ USAGE = """flow workitem <sub> ...
   unlock   <id> [--owner ID] [--force] [--json]
   show     <id> <artifact>
   guard    <id> --gate quality|test [--json]
-  verify   <id> [--tests b] [--diff b] [--errors b] [--route design|impl] [--json]
+  design   <id> [--force] [--json]
+  execute  <id> [--executor NAME] [--timeout N] [--force] [--json]
+  verify   <id> [--auto] [--tests b] [--diff b] [--errors b] [--route design|impl] [--test-command CMD] [--scope FILE] [--no-transition] [--json]
   decision <id> --verdict pass|reject|takeover [--defect-type T] [--summary S] [--json]
 """
 
@@ -1310,6 +2034,7 @@ SUBCOMMANDS = {
     "new": cmd_new, "status": cmd_status, "transition": cmd_transition,
     "list": cmd_list, "log": cmd_log, "lock": cmd_lock, "unlock": cmd_unlock,
     "show": cmd_show, "guard": cmd_guard, "verify": cmd_verify, "decision": cmd_decision,
+    "design": cmd_design, "execute": cmd_execute,
 }
 
 
