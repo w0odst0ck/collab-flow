@@ -1,0 +1,1 @@
+{"ts": "2026-08-14T13:48:40+08:00", "output": "20260814-134840-956887393-P2-workitem.md", "brief": "/tmp/dsh-inspect/brief-p2-workitem.md", "model": "deepseek-v4-pro", "session": "session-bb2cc63e-659d-4b61-b615-1a9117df4bf0", "usage": {"inputTokens": 50324, "outputTokens": 33713, "cacheReadTokens": 157184, "reasoningTokens": 21283}, "status": "ok", "duration_s": 479}
