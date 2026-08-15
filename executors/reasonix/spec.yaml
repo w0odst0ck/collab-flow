@@ -21,6 +21,7 @@ input:
   taskbook: file
   workdir: dir
 output:
+  # 契约产物统一由 wrapper 生成到 workitem 的 executor/ 目录;执行者不得在项目根/工作区生成,详见 templates/任务书.md【红线】执行器契约红线
   result_manifest: result.json
   diff: diff.patch
   cost: cost.json
