@@ -15,16 +15,17 @@
 #   flow workitem show     <id> <artifact>
 #   flow workitem guard    <id> --gate quality|test [--json]
 #   flow workitem verify   <id> [--tests b] [--diff b] [--errors b] [--route design|impl] [--json]
-#   flow workitem design   <id> [--async [--expected N]] [--check] [--force] [--json]
-#   flow workitem execute  <id> [--executor NAME] [--timeout N] [--model NAME] [--force] [--json]
+#   flow workitem design   <id> [--async [--expected N]] [--check] [--sync] [--force] [--json]
+#   flow workitem execute  <id> [--sync] [--executor NAME] [--timeout N] [--model NAME] [--force] [--json]
 #   flow workitem decision <id> --verdict pass|reject|takeover [--defect-type T] [--summary S] [--json]
-#   flow task add/status/list/log/run/reconcile(M1 后台任务队列,见 flow-task-core.py)
+#   flow task add/status/list/log/run/reconcile/wake-text(M1/M2 后台任务队列,见 flow-task-core.py)
 #
 # 退出码: 0 成功 / 1 运行失败(守卫拒绝等) / 2 用法或前置错误 /
 #         3 async 设计运行中(design --check) / 124 超时
 #
 # design --async:后台起 worker 立即返回(exit 0);--check 幂等查询,完成则落盘并转 designed
 # (运行中 exit 3;超预期时长报警 alarm:"timeout" exit 124;失败 exit 1;已设计 no-op exit 0)。
+# design/execute 无 flag = M2 默认 async-first:入队后台立即返回;--sync 保留旧同步路径。
 
 set -uo pipefail
 

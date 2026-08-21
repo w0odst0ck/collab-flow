@@ -92,7 +92,7 @@ make_executed() {
   local brief="$WORK/brief-$id.md"
   echo "# brief $id" > "$brief"
   run workitem new "$id" --brief "$brief" >/dev/null 2>&1 || { echo "make_executed:new fail"; return 1; }
-  run workitem design "$id" >/dev/null 2>&1 || { echo "make_executed:design fail"; return 1; }
+  run workitem design "$id" --sync >/dev/null 2>&1 || { echo "make_executed:design fail"; return 1; }
   run workitem decision "$id" --verdict pass >/dev/null 2>&1 || { echo "make_executed:decision fail"; return 1; }
   run workitem transition "$id" reviewed >/dev/null 2>&1 || { echo "make_executed:reviewed fail"; return 1; }
   run workitem transition "$id" translated >/dev/null 2>&1 || { echo "make_executed:translated fail"; return 1; }
@@ -107,7 +107,7 @@ diff_scope:
     - scripts/dsh-design
 ```
 TASKBOOK
-  STUB_EXECUTOR_CHANGE_FILE="$cf" run workitem execute "$id" --executor stub >/dev/null 2>&1 \
+  STUB_EXECUTOR_CHANGE_FILE="$cf" run workitem execute "$id" --sync --executor stub >/dev/null 2>&1 \
     || { echo "make_executed:execute fail"; return 1; }
 }
 
@@ -117,7 +117,7 @@ make_translated() {
   local brief="$WORK/brief-$id.md"
   echo "# brief $id" > "$brief"
   run workitem new "$id" --brief "$brief" >/dev/null 2>&1 || { echo "make_translated:new fail"; return 1; }
-  run workitem design "$id" >/dev/null 2>&1 || { echo "make_translated:design fail"; return 1; }
+  run workitem design "$id" --sync >/dev/null 2>&1 || { echo "make_translated:design fail"; return 1; }
   run workitem decision "$id" --verdict pass >/dev/null 2>&1 || { echo "make_translated:decision fail"; return 1; }
   run workitem transition "$id" reviewed >/dev/null 2>&1 || { echo "make_translated:reviewed fail"; return 1; }
   run workitem transition "$id" translated >/dev/null 2>&1 || { echo "make_translated:translated fail"; return 1; }
@@ -207,7 +207,7 @@ else
   bad "C24a" "rc=$RC out=$OUT"
 fi
 # execute --json(force 重跑 w5,已 executed)
-OUT="$(run workitem execute w5 --executor stub --force --json 2>/dev/null)"; RC=$?
+OUT="$(run workitem execute w5 --sync --executor stub --force --json 2>/dev/null)"; RC=$?
 if [[ $RC -eq 0 ]] && [[ $(printf '%s' "$OUT" | grep -c .) -eq 1 ]] && json_ok "$OUT" >/dev/null; then
   ok "execute --json 单行"
 else
@@ -251,7 +251,7 @@ fi
 echo "== C27: reasonix wrapper 经 stub rx 正常路径(ok + model/duration_s 落盘) =="
 make_translated w7 >/dev/null 2>&1
 export RX_BIN="$STUB_RX" RX_STUB_EXIT=0 RX_STUB_DIFF=1 RX_STUB_SLEEP=0 RX_STUB_LEAK=0
-OUT="$(run workitem execute w7 --executor reasonix --timeout 7 2>&1)"; RC=$?
+OUT="$(run workitem execute w7 --sync --executor reasonix --timeout 7 2>&1)"; RC=$?
 if [[ $RC -eq 0 ]] && [[ "$(state_of w7)" == "executed" ]] \
    && [[ -s "$DATA/workitems/w7/executor/diff.patch" ]] \
    && python3 -c 'import json;r=json.load(open("'"$DATA"'/workitems/w7/executor/result.json",encoding="utf-8"));assert r["status"]=="ok" and r["model"]=="deepseek-v4-flash" and "duration_s" in r and r["rx_timeout_s"]==7' 2>/dev/null; then
@@ -264,7 +264,7 @@ unset RX_BIN RX_STUB_EXIT RX_STUB_DIFF RX_STUB_SLEEP RX_STUB_LEAK
 echo "== C28: partial-complete 端到端(内层超时 + 产出非空 + redact) =="
 make_translated w8 >/dev/null 2>&1
 export RX_BIN="$STUB_RX" RX_STUB_EXIT=124 RX_STUB_DIFF=1 RX_STUB_SLEEP=3 RX_STUB_LEAK=1
-OUT="$(run workitem execute w8 --executor reasonix --timeout 1 2>&1)"; RC=$?
+OUT="$(run workitem execute w8 --sync --executor reasonix --timeout 1 2>&1)"; RC=$?
 if [[ $RC -eq 124 ]] && echo "$OUT" | grep -q "partial-complete" \
    && [[ "$(state_of w8)" == "translated" ]] \
    && python3 -c 'import json,re;r=json.load(open("'"$DATA"'/workitems/w8/executor/result.json",encoding="utf-8"));assert r["status"]=="partial-complete" and r["partial_complete"] and r["timeout_source"]=="rx" and r["redacted_logs"] and not re.search(r"sk-[A-Za-z0-9]{10}",r["redacted_logs"])' 2>/dev/null; then

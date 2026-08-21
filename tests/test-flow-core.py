@@ -614,7 +614,8 @@ class AsyncDesignTests(unittest.TestCase):
 
     def test_A10_sync_no_regression(self):
         wi_dir = self._mk_wi()
-        self.assertEqual(fc.cmd_design(["w1"], _cfg()), 0)   # 无 flag 仍走同步
+        # M2 默认 async-first:旧同步行为迁移到 --sync(断言不变)
+        self.assertEqual(fc.cmd_design(["w1", "--sync"], _cfg()), 0)
         st = fc.load_status(wi_dir)
         self.assertEqual(st["state"], "designed")
         self.assertNotIn("async", st)                       # 同步不写 async 标记

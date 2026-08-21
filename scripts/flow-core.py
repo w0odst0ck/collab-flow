@@ -22,6 +22,7 @@ import json
 import os
 import re
 import secrets
+import shlex
 import shutil
 import subprocess
 import sys
@@ -2011,6 +2012,69 @@ def _cmd_design_check(wi_id, wi_dir, json_mode, cfg):
     return 0
 
 
+def _translate_task_add_error(proc, json_mode):
+    """flow task add 非零退出 → 映射退出码(§0.3):duplicate_workitem→2(detail 含已有 task id);
+    写盘失败→1;其余用法/前置/StoreError→2;stderr 不可解析→1(fail-closed)。"""
+    lines = (proc.stderr or "").strip().splitlines()
+    text = lines[-1] if lines else ""
+    error, detail = None, None
+    try:
+        obj = json.loads(text)
+        if isinstance(obj, dict):
+            error = obj.get("error")
+            detail = obj.get("detail")
+    except (ValueError, TypeError):
+        pass
+    if error == "duplicate_workitem":
+        return fail(2, "duplicate_workitem", detail or "同 workitem 已有非终态任务", json_mode)
+    if error is not None and str(error).startswith("写盘失败"):
+        return fail(1, f"入队失败: {error}", detail, json_mode)
+    if error is not None:
+        return fail(2, f"入队被拒: {error}", detail, json_mode)
+    return fail(1, "flow task add 失败", text[:200] or None, json_mode)
+
+
+def _enqueue_workitem_op(cfg, sub, wi_id, inner_argv, kind, json_mode, state_before,
+                         timeout=None):
+    """M2 默认 async-first:构造 --sync 命令串 → flow task add 入队 → 返回 task_id。
+
+    命令串只拼 flow 绝对路径 + 白名单 id/选项(shlex.quote),不拼数据路径
+    (FLOW_DATA_DIR/FLOW_WORKDIR/DSH_* 经 env 继承透传,runner 及 sh -c 子进程天然继承)。
+    --sync 子命令是断递归关键:runner 执行同步分支,不再触发入队。
+    退出码:0 入队成功 / 1 子进程不可调用或写盘失败 / 2 重复入队、state 守卫等前置。
+    """
+    flow_bin = os.path.join(os.path.dirname(os.path.abspath(__file__)), "flow")
+    command = " ".join(shlex.quote(a) for a in ([flow_bin] + inner_argv))
+    if DENY_RE.search(command):
+        return fail(2, "入队命令含疑似 secret, 拒绝入队", None, json_mode)
+    cmd = [flow_bin, "task", "add", "--command", command,
+           "--workitem", wi_id, "--kind", kind]
+    if kind == "execute":
+        cmd += ["--expected-seconds", str(timeout + 115)]  # 外层安全网 ≥ 内层 timeout+缓冲
+    cmd += ["--json"]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True)
+    except OSError as e:
+        return fail(1, f"无法调用 flow task add: {e}", None, json_mode)
+    if proc.returncode != 0:
+        return _translate_task_add_error(proc, json_mode)
+    try:
+        info = json.loads(proc.stdout.strip().splitlines()[-1])
+    except (ValueError, IndexError):
+        return fail(1, "flow task add 输出非 JSON", None, json_mode)
+    if not isinstance(info, dict) or not info.get("id"):
+        return fail(1, "flow task add 输出缺 task id", None, json_mode)
+    task_id = info["id"]
+    if json_mode:
+        emit({"status": "ok", "id": wi_id, "state": state_before, "queued": True,
+              "task_id": task_id, "event": f"events/{task_id}.jsonl",
+              "expected_seconds": info.get("expected_seconds")})
+    else:
+        print(f"{wi_id}: {sub} 已入队 task={task_id} "
+              f"(后台执行;flow task status {task_id} 查询)")
+    return 0
+
+
 def async_worker_main(argv):
     """内部隐藏入口(--async-worker):后台 worker 契约,用户不可见(不出现在 USAGE)。
 
@@ -2056,8 +2120,11 @@ def cmd_design(args, cfg):
     force = bool(opts.get("force"))
     async_mode = bool(opts.get("async"))
     check_mode = bool(opts.get("check"))
+    sync_mode = bool(opts.get("sync"))
     if async_mode and check_mode:
         raise UsageError("--async 与 --check 互斥")
+    if sync_mode and (async_mode or check_mode):
+        raise UsageError("--sync 与 --async/--check 互斥")
     if opts.get("expected") is not None and not async_mode:
         raise UsageError("--expected 仅用于 --async")
     wi_dir = resolve_wi_dir(wi_id, cfg)
@@ -2072,6 +2139,13 @@ def cmd_design(args, cfg):
         return fail(2, "brief.md 为空或缺失", None, json_mode)
     if async_mode:
         return _cmd_design_async(wi_id, wi_dir, brief_path, json_mode, cfg, opts)
+    if not sync_mode:
+        # ── M2 默认 async-first:入队后台(命令串 = flow 绝对路径 + --sync 子命令) ──
+        return _enqueue_workitem_op(
+            cfg, "design", wi_id,
+            ["workitem", "design", wi_id, "--sync"]
+            + (["--force"] if force else []) + ["--json"],
+            "design", json_mode, status["state"])
 
     # ── 同步路径(行为与现状逐分支一致;仅把 flow-config 调用提取为 _invoke_design) ──
     flow_config = os.path.join(os.path.dirname(os.path.abspath(__file__)), "flow-config")
@@ -2144,6 +2218,7 @@ def cmd_execute(args, cfg):
         raise UsageError("execute 多余参数")
     json_mode = bool(opts.get("json"))
     force = bool(opts.get("force"))
+    sync_mode = bool(opts.get("sync"))
     executor_name = opts.get("executor") or cfg["executor"].get("default", "reasonix")
     wi_dir = resolve_wi_dir(wi_id, cfg)
 
@@ -2181,6 +2256,17 @@ def cmd_execute(args, cfg):
     wrapper = os.path.join(executors_dir(), executor_name, "wrapper.sh")
     if not os.path.isfile(wrapper):
         return fail(2, f"执行器 wrapper 缺失: {executor_name}", None, json_mode)
+
+    if not sync_mode:
+        # ── M2 默认 async-first:入队后台(命令串 = flow 绝对路径 + --sync 子命令) ──
+        # 外层 expected-seconds = timeout+115(≥ 内层执行器 timeout + wrapper 缓冲,防抢先杀)
+        return _enqueue_workitem_op(
+            cfg, "execute", wi_id,
+            ["workitem", "execute", wi_id, "--sync", "--executor", executor_name,
+             "--timeout", str(timeout)]
+            + (["--model", model] if model else [])
+            + (["--force"] if force else []) + ["--json"],
+            "execute", json_mode, status["state"], timeout=timeout)
 
     # 调 wrapper(执行器子进程运行期间不持 workitem 锁)
     run_executor(wrapper, taskbook_path, wdir, out_dir, timeout, model=model)
@@ -2396,8 +2482,8 @@ USAGE = """flow workitem <sub> ...
   unlock   <id> [--owner ID] [--force] [--json]
   show     <id> <artifact>
   guard    <id> --gate quality|test [--json]
-  design   <id> [--async [--expected N]] [--check] [--force] [--json]
-  execute  <id> [--executor NAME] [--timeout N] [--model NAME] [--force] [--json]
+  design   <id> [--async [--expected N]] [--check] [--sync] [--force] [--json]
+  execute  <id> [--sync] [--executor NAME] [--timeout N] [--model NAME] [--force] [--json]
   verify   <id> [--auto] [--tests b] [--diff b] [--errors b] [--route design|impl] [--test-command CMD] [--scope FILE] [--no-transition] [--json]
   decision <id> --verdict pass|reject|takeover [--defect-type T] [--summary S] [--json]
 """

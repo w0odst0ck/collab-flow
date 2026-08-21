@@ -20,6 +20,7 @@
 
 import importlib.util
 import json
+import math
 import os
 import re
 import secrets
@@ -57,6 +58,7 @@ now_iso = _fc.now_iso            # ISO8601 UTC(timespec="seconds")
 TASK_ID_RE = re.compile(r"^t-[0-9a-f]{12}$")   # 任务 id 白名单,硬编码不进 config
 TASK_STATES = ("queued", "running", "done", "failed", "timeout")
 TERMINAL_STATES = ("done", "failed", "timeout")
+KINDS = ("design", "execute")                  # M2:任务类型(决定事件/种子/partial-complete 语义)
 PRIORITIES = ("P0", "P1", "P2")
 PRIO_ORDER = {"P0": 0, "P1": 1, "P2": 2}
 SCHEMA_VERSION = 1
@@ -64,12 +66,14 @@ RECONCILE_GRACE_S = 60   # pid=None(dispatch 提升后 runner 尚未写 pid 的�
 
 USAGE = """用法: flow task <sub> ...
   flow task add       --command CMD [--workitem W] [--priority P0|P1|P2]
-                      [--expected-seconds N] [--kill-on-timeout] [--json]
+                      [--expected-seconds N] [--kill-on-timeout]
+                      [--kind design|execute] [--json]
   flow task status    <id> [--json]
   flow task list      [--state S] [--workitem W] [--json]
   flow task log       <id> [--tail N] [--json]
   flow task run       [--max-parallel N] [--json]
   flow task reconcile [--json]
+  flow task wake-text <id> [--json]
 退出码: 0 成功 / 1 运行失败 / 2 用法或前置错误(含幂等拒绝)/
         124 仅任务命令语义(不进 CLI 顶层)。
 """
@@ -185,18 +189,20 @@ def load_task_config():
         script_dir, "..", "config", "defaults.yaml")
     defaults = _fc.parse_yaml(_fc.read_file(defaults_path), defaults_path)
     task = dict(defaults.get("task") or {})
+    host = dict(defaults.get("host") or {})
     user_path = os.environ.get("COLLABFLOW_CONFIG") or os.path.expanduser(
         "~/.config/collabflow/config.yaml")
     if os.path.isfile(user_path):
         user = _fc.parse_yaml(_fc.read_file(user_path), user_path)
         task = _merge(task, dict(user.get("task") or {}))
+        host = _merge(host, dict(user.get("host") or {}))
     mp = _env_int("FLOW_TASK_MAX_PARALLEL")
     if mp is not None:
         task["max_parallel"] = mp
     lb = _env_int("FLOW_TASK_LOG_TAIL_BYTES")
     if lb is not None:
         task["log_tail_bytes"] = lb
-    return {"task": task}
+    return {"task": task, "host": host}
 
 
 # ---------------------------------------------------------------------------
@@ -304,6 +310,182 @@ def read_log(path, tail_bytes=None):
 
 
 # ---------------------------------------------------------------------------
+# 事件层(§1.3:只增不删、可重放;best-effort,注册表是唯一权威终态)
+# ---------------------------------------------------------------------------
+
+EVENT_SCHEMA_VERSION = 1
+
+
+def events_dir():
+    return os.path.join(task_dir(), "events")
+
+
+def event_path(tid):
+    return os.path.join(events_dir(), f"{tid}.jsonl")
+
+
+def event_lock_path(tid):
+    return event_path(tid) + ".lock"
+
+
+def count_lines(path):
+    """事件文件行数(= 下一条 seq);缺失 → 0。"""
+    if not os.path.isfile(path):
+        return 0
+    n = 0
+    with open(path, "rb") as f:
+        for _ in f:
+            n += 1
+    return n
+
+
+def append_task_event(tid, record):
+    """events/<tid>.jsonl flock 追加;seq=行数+1;只增不删(open "a" 无截断路径);
+    写入前过 DENY_RE(fail-closed)。失败=best-effort(注册表仍是权威)。"""
+    path = event_path(tid)
+    os.makedirs(events_dir(), exist_ok=True)
+    text = json.dumps(record, ensure_ascii=False)
+    if DENY_RE.search(text):
+        raise StoreError("事件含疑似 secret, 拒绝写入")
+    fd = os.open(event_lock_path(tid), os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        if fcntl is not None and hasattr(fcntl, "flock"):
+            fcntl.flock(fd, fcntl.LOCK_EX)
+        seq = count_lines(path) + 1
+        rec = dict(record)
+        rec["seq"] = seq
+        line = json.dumps(rec, ensure_ascii=False, separators=(",", ":")) + "\n"
+        with open(path, "a", encoding="utf-8") as f:  # 只增不删,无截断
+            f.write(line)
+            f.flush()
+            os.fsync(f.fileno())
+    finally:
+        if fcntl is not None and hasattr(fcntl, "flock"):
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+    return seq
+
+
+def _emit_task_event_best_effort(tid, record):
+    """事件写入 best-effort:失败仅告警,不改任务终态。"""
+    try:
+        append_task_event(tid, record)
+    except (StoreError, OSError) as e:
+        print(f"告警: 事件写入失败 {tid}: {e}", file=sys.stderr)
+
+
+# ---------------------------------------------------------------------------
+# duration→expected_seconds 种子(§1.4(2):EMA + last[N] 截断 + flock 原子写)
+# ---------------------------------------------------------------------------
+
+SEED_SCHEMA_VERSION = 1
+
+
+def seed_path():
+    return os.path.join(task_dir(), "duration-seed.json")
+
+
+def seed_lock_path():
+    return seed_path() + ".lock"
+
+
+def empty_seed():
+    return {"schema_version": SEED_SCHEMA_VERSION, "kinds": {}}
+
+
+def load_seed():
+    """读种子库:缺失 → 空;非 JSON/顶层非 dict → 空(回退 fallback,不 crash,§E5)。"""
+    path = seed_path()
+    if not os.path.isfile(path):
+        return empty_seed()
+    try:
+        data = json.loads(_fc.read_file(path))
+    except ValueError:
+        return empty_seed()
+    if not isinstance(data, dict):
+        return empty_seed()
+    return data
+
+
+def save_seed_atomic(seed):
+    """原子写(同注册表):temp + fsync + os.replace;整表写入前过 DENY_RE。"""
+    path = seed_path()
+    os.makedirs(task_dir(), exist_ok=True)
+    text = json.dumps(seed, ensure_ascii=False, indent=2) + "\n"
+    if DENY_RE.search(text):
+        raise StoreError("种子库含疑似 secret, 拒绝写入")
+    tmp = f"{path}.tmp.{os.getpid()}.{secrets.token_hex(4)}"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+
+
+def with_seed_flock(fn):
+    """种子库 flock 串行化(同注册表模式);非 POSIX 降级无锁直执行。"""
+    if fcntl is None or not hasattr(fcntl, "flock"):
+        return fn()
+    os.makedirs(task_dir(), exist_ok=True)
+    fd = os.open(seed_lock_path(), os.O_CREAT | os.O_RDWR, 0o644)
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    try:
+        return fn()
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
+def seed_expected(history, fallback):
+    """纯函数:history=[int>0...](chronological);空→fallback;
+    否则 max(fallback, ceil(EMA(α=0.5)*1.5))。"""
+    if not history:
+        return int(fallback)
+    ema = float(history[0])
+    for d in history[1:]:
+        ema = 0.5 * float(d) + 0.5 * ema
+    return max(int(fallback), int(math.ceil(ema * 1.5)))
+
+
+def update_seed(store, kind, duration_s, max_len=8):
+    """纯函数:duration 入种子库,维护 last[N] + EMA;非法 duration 忽略。"""
+    if not isinstance(duration_s, int) or duration_s <= 0:
+        return store
+    k = store.setdefault("kinds", {}).setdefault(
+        kind, {"ema": 0.0, "count": 0, "last": []})
+    k["count"] += 1
+    k["last"] = (k["last"] + [duration_s])[-max_len:]
+    k["ema"] = float(duration_s) if k["count"] == 1 else 0.5 * duration_s + 0.5 * k["ema"]
+    return store
+
+
+def _load_seed_kind(kind):
+    """读某 kind 的历史 duration 样本(纯正数,chronological)。"""
+    seed = load_seed()
+    k = (seed.get("kinds") or {}).get(kind) or {}
+    hist = k.get("last") or []
+    return [int(d) for d in hist if isinstance(d, int) and d > 0]
+
+
+def _record_duration_best_effort(kind, duration_s, max_len):
+    """runner 终态回灌种子(flock 内读-改-写);失败仅告警。"""
+    if not kind or duration_s is None:
+        return
+    try:
+        with_seed_flock(lambda: save_seed_atomic(
+            update_seed(load_seed(), kind, duration_s, max_len)))
+    except (StoreError, OSError) as e:
+        print(f"告警: 种子更新失败 kind={kind}: {e}", file=sys.stderr)
+
+
+# ---------------------------------------------------------------------------
 # 运行层(§1.4(2)/§1.6:reconcile / dispatch / spawn / run_command)
 # ---------------------------------------------------------------------------
 
@@ -402,7 +584,7 @@ def spawn_runner(tid):
 
 
 def dispatch(cfg, max_parallel=None):
-    """调度(§1.4(2)):flock 内 reconcile → plan_dispatch(优先级+空闲槽) → 提升保存;锁外 spawn。"""
+    """调度(§1.4(2)):flock 内 reconcile → plan_dispatch(优先级+空闲槽) → 提升保存;锁外写 running 事件 + spawn。"""
     m = max_parallel if max_parallel is not None else int(cfg["task"]["max_parallel"])
 
     def _do():
@@ -415,21 +597,35 @@ def dispatch(cfg, max_parallel=None):
             t["started_at"] = now
             t["pid"] = None  # runner 启动后自填(§1.4(2))
         save_registry_atomic(reg)
-        return [t["id"] for t in promoted]
+        return [(t["id"], dict(t)) for t in promoted]
 
-    promoted_ids = with_registry_flock(_do)
-    for tid in promoted_ids:
+    promoted = with_registry_flock(_do)
+    for tid, t in promoted:
+        _emit_task_event_best_effort(tid, {
+            "schema_version": EVENT_SCHEMA_VERSION, "ts": now_iso(),
+            "task_id": tid, "workitem": t.get("workitem"), "kind": t.get("kind"),
+            "state": "running", "exit_code": None, "duration_s": None,
+            "expected_seconds": t.get("expected_seconds"),
+            "started_at": t.get("started_at"), "finished_at": None,
+            "diagnostic": None, "partial_complete": False,
+        })
         spawn_runner(tid)
-    return promoted_ids
+    return [tid for tid, _ in promoted]
 
 
 def add_task(cfg, command, workitem=None, priority="P2",
-             expected_seconds=None, kill_on_timeout=False):
-    """幂等入队(§1.4(1)):flock 内去重(同 workitem 非终态 → DuplicateWorkitem) + 追加 + 自动 dispatch。"""
+             expected_seconds=None, kill_on_timeout=False, kind=None):
+    """幂等入队(§1.4(1)):flock 内去重(同 workitem 非终态 → DuplicateWorkitem) + 追加 + 自动 dispatch。
+
+    kind 非空时:缺省 expected_seconds → 种子回退(config 默认);注册表条目带 kind 字段。
+    queued 事件在注册表追加后 best-effort 写入(§1.3)。
+    """
     if command is None or command.strip() == "":
         raise UsageError("--command 不能为空")
     if priority not in PRIORITIES:
         raise UsageError(f"--priority 必须为 {'/'.join(PRIORITIES)}: {priority}")
+    if kind is not None and kind not in KINDS:
+        raise UsageError(f"--kind 必须为 {'/'.join(KINDS)}: {kind}")
     if expected_seconds is not None:
         if not isinstance(expected_seconds, int) or expected_seconds <= 0:
             raise UsageError(f"--expected-seconds 必须是正整数: {expected_seconds}")
@@ -445,17 +641,29 @@ def add_task(cfg, command, workitem=None, priority="P2",
         tid = "t-" + secrets.token_hex(6)
         while tid in reg["tasks"]:  # 冲突则重试(§1.4(1))
             tid = "t-" + secrets.token_hex(6)
+        exp = expected_seconds
+        if exp is None and kind is not None:
+            fallback = int((cfg["task"].get("expected_seconds_seed") or {}).get(kind, 480))
+            exp = seed_expected(_load_seed_kind(kind), fallback)
         reg["tasks"][tid] = {
             "id": tid, "workitem": workitem, "command": command,
-            "priority": priority, "state": "queued",
-            "expected_seconds": expected_seconds, "kill_on_timeout": bool(kill_on_timeout),
+            "priority": priority, "state": "queued", "kind": kind,
+            "expected_seconds": exp, "kill_on_timeout": bool(kill_on_timeout),
             "created_at": _now_ms(), "started_at": None, "finished_at": None,
             "exit_code": None, "failure_tail": None, "pid": None, "heartbeat_at": None,
         }
         save_registry_atomic(reg)
-        return tid
+        # queued 事件在注册表锁内写:保证先于任何并发 dispatch 的 running 事件落盘(事件流不倒挂)
+        _emit_task_event_best_effort(tid, {
+            "schema_version": EVENT_SCHEMA_VERSION, "ts": now_iso(),
+            "task_id": tid, "workitem": workitem, "kind": kind,
+            "state": "queued", "exit_code": None, "duration_s": None,
+            "expected_seconds": exp, "started_at": None, "finished_at": None,
+            "diagnostic": None, "partial_complete": False,
+        })
+        return tid, reg["tasks"][tid]
 
-    tid = with_registry_flock(_do)
+    tid, entry = with_registry_flock(_do)
     try:
         dispatch(cfg)  # best-effort 自动出队;失败不回溯,任务留在 queued,run 可补
     except (StoreError, OSError):
@@ -466,6 +674,60 @@ def add_task(cfg, command, workitem=None, priority="P2",
 # ---------------------------------------------------------------------------
 # 落账 runner(§1.4(3):分离式 wrapper,命令结束 finally 自动状态流转)
 # ---------------------------------------------------------------------------
+
+def classify_event_state(rc, timed_out, partial_complete=False):
+    """纯函数:命令结束 → 事件终态;timeout 且 partial → "partial-complete"。"""
+    st, _ = terminal_state(rc, timed_out)
+    return "partial-complete" if (st == "timeout" and partial_complete) else st
+
+
+def _executor_result_path(t):
+    """execute 任务对应的 <FLOW_DATA_DIR>/workitems/<wi>/executor/result.json。"""
+    data_dir = os.environ.get("FLOW_DATA_DIR") or os.path.join(os.getcwd(), ".flow")
+    return os.path.join(data_dir, "workitems", t["workitem"], "executor", "result.json")
+
+
+def _is_partial_complete(t, rc):
+    """I/O:execute 且 rc==124 时读 result.json(status=partial-complete/partial_complete)。
+    缺失/损坏 → False(降级 timeout,安全侧,§E14)。"""
+    if rc != 124 or t.get("kind") != "execute" or not t.get("workitem"):
+        return False
+    p = _executor_result_path(t)
+    if not os.path.isfile(p):
+        return False
+    try:
+        r = json.loads(_fc.read_file(p))
+    except (ValueError, OSError):
+        return False
+    return isinstance(r, dict) and (
+        r.get("status") == "partial-complete" or r.get("partial_complete") is True)
+
+
+def _diagnostic_for(event_state, t, tail):
+    """终态诊断串(均须已 redact):done → null;partial-complete → result.json redacted_logs;
+    failed/timeout → failure_tail(tail)。"""
+    if event_state == "done":
+        return None
+    if event_state == "partial-complete" and t.get("workitem"):
+        try:
+            r = json.loads(_fc.read_file(_executor_result_path(t)))
+        except (ValueError, OSError):
+            return tail
+        if isinstance(r, dict) and r.get("redacted_logs"):
+            return r["redacted_logs"]
+    return tail
+
+
+def _wallclock_seconds(started_at, finished_at):
+    """墙钟耗时(秒);任一时间缺失/非法 → None。"""
+    if not started_at or not finished_at:
+        return None
+    try:
+        delta = datetime.fromisoformat(finished_at) - datetime.fromisoformat(started_at)
+        return max(0, int(delta.total_seconds()))
+    except (TypeError, ValueError):
+        return None
+
 
 def _runner(task_id, cfg):
     """单任务落账(内部子命令,隐藏不入 help)。命令结束后 finally 写终态,再 dispatch 自续。"""
@@ -496,19 +758,41 @@ def _runner(task_id, cfg):
         state, _reason = terminal_state(rc, timed_out)
         tail = extract_tail(log_path_, int(cfg["task"].get("log_tail_bytes", 2000))) \
             if state != "done" else None
+        finished_at = _now_ms()
 
         def _settle():
+            nonlocal finished_at
             reg = load_registry()
             t2 = reg["tasks"].get(task_id)
             if t2 is not None and t2["state"] == "running":  # 二次守卫:落账幂等
                 t2["state"] = state
                 t2["exit_code"] = rc
-                t2["finished_at"] = _now_ms()
+                t2["finished_at"] = finished_at
                 t2["failure_tail"] = tail
                 save_registry_atomic(reg)
 
         with_registry_flock(_settle)
         print(f"=== {task_id} end state={state} exit={rc} ===", flush=True)
+        # ── M2:注册表终态提交后,锁外 best-effort(事件/种子/notify,注册表是唯一权威) ──
+        try:
+            partial = _is_partial_complete(t, rc)
+            event_state = classify_event_state(rc, timed_out, partial)
+            dur = _wallclock_seconds(t.get("started_at"), finished_at)
+            event_record = {
+                "schema_version": EVENT_SCHEMA_VERSION, "ts": now_iso(),
+                "task_id": task_id, "workitem": t.get("workitem"), "kind": t.get("kind"),
+                "state": event_state, "exit_code": rc, "duration_s": dur,
+                "expected_seconds": t.get("expected_seconds"),
+                "started_at": t.get("started_at"), "finished_at": finished_at,
+                "diagnostic": _diagnostic_for(event_state, t, tail),
+                "partial_complete": partial,
+            }
+            _record_duration_best_effort(
+                t.get("kind"), dur, int(cfg["task"].get("seed_history_len", 8)))
+            _emit_task_event_best_effort(task_id, event_record)
+            _notify_if_configured(cfg, event_record)
+        except (StoreError, OSError) as e:
+            print(f"告警: 终态事件/种子处理失败 {task_id}: {e}", file=sys.stderr)
     try:
         dispatch(cfg)  # 释放槽位 → 触发下一批(自续队列)
     except (StoreError, OSError):
@@ -532,7 +816,7 @@ def runner_main(argv):
 # ---------------------------------------------------------------------------
 
 def cmd_add(args, cfg):
-    pos, opts = scan_args(args, {"command", "workitem", "priority", "expected-seconds"})
+    pos, opts = scan_args(args, {"command", "workitem", "priority", "expected-seconds", "kind"})
     json_mode = bool(opts.get("json"))
     if pos:
         return fail(2, "add 不接受位置参数", None, json_mode)
@@ -541,6 +825,7 @@ def cmd_add(args, cfg):
         return fail(2, "missing command", "add 需要 --command CMD", json_mode)
     workitem = opts.get("workitem")
     priority = opts.get("priority") or str(cfg["task"].get("default_priority", "P2"))
+    kind = opts.get("kind")
     expected_raw = opts.get("expected-seconds")
     expected = None
     if expected_raw is not None:
@@ -552,7 +837,7 @@ def cmd_add(args, cfg):
             return fail(2, "invalid expected-seconds", "必须为正整数", json_mode)
     try:
         tid = add_task(cfg, command, workitem=workitem, priority=priority,
-                       expected_seconds=expected,
+                       expected_seconds=expected, kind=kind,
                        kill_on_timeout=bool(opts.get("kill-on-timeout")))
     except DuplicateWorkitem as e:
         return fail(2, "duplicate_workitem", f"已有非终态任务 {e.args[0]} ({e.args[1]})", json_mode)
@@ -561,8 +846,17 @@ def cmd_add(args, cfg):
     except StoreError as e:
         return fail(2, str(e), None, json_mode)
     if json_mode:
+        exp = expected
+        if exp is None and kind is not None:  # 种子回退的实际落盘值(供入队方透传)
+            try:
+                entry = load_registry()["tasks"].get(tid)
+                if entry is not None:
+                    exp = entry.get("expected_seconds")
+            except (StoreError, KeyError, TypeError):
+                pass
         emit({"status": "ok", "id": tid, "state": "queued",  # 入队确认(§1.5 契约)
-              "workitem": workitem, "priority": priority})
+              "workitem": workitem, "priority": priority, "kind": kind,
+              "expected_seconds": exp})
     else:
         print(f"task {tid}: queued")
     return 0
@@ -708,12 +1002,110 @@ def cmd_reconcile(args, cfg):
 
 
 # ---------------------------------------------------------------------------
+# 宿主集成(§1.5:wake 自包含文本 + notify 命令钩子;均 best-effort)
+# ---------------------------------------------------------------------------
+
+WAKE_VARS = ("task_id", "workitem", "kind", "state", "exit_code", "elapsed_seconds",
+             "expected_seconds", "log_path", "event_path", "next_command")
+
+DEFAULT_WAKE_TEMPLATE = (
+    "任务 {task_id}（workitem={workitem} kind={kind}）当前 state={state} exit_code={exit_code}\n"
+    "已耗时 {elapsed_seconds}s / 预估 {expected_seconds}s\n"
+    "统一日志: {log_path}   事件流: {event_path}\n"
+    "下一步: {next_command}\n"
+    "失败处理: 见 {log_path} 尾部与事件流 diagnostic；"
+    "design 可 design --check，execute 可 execute --sync --force 重跑"
+)
+
+
+def render_wake_text(template, ctx):
+    """纯函数:null → 内置默认模板;对 WAKE_VARS 做替换;未知占位符保留字面量。"""
+    tpl = template or DEFAULT_WAKE_TEMPLATE
+    for k in WAKE_VARS:
+        tpl = tpl.replace("{" + k + "}", str(ctx.get(k, "")))
+    return tpl
+
+
+def _wake_ctx(t):
+    """由注册表条目构造 wake 渲染上下文(elapsed 由 started/finished 派生,next_command 按 kind)。"""
+    tid = t["id"]
+    kind = t.get("kind")
+    wi = t.get("workitem") or ""
+    if kind == "design":
+        next_command = f"flow workitem design {wi} --check"
+    elif kind == "execute":
+        next_command = f"flow workitem status {wi}"
+    else:
+        next_command = f"flow task status {tid}"
+    if t.get("finished_at"):
+        elapsed = _wallclock_seconds(t.get("started_at"), t.get("finished_at"))
+    else:
+        elapsed = _wallclock_seconds(t.get("started_at"), _now_ms())
+    return {
+        "task_id": tid, "workitem": wi, "kind": kind or "",
+        "state": t.get("state"),
+        "exit_code": t.get("exit_code") if t.get("exit_code") is not None else "",
+        "elapsed_seconds": elapsed if elapsed is not None else "",
+        "expected_seconds": (t.get("expected_seconds")
+                             if t.get("expected_seconds") is not None else ""),
+        "log_path": os.path.abspath(log_path(tid)),
+        "event_path": os.path.abspath(event_path(tid)),
+        "next_command": next_command,
+    }
+
+
+def cmd_wake_text(args, cfg):
+    pos, opts = scan_args(args, set())
+    json_mode = bool(opts.get("json"))
+    if len(pos) != 1:
+        return fail(2, "wake-text 需要 <id>", None, json_mode)
+    tid = pos[0]
+    if not TASK_ID_RE.fullmatch(tid):
+        return fail(2, "invalid task id", tid, json_mode)
+    try:
+        reg = load_registry()
+    except StoreError as e:
+        return fail(2, str(e), None, json_mode)
+    t = reg["tasks"].get(tid)
+    if t is None:
+        return fail(2, "task not found", tid, json_mode)
+    host = cfg.get("host") or {}
+    text = render_wake_text(host.get("wake_template"), _wake_ctx(t))
+    if json_mode:
+        emit({"status": "ok", "id": tid, "wake_text": text})
+    else:
+        print(text)
+    return 0
+
+
+def _notify_if_configured(cfg, event_record):
+    """终态通知钩子(§1.5):host.notify 非空才调;事件 JSON 走 stdin(不落 argv);
+    模板含控制字符 → 拒绝执行(fail-closed);失败仅告警不影响终态。"""
+    host = cfg.get("host") or {}
+    template = host.get("notify")
+    if not template or not isinstance(template, str):
+        return
+    if re.search(r"[\x00-\x1f]", template):
+        print("告警: host.notify 含控制字符, 拒绝执行", file=sys.stderr)
+        return
+    try:
+        proc = subprocess.run(["sh", "-c", template],
+                              input=json.dumps(event_record, ensure_ascii=False),
+                              capture_output=True, text=True)
+        if proc.returncode != 0:
+            print(f"告警: notify 命令 exit={proc.returncode}", file=sys.stderr)
+    except OSError as e:
+        print(f"告警: notify 调用失败: {e}", file=sys.stderr)
+
+
+# ---------------------------------------------------------------------------
 # 入口
 # ---------------------------------------------------------------------------
 
 SUBCOMMANDS = {
     "add": cmd_add, "status": cmd_status, "list": cmd_list,
     "log": cmd_log, "run": cmd_run, "reconcile": cmd_reconcile,
+    "wake-text": cmd_wake_text,
 }
 
 

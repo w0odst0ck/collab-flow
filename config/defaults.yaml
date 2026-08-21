@@ -59,4 +59,11 @@ task:                          # M1 新增;全标量,P1 解析器照常通过(ta
   default_priority: P2         # 新任务默认优先级
   log_tail_bytes: 2000         # failure_tail 抽取字节数(对齐 executor output_tail 口径),env FLOW_TASK_LOG_TAIL_BYTES
   kill_grace_s: 5              # --kill-on-timeout 时 SIGTERM→SIGKILL 宽限秒数
+  expected_seconds_seed:       # M2 新增:队列 SLA 硬超时种子(软截止先验,非硬超时本身)
+    design: 480                # 对齐 workitem.design_expected_seconds
+    execute: 1800              # 对齐 executor.timeout_s
+  seed_history_len: 8          # M2 新增:每 kind 保留的 duration 样本数
+host:                          # M2 新增:宿主集成钩子(全标量,均 null=关闭)
+  notify: null                 # 通知命令模板;非空时终态把事件 JSON 走 stdin 喂给该命令
+  wake_template: null          # 唤醒文本模板;null=内置默认;占位符渲染(design M2 §1.5)
 

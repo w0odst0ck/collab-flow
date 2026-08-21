@@ -272,7 +272,7 @@ class FlowCorePartialCompleteTests(unittest.TestCase):
         os.environ["STUB_EXECUTOR_NO_RESULT"] = "1"
         os.environ["STUB_EXECUTOR_EXIT"] = "0"
         self._write_result(wi_dir)
-        code = fc.cmd_execute(["w1", "--executor", "stub"], _cfg())
+        code = fc.cmd_execute(["w1", "--sync", "--executor", "stub"], _cfg())
         self.assertEqual(code, 124)
         self.assertEqual(fc.load_status(wi_dir)["state"], "translated")
 
@@ -298,7 +298,7 @@ class FlowCorePartialCompleteTests(unittest.TestCase):
     def test_PC03_model_empty_rejected(self):
         """--model 空串 → exit 2,不转移。"""
         wi_dir = self._mk_wi("translated")
-        code = fc.cmd_execute(["w1", "--executor", "stub", "--model", ""], _cfg())
+        code = fc.cmd_execute(["w1", "--sync", "--executor", "stub", "--model", ""], _cfg())
         self.assertEqual(code, 2)
         self.assertEqual(fc.load_status(wi_dir)["state"], "translated")
 

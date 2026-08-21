@@ -220,7 +220,9 @@ chmod +x "$STUB_DSH"
 mkdir -p "$WORK/dshhome"
 
 run_design() { # run_design [args...] —— design 链路:注入 stub dsh 全套 env
-  env HOME="$WORK/home" FLOW_DATA_DIR="$DATA" COLLABFLOW_CONFIG="$WORK/no-cfg.yaml" \
+  # FLOW_TASK_DIR 必注(M2 默认入队落临时目录,不触碰真实 ~/.collabflow;run/run_mp 已有,此处补齐)
+  env HOME="$WORK/home" FLOW_DATA_DIR="$DATA" FLOW_TASK_DIR="$WORK/task" \
+      COLLABFLOW_CONFIG="$WORK/no-cfg.yaml" \
       DEEPSEEK_API_KEY="$FAKE_KEY" DSH_HOME="$WORK/dshhome" DSH_BIN="$STUB_DSH" \
       DSH_DESIGN_PRO_PATCH="$WORK/pro.patch.yml" \
       "$FLOW" "$@"
@@ -424,6 +426,286 @@ if [[ $RC -eq 0 ]] && [[ "$LEN" -le 20 ]] && echo "$OUT" | grep -q "==="; then
   ok "尾部 ${LEN} 字节 ≤20 + 含 runner 结束标记"
 else
   bad "C29" "rc=$RC len=$LEN out=$OUT"
+fi
+
+# ---------- C30-C39: M2 async-first 默认 + 事件层 + 宿主集成(stub 零 API) ----------
+# stub rx(reasonix wrapper 经 RX_BIN 注入,C36 partial-complete 用):记录/行为受 env 控制
+STUB_RX="$WORK/stub-rx.sh"
+cat > "$STUB_RX" << 'RX'
+#!/usr/bin/env bash
+set -u
+if [[ "${RX_STUB_DIFF:-0}" == "1" ]]; then
+  echo "stub rx change $(date +%s)" >> README.md
+fi
+if [[ "${RX_STUB_SLEEP:-0}" != "0" ]]; then
+  sleep "${RX_STUB_SLEEP}"
+fi
+exit "${RX_STUB_EXIT:-0}"
+RX
+chmod +x "$STUB_RX"
+
+run_x() { # run_x [args...] —— execute 链路 env(FLOW_WORKDIR=临时 git 项目,防污染仓库根)
+  env HOME="$WORK/home" FLOW_DATA_DIR="$DATA" FLOW_TASK_DIR="$WORK/task" \
+      FLOW_WORKDIR="$PROJ" COLLABFLOW_CONFIG="$WORK/no-cfg.yaml" \
+      DSH_BIN="$STUB_DSH" DEEPSEEK_API_KEY="$FAKE_KEY" \
+      DSH_HOME="$WORK/dshhome" DSH_DESIGN_PRO_PATCH="$WORK/pro.patch.yml" \
+      "$FLOW" "$@"
+}
+
+task_id_of() { # task_id_of —— 从入队 JSON 输出取 task_id
+  printf '%s' "$1" | python3 -c 'import sys,json;print(json.loads(sys.stdin.read()).get("task_id",""))' 2>/dev/null
+}
+
+wait_task() { # wait_task <tid> [timeout_s] —— 轮询 task status 至终态
+  local tid="$1" t="${2:-30}" i=0 st=""
+  while [[ $i -lt $((t * 2)) ]]; do
+    st="$(run task status "$tid" --json 2>/dev/null \
+          | python3 -c 'import sys,json;print((json.loads(sys.stdin.read()).get("task") or {}).get("state",""))' 2>/dev/null)"
+    case "$st" in done|failed|timeout) return 0;; esac
+    sleep 0.5
+    i=$((i + 1))
+  done
+  return 1
+}
+
+ev_state() { # ev_state <evfile> —— 事件流最后一行 state
+  python3 -c 'import json,sys
+lines=[l for l in open(sys.argv[1],encoding="utf-8") if l.strip()]
+print(json.loads(lines[-1]).get("state",""))' "$1" 2>/dev/null
+}
+
+echo "== C30: design 默认入队(queued+task_id+事件 queued/running) =="
+run_design workitem new w5 --brief "$BRIEF_SRC" --json >/dev/null 2>&1
+OUT="$(DSH_STUB_SLEEP=2 run_design workitem design w5 --json 2>&1)"; RC=$?
+TID30="$(task_id_of "$OUT")"
+if [[ $RC -eq 0 ]] && echo "$OUT" | grep -q '"queued":true' \
+   && echo "$OUT" | grep -q '"status":"ok"' && [[ "$TID30" =~ ^t-[0-9a-f]{12}$ ]]; then
+  ok "默认入队 exit0+queued+task_id"
+else
+  bad "C30a" "rc=$RC out=$OUT"
+fi
+EV30="$WORK/task/events/$TID30.jsonl"
+if [[ -f "$EV30" ]] && grep -q '"state":"queued"' "$EV30" && grep -q '"state":"running"' "$EV30"; then
+  ok "事件流含 queued/running"
+else
+  bad "C30b" "events 缺失或事件不全: $EV30"
+fi
+
+echo "== C34: design 重复入队(在途 → exit2+duplicate_workitem) =="
+OUT="$(run_design workitem design w5 --json 2>&1)"; RC=$?
+if [[ $RC -eq 2 ]] && echo "$OUT" | grep -q 'duplicate_workitem'; then
+  ok "在途重复入队 exit2+duplicate_workitem"
+else
+  bad "C34" "rc=$RC out=$OUT"
+fi
+
+echo "== C31: design --sync 同步(立即 designed,无新增任务) =="
+run_design workitem new w6 --brief "$BRIEF_SRC" --json >/dev/null 2>&1
+N_BEFORE="$(run task list --json 2>/dev/null \
+            | python3 -c 'import sys,json;print(json.loads(sys.stdin.read()).get("count",-1))' 2>/dev/null)"
+OUT="$(run_design workitem design w6 --sync --json 2>&1)"; RC=$?
+N_AFTER="$(run task list --json 2>/dev/null \
+           | python3 -c 'import sys,json;print(json.loads(sys.stdin.read()).get("count",-1))' 2>/dev/null)"
+ST6="$(run_design workitem status w6 --json 2>/dev/null \
+       | python3 -c 'import sys,json;print(json.loads(sys.stdin.read())["state"])' 2>/dev/null)"
+if [[ $RC -eq 0 ]] && [[ "$ST6" == "designed" ]] \
+   && [[ -s "$DATA/workitems/w6/design.md" ]] && [[ "$N_BEFORE" == "$N_AFTER" ]]; then
+  ok "--sync 同步 designed + design.md 非空 + 无新增任务"
+else
+  bad "C31" "rc=$RC state=$ST6 nbefore=$N_BEFORE nafter=$N_AFTER"
+fi
+
+echo "== C32: design 入队 E2E 联动(任务 done → workitem designed + 事件 done) =="
+if wait_task "$TID30"; then
+  ST5="$(run_design workitem status w5 --json 2>/dev/null \
+         | python3 -c 'import sys,json;print(json.loads(sys.stdin.read())["state"])' 2>/dev/null)"
+  TST30="$(run task status "$TID30" --json 2>/dev/null \
+           | python3 -c 'import sys,json;print((json.loads(sys.stdin.read()).get("task") or {}).get("state",""))' 2>/dev/null)"
+  EST30="$(ev_state "$EV30")"
+  if [[ "$ST5" == "designed" && "$TST30" == "done" && "$EST30" == "done" ]]; then
+    ok "task done + workitem designed + 事件 done(联动)"
+  else
+    bad "C32" "st=$ST5 tst=$TST30 est=$EST30"
+  fi
+else
+  bad "C32" "w5 任务未在超时内完成"
+fi
+
+echo "== C33: 事件可重放(逐行 JSON + seq 单调 + 终态含 diagnostic 键) =="
+if python3 - "$EV30" << 'PY'
+import json, sys
+seqs = []
+with open(sys.argv[1], encoding="utf-8") as f:
+    for line in f:
+        line = line.strip()
+        if not line:
+            continue
+        rec = json.loads(line)          # 坏行会抛 → 测试失败
+        assert rec.get("seq") is not None
+        seqs.append(rec["seq"])
+assert seqs == sorted(seqs) and len(set(seqs)) == len(seqs), seqs
+last = json.loads([l for l in open(sys.argv[1], encoding="utf-8") if l.strip()][-1])
+assert "diagnostic" in last, last
+PY
+then
+  ok "重放成功,seq 单调,终态含 diagnostic 键"
+else
+  bad "C33" "重放失败: $EV30"
+fi
+
+echo "== C35: execute 默认入队 E2E(stub executor → executed + 事件 done) =="
+PROJ="$WORK/proj"
+mkdir -p "$PROJ"
+git -C "$PROJ" init -q
+git -C "$PROJ" config user.email t@example.com
+git -C "$PROJ" config user.name tester
+echo "# init" > "$PROJ/README.md"
+git -C "$PROJ" add README.md
+git -C "$PROJ" commit -q -m init
+run_x workitem new w7 --brief "$BRIEF_SRC" --json >/dev/null 2>&1
+run_x workitem design w7 --sync --json >/dev/null 2>&1
+run_x workitem decision w7 --verdict pass --json >/dev/null 2>&1
+run_x workitem transition w7 reviewed --json >/dev/null 2>&1
+run_x workitem transition w7 translated --json >/dev/null 2>&1
+cat > "$DATA/workitems/w7/taskbook.md" << 'TASKBOOK'
+# taskbook
+```flow
+test_command: /bin/true
+diff_scope:
+  allow:
+    - README.md
+  deny: []
+```
+TASKBOOK
+OUT="$(run_x workitem execute w7 --executor stub --json 2>&1)"; RC=$?
+TID35="$(task_id_of "$OUT")"
+if [[ $RC -eq 0 ]] && echo "$OUT" | grep -q '"queued":true' && [[ "$TID35" =~ ^t-[0-9a-f]{12}$ ]]; then
+  ok "execute 默认入队 exit0+queued+task_id"
+else
+  bad "C35a" "rc=$RC out=$OUT"
+fi
+if wait_task "$TID35"; then
+  ST7="$(run_x workitem status w7 --json 2>/dev/null \
+         | python3 -c 'import sys,json;print(json.loads(sys.stdin.read())["state"])' 2>/dev/null)"
+  TST35="$(run task status "$TID35" --json 2>/dev/null \
+           | python3 -c 'import sys,json;print((json.loads(sys.stdin.read()).get("task") or {}).get("state",""))' 2>/dev/null)"
+  EST35="$(ev_state "$WORK/task/events/$TID35.jsonl")"
+  if [[ "$ST7" == "executed" && "$TST35" == "done" && "$EST35" == "done" ]]; then
+    ok "E2E: workitem executed + task done + 事件 done"
+  else
+    bad "C35b" "st=$ST7 tst=$TST35 est=$EST35"
+  fi
+else
+  bad "C35c" "w7 任务未在超时内完成"
+fi
+
+echo "== C36: execute partial-complete 事件(内层超时 + 产出非空) =="
+run_x workitem new w8 --brief "$BRIEF_SRC" --json >/dev/null 2>&1
+run_x workitem design w8 --sync --json >/dev/null 2>&1
+run_x workitem decision w8 --verdict pass --json >/dev/null 2>&1
+run_x workitem transition w8 reviewed --json >/dev/null 2>&1
+run_x workitem transition w8 translated --json >/dev/null 2>&1
+cat > "$DATA/workitems/w8/taskbook.md" << 'TASKBOOK'
+# taskbook
+```flow
+test_command: /bin/true
+diff_scope:
+  allow:
+    - README.md
+  deny: []
+```
+TASKBOOK
+export RX_BIN="$STUB_RX" RX_STUB_EXIT=124 RX_STUB_DIFF=1 RX_STUB_SLEEP=0 RX_STUB_LEAK=0
+OUT="$(run_x workitem execute w8 --executor reasonix --timeout 1 --json 2>&1)"; RC=$?
+TID36="$(task_id_of "$OUT")"
+unset RX_BIN RX_STUB_EXIT RX_STUB_DIFF RX_STUB_SLEEP RX_STUB_LEAK
+if [[ $RC -eq 0 ]] && [[ "$TID36" =~ ^t-[0-9a-f]{12}$ ]] && wait_task "$TID36"; then
+  if python3 - "$WORK/task/events/$TID36.jsonl" << 'PY'
+import json, sys
+lines = [l for l in open(sys.argv[1], encoding="utf-8") if l.strip()]
+rec = json.loads(lines[-1])
+assert rec["state"] == "partial-complete", rec
+assert rec["partial_complete"] is True, rec
+assert rec.get("diagnostic"), rec
+PY
+  then
+    ok "事件 state=partial-complete + partial_complete:true + diagnostic 非空"
+  else
+    bad "C36b" "事件内容不符: $(cat "$WORK/task/events/$TID36.jsonl" 2>/dev/null)"
+  fi
+else
+  bad "C36a" "rc=$RC tid=$TID36"
+fi
+
+echo "== C37: 事件失败诊断(failed + diagnostic 含 boom) =="
+OUT="$(run task add --command "sh -c 'echo boom; exit 3'" --json 2>&1)"; RC=$?
+TID37="$(task_id "$OUT")"
+sleep 2
+if python3 - "$WORK/task/events/$TID37.jsonl" << 'PY'
+import json, sys
+lines = [l for l in open(sys.argv[1], encoding="utf-8") if l.strip()]
+rec = json.loads(lines[-1])
+assert rec["state"] == "failed", rec
+assert "boom" in (rec.get("diagnostic") or ""), rec
+PY
+then
+  ok "事件 failed + diagnostic 含 boom"
+else
+  bad "C37" "rc=$RC events=$(cat "$WORK/task/events/$TID37.jsonl" 2>/dev/null)"
+fi
+
+echo "== C38: wake-text 自包含(含 task_id/state/下一步/日志路径) =="
+OUT="$(run task wake-text "$TID37" 2>&1)"; RC=$?
+if [[ $RC -eq 0 ]] && echo "$OUT" | grep -q "$TID37" \
+   && echo "$OUT" | grep -q "下一步" && echo "$OUT" | grep -q "logs/$TID37.log"; then
+  ok "wake-text 自包含文本"
+else
+  bad "C38" "rc=$RC out=$OUT"
+fi
+
+echo "== C39: notify 触发(配置时 stdin 事件;未配置零调用) =="
+NOTIFY_RECORD="$WORK/notify-record.json"
+if [[ -e "$NOTIFY_RECORD" ]]; then
+  bad "C39a" "未配置 notify 却有调用记录"
+else
+  ok "未配置 host.notify → 零调用"
+fi
+STUB_NOTIFY="$WORK/stub-notify.sh"
+cat > "$STUB_NOTIFY" << 'NOTIFY'
+#!/usr/bin/env bash
+cat > "$1"
+NOTIFY
+chmod +x "$STUB_NOTIFY"
+cat > "$WORK/notify-cfg.yaml" << EOF
+host:
+  notify: $STUB_NOTIFY $NOTIFY_RECORD
+EOF
+OUT="$(env HOME="$WORK/home" FLOW_DATA_DIR="$DATA" FLOW_TASK_DIR="$WORK/task" \
+    COLLABFLOW_CONFIG="$WORK/notify-cfg.yaml" "$FLOW" \
+    task add --command "echo notify-test" --json 2>&1)"; RC=$?
+TID39="$(task_id "$OUT")"
+sleep 2
+if [[ $RC -eq 0 ]] && [[ -f "$NOTIFY_RECORD" ]] && grep -q "$TID39" "$NOTIFY_RECORD"; then
+  ok "配置 notify → 终态事件经 stdin 到达 stub"
+else
+  bad "C39b" "rc=$RC record=$(test -f "$NOTIFY_RECORD" && cat "$NOTIFY_RECORD" || echo missing)"
+fi
+
+echo "== C40: 全量回归(run-smoke + run-config-smoke + run-executor-smoke + unittest) =="
+if [[ "${FLOW_SMOKE_NESTED:-0}" == "1" ]]; then
+  ok "嵌套调用(FLOW_SMOKE_NESTED=1),跳过 C40 防递归"
+else
+  bash "$ROOT_DIR/tests/run-smoke.sh" >"$WORK/c40-1.log" 2>&1; RC1=$?
+  bash "$ROOT_DIR/tests/run-config-smoke.sh" >"$WORK/c40-2.log" 2>&1; RC2=$?
+  export FLOW_SMOKE_NESTED=1
+  bash "$ROOT_DIR/tests/run-executor-smoke.sh" >"$WORK/c40-3.log" 2>&1; RC3=$?
+  unset FLOW_SMOKE_NESTED
+  ( cd "$ROOT_DIR" && python3 -m unittest discover tests >"$WORK/c40-4.log" 2>&1 ); RC4=$?
+  if [[ $RC1 -eq 0 && $RC2 -eq 0 && $RC3 -eq 0 && $RC4 -eq 0 ]]; then
+    ok "四个回归门全绿"
+  else
+    bad "C40" "run-smoke=$RC1 run-config=$RC2 run-executor=$RC3 unittest=$RC4"
+  fi
 fi
 
 echo

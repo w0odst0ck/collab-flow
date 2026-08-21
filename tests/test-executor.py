@@ -149,7 +149,7 @@ class ExecutorContractTests(_Base):
         wi_dir = self._mk_wi("translated")
         self._write_taskbook(wi_dir)
         os.environ["STUB_EXECUTOR_EXIT"] = "0"
-        code = fc.cmd_execute(["w1", "--executor", "stub"], _cfg())
+        code = fc.cmd_execute(["w1", "--sync", "--executor", "stub"], _cfg())
         self.assertEqual(code, 0)
         r = _jload(os.path.join(wi_dir, "executor", "result.json"))
         self.assertEqual(r["status"], "ok")
@@ -161,7 +161,7 @@ class ExecutorContractTests(_Base):
         wi_dir = self._mk_wi("translated")
         self._write_taskbook(wi_dir)
         os.environ["STUB_EXECUTOR_EXIT"] = "1"
-        code = fc.cmd_execute(["w1", "--executor", "stub"], _cfg())
+        code = fc.cmd_execute(["w1", "--sync", "--executor", "stub"], _cfg())
         self.assertEqual(code, 1)
         r = _jload(os.path.join(wi_dir, "executor", "result.json"))
         self.assertEqual(r["status"], "failed")
@@ -172,7 +172,7 @@ class ExecutorContractTests(_Base):
         wi_dir = self._mk_wi("translated")
         self._write_taskbook(wi_dir)
         os.environ["STUB_EXECUTOR_SLEEP"] = "5"
-        code = fc.cmd_execute(["w1", "--executor", "stub", "--timeout", "1"], _cfg())
+        code = fc.cmd_execute(["w1", "--sync", "--executor", "stub", "--timeout", "1"], _cfg())
         self.assertEqual(code, 124)
         r = _jload(os.path.join(wi_dir, "executor", "result.json"))
         self.assertEqual(r["status"], "timeout")
@@ -183,7 +183,7 @@ class ExecutorContractTests(_Base):
         wi_dir = self._mk_wi("translated")
         self._write_taskbook(wi_dir)
         os.environ["STUB_EXECUTOR_NO_RESULT"] = "1"
-        code = fc.cmd_execute(["w1", "--executor", "stub"], _cfg())
+        code = fc.cmd_execute(["w1", "--sync", "--executor", "stub"], _cfg())
         self.assertEqual(code, 2)
         self.assertEqual(fc.load_status(wi_dir)["state"], "translated")
 
@@ -196,7 +196,7 @@ class ExecutorContractTests(_Base):
         os.makedirs(os.path.join(wi_dir, "executor"), exist_ok=True)
         with open(os.path.join(wi_dir, "executor", "result.json"), "w", encoding="utf-8") as f:
             f.write("{not-valid-json")
-        code = fc.cmd_execute(["w1", "--executor", "stub"], _cfg())
+        code = fc.cmd_execute(["w1", "--sync", "--executor", "stub"], _cfg())
         self.assertEqual(code, 2)
         self.assertEqual(fc.load_status(wi_dir)["state"], "translated")
 
@@ -221,7 +221,7 @@ class ExecutorContractTests(_Base):
         wi_dir = self._mk_wi("translated")
         self._write_taskbook(wi_dir)
         os.environ["STUB_EXECUTOR_NO_DIFF"] = "1"
-        code = fc.cmd_execute(["w1", "--executor", "stub"], _cfg())
+        code = fc.cmd_execute(["w1", "--sync", "--executor", "stub"], _cfg())
         self.assertEqual(code, 2)
         self.assertEqual(fc.load_status(wi_dir)["state"], "translated")
 
@@ -235,7 +235,7 @@ class ExecutorContractTests(_Base):
         with open(os.path.join(wi_dir, "executor", "result.json"), "w", encoding="utf-8") as f:
             json.dump({"schema_version": 1, "executor": "stub", "status": "ok",
                        "exit_code": 0, "redacted_logs": leak}, f)
-        code = fc.cmd_execute(["w1", "--executor", "stub"], _cfg())
+        code = fc.cmd_execute(["w1", "--sync", "--executor", "stub"], _cfg())
         self.assertEqual(code, 2)
         self.assertEqual(fc.load_status(wi_dir)["state"], "translated")
 
@@ -281,7 +281,7 @@ class DesignerContractTests(_Base):
         self._mk_brief(wi_dir)
         os.environ["DSH_STUB_SESSION"] = "1"
         os.environ["DSH_STUB_MODEL"] = "deepseek-v4-pro"
-        code = fc.cmd_design(["w1"], _cfg())
+        code = fc.cmd_design(["w1", "--sync"], _cfg())
         self.assertEqual(code, 0)
         self.assertTrue(os.path.isfile(os.path.join(wi_dir, "design.md")))
         dr = _jload(os.path.join(wi_dir, "design-result.json"))
@@ -295,7 +295,7 @@ class DesignerContractTests(_Base):
         self._mk_brief(wi_dir)
         os.environ["DSH_STUB_SESSION"] = "1"
         os.environ["DSH_STUB_MODEL"] = "deepseek-v4-flash"
-        code = fc.cmd_design(["w1"], _cfg())
+        code = fc.cmd_design(["w1", "--sync"], _cfg())
         self.assertEqual(code, 1)
         self.assertFalse(os.path.isfile(os.path.join(wi_dir, "design.md")))
         self.assertEqual(fc.load_status(wi_dir)["state"], "created")
@@ -305,7 +305,7 @@ class DesignerContractTests(_Base):
         # brief.md 为空(不写内容)
         with open(os.path.join(wi_dir, "brief.md"), "w", encoding="utf-8") as f:
             f.write("")
-        code = fc.cmd_design(["w1"], _cfg())
+        code = fc.cmd_design(["w1", "--sync"], _cfg())
         self.assertEqual(code, 2)
         self.assertEqual(fc.load_status(wi_dir)["state"], "created")
 
