@@ -19,8 +19,18 @@ DATA="$WORK/.flow"
 BRIEF_SRC="$WORK/brief-src.md"
 echo "# 简报内容 for w2" > "$BRIEF_SRC"
 
-run() { # run [args...]  —— 统一注入隔离 env
-  env HOME="$WORK/home" FLOW_DATA_DIR="$DATA" COLLABFLOW_CONFIG="$WORK/no-cfg.yaml" "$FLOW" "$@"
+run() { # run [args...]  —— 统一注入隔离 env(含 FLOW_TASK_DIR,绝不触碰真实 ~/.collabflow)
+  env HOME="$WORK/home" FLOW_DATA_DIR="$DATA" FLOW_TASK_DIR="$WORK/task" \
+      COLLABFLOW_CONFIG="$WORK/no-cfg.yaml" "$FLOW" "$@"
+}
+
+run_mp() { # run_mp <max-parallel> [args...] —— 注入 FLOW_TASK_MAX_PARALLEL(task 冒烟用)
+  env HOME="$WORK/home" FLOW_DATA_DIR="$DATA" FLOW_TASK_DIR="$WORK/task" \
+      FLOW_TASK_MAX_PARALLEL="$1" COLLABFLOW_CONFIG="$WORK/no-cfg.yaml" "$FLOW" "${@:2}"
+}
+
+task_id() { # task_id —— 从 add 的 --json 输出取 id
+  printf '%s' "$1" | python3 -c 'import sys,json;print(json.loads(sys.stdin.read()).get("id",""))' 2>/dev/null
 }
 
 # 单行有效 JSON 校验
@@ -282,6 +292,138 @@ if [[ $RC -eq 0 ]]; then
   [[ -n "$WPID" ]] && kill -9 "$WPID" 2>/dev/null   # 清理未结束的 worker
 else
   bad "C21a" "async 启动 rc=$RC out=$OUT"
+fi
+
+# ---------- C22-C29: flow task 后台任务队列(M1;对应设计文档 C19-C26) ----------
+# 全程 stub(sleep / sh -c "exit N")零 API;FLOW_TASK_DIR 已由 run()/run_mp() 注入临时目录。
+
+echo "== C22: task add+status(add 返回 queued,status id 一致) =="
+OUT="$(run task add --command "sleep 1" --json 2>&1)"; RC=$?
+TID="$(task_id "$OUT")"
+if [[ $RC -eq 0 ]] && json_ok "$OUT" >/dev/null \
+   && [[ $(printf '%s' "$OUT" | grep -c .) -eq 1 ]] \
+   && echo "$OUT" | grep -q '"state":"queued"' \
+   && [[ "$TID" =~ ^t-[0-9a-f]{12}$ ]]; then
+  ok "add exit0+单行JSON+state=queued+id 形状"
+else
+  bad "C22a" "rc=$RC out=$OUT"
+fi
+OUT="$(run task status "$TID" --json 2>&1)"; RC=$?
+if [[ $RC -eq 0 ]] && echo "$OUT" | grep -q "\"id\":\"$TID\"" \
+   && echo "$OUT" | grep -qE '"state":"(queued|running|done)"'; then
+  ok "status id 一致+state 合法"
+else
+  bad "C22b" "rc=$RC out=$OUT"
+fi
+
+echo "== C23: 幂等拒绝(同 workitem 非终态 → exit2+duplicate_workitem) =="
+OUT="$(run task add --workitem w1 --command "sleep 2" --json 2>&1)"; RC=$?
+if [[ $RC -eq 0 ]]; then
+  OUT="$(run task add --workitem w1 --command "sleep 1" --json 2>&1)"; RC=$?
+  if [[ $RC -eq 2 ]] && echo "$OUT" | grep -q '"error":"duplicate_workitem"'; then
+    ok "重复 add exit2+duplicate_workitem"
+  else
+    bad "C23b" "rc=$RC out=$OUT"
+  fi
+  sleep 3   # 等 w1 的 sleep 2 任务结束,不占后续槽位
+else
+  bad "C23a" "add rc=$RC out=$OUT"
+fi
+
+echo "== C24: E2E 自动流转 done(add→done,exit_code=0,finished_at 非空) =="
+OUT="$(run task add --command "sleep 2" --json 2>&1)"; RC=$?
+TID="$(task_id "$OUT")"
+sleep 3
+OUT="$(run task status "$TID" --json 2>&1)"; RC=$?
+if [[ $RC -eq 0 ]] && echo "$OUT" | grep -q '"state":"done"' \
+   && echo "$OUT" | grep -q '"exit_code":0' \
+   && echo "$OUT" | grep -q '"finished_at":"[0-9]'; then
+  ok "add→自动流转 done+exit_code=0+finished_at 非空"
+else
+  bad "C24a" "rc=$RC out=$OUT"
+fi
+OUT="$(run task list --json 2>&1)"; RC=$?
+if [[ $RC -eq 0 ]] && echo "$OUT" | grep -q "\"id\":\"$TID\""; then
+  ok "list 含该任务"
+else
+  bad "C24b" "rc=$RC out=$OUT"
+fi
+
+echo "== C25: 并发排队(--max-parallel 2,running 不超限,最终全 done) =="
+TIDS25=()
+for i in 1 2 3 4; do
+  OUT="$(run_mp 2 task add --command "sleep 1" --json 2>&1)"
+  TIDS25+=("$(task_id "$OUT")")
+done
+OUT="$(run_mp 2 task list --state running --json 2>&1)"
+RUNNING_N="$(printf '%s' "$OUT" | python3 -c 'import sys,json;print(json.loads(sys.stdin.read()).get("count",99))' 2>/dev/null)"
+if [[ "$RUNNING_N" -le 2 ]]; then
+  ok "running 数=$RUNNING_N ≤2"
+else
+  bad "C25a" "running=$RUNNING_N out=$OUT"
+fi
+sleep 4
+ALL_DONE=1
+for TID in "${TIDS25[@]}"; do
+  OUT="$(run_mp 2 task status "$TID" --json 2>&1)"
+  echo "$OUT" | grep -q '"state":"done"' || ALL_DONE=0
+done
+if [[ $ALL_DONE -eq 1 ]]; then
+  ok "4 个任务最终全 done"
+else
+  bad "C25b" "out=$OUT"
+fi
+
+echo "== C26: 优先级排队(P0 先于 P2 出队,--max-parallel 1) =="
+OUT="$(run_mp 1 task add --command "sleep 1" --json 2>&1)"
+BLOCK_ID="$(task_id "$OUT")"
+OUT="$(run_mp 1 task add --command "sleep 0.2" --priority P2 --json 2>&1)"
+P2_ID="$(task_id "$OUT")"
+OUT="$(run_mp 1 task add --command "sleep 0.2" --priority P0 --json 2>&1)"
+P0_ID="$(task_id "$OUT")"
+sleep 4
+S_P0="$(run_mp 1 task status "$P0_ID" --json 2>/dev/null \
+        | python3 -c 'import sys,json;print((json.loads(sys.stdin.read()).get("task") or {}).get("started_at") or "")' 2>/dev/null)"
+S_P2="$(run_mp 1 task status "$P2_ID" --json 2>/dev/null \
+        | python3 -c 'import sys,json;print((json.loads(sys.stdin.read()).get("task") or {}).get("started_at") or "")' 2>/dev/null)"
+if [[ -n "$S_P0" && -n "$S_P2" && "$S_P0" < "$S_P2" ]]; then
+  ok "P0 先于 P2 出队($S_P0 < $S_P2)"
+else
+  bad "C26" "p0=$S_P0 p2=$S_P2 block=$BLOCK_ID"
+fi
+
+echo "== C27: 超时熔断(--expected-seconds 1 + sleep 5 → timeout/124) =="
+OUT="$(run task add --command "sleep 5" --expected-seconds 1 --json 2>&1)"; RC=$?
+TID="$(task_id "$OUT")"
+sleep 3
+OUT="$(run task status "$TID" --json 2>&1)"
+if [[ $RC -eq 0 ]] && echo "$OUT" | grep -q '"state":"timeout"' \
+   && echo "$OUT" | grep -q '"exit_code":124'; then
+  ok "终态 timeout+exit_code=124"
+else
+  bad "C27" "rc=$RC out=$OUT"
+fi
+
+echo "== C28: 失败诊断(failed+failure_tail 含 boom) =="
+OUT="$(run task add --command "sh -c 'echo boom; exit 3'" --json 2>&1)"; RC=$?
+TID="$(task_id "$OUT")"
+sleep 2
+OUT="$(run task status "$TID" --json 2>&1)"
+if [[ $RC -eq 0 ]] && echo "$OUT" | grep -q '"state":"failed"' \
+   && echo "$OUT" | grep -q '"exit_code":3' \
+   && echo "$OUT" | grep -q 'boom'; then
+  ok "failed+exit_code=3+failure_tail 含 boom"
+else
+  bad "C28" "rc=$RC out=$OUT"
+fi
+
+echo "== C29: log --tail 抽取(尾部 ≤20 字节且含结束标记) =="
+OUT="$(run task log "$TID" --tail 20 2>&1)"; RC=$?
+LEN="$(printf '%s' "$OUT" | wc -c | tr -d ' ')"
+if [[ $RC -eq 0 ]] && [[ "$LEN" -le 20 ]] && echo "$OUT" | grep -q "==="; then
+  ok "尾部 ${LEN} 字节 ≤20 + 含 runner 结束标记"
+else
+  bad "C29" "rc=$RC len=$LEN out=$OUT"
 fi
 
 echo

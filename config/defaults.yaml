@@ -53,4 +53,10 @@ executor:                      # P3 新增;全标量(执行器默认策略)
   default: reasonix            # 默认执行器(flow workitem execute 未指定 --executor 时)
   timeout_s: 1800              # 默认超时兜底(实际以 spec.invoke.timeout_s 为主,--timeout 可覆盖)
   diff_scope: null             # 默认不设全局 scope;scope 来自 taskbook 前置块或 --scope,缺失即 fail-closed
+task:                          # M1 新增;全标量,P1 解析器照常通过(task 核心模块读取)
+  schema_version: 1
+  max_parallel: 2              # 全局并发上限(running 任务数);run --max-parallel 可覆盖,env FLOW_TASK_MAX_PARALLEL
+  default_priority: P2         # 新任务默认优先级
+  log_tail_bytes: 2000         # failure_tail 抽取字节数(对齐 executor output_tail 口径),env FLOW_TASK_LOG_TAIL_BYTES
+  kill_grace_s: 5              # --kill-on-timeout 时 SIGTERM→SIGKILL 宽限秒数
 

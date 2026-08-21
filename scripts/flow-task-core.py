@@ -1,0 +1,756 @@
+#!/usr/bin/env python3
+"""flow-task-core.py —— collab-flow 后台任务队列子系统核心(M1)。
+
+职责(对应 .flow/workitems/flow-task-queue/design.md):
+  1. 任务状态机纯函数(§1.3)—— TASK_STATES/terminal_state()/sort_queue()/plan_dispatch()/
+     validate_entry()/extract_tail(),零隐藏 I/O 依赖,供单测直接 import;
+  2. store 层(§1.4)—— tasks.json 注册表 flock 读-改-写 + 原子写(temp+fsync+replace)
+     + DENY_RE 防 secret(沿用 flow-core.py 口径,import 复用而非复制);
+  3. 落账 runner(§1.4(3))—— _runner <id> 分离式 wrapper:命令结束 finally 写终态
+     (state/exit_code/finished_at/failure_tail),再 dispatch 自续队列,无需常驻 daemon;
+  4. CLI(§1.5)—— flow task add/status/list/log/run/reconcile。
+
+用法: flow-task-core.py task <sub> ...
+退出码: 0 成功 / 1 运行失败(写盘/运行异常) / 2 用法或前置错误(含幂等拒绝) /
+        124 仅任务命令语义(timeout 透传),不进入 task CLI 顶层。
+
+红线: 零个人标识(不取 hostname/用户名);注册表/日志输出过 DENY_RE;
+      幂等拒绝不设 --force 绕过;超时→timeout 终态判定不削弱;纯函数零 I/O。
+"""
+
+import importlib.util
+import json
+import os
+import re
+import secrets
+import shutil
+import subprocess
+import sys
+from datetime import datetime, timezone
+
+try:
+    import fcntl
+except ImportError:  # 非 POSIX 降级(§1.6.6)
+    fcntl = None
+
+# ---------------------------------------------------------------------------
+# 复用 flow-core.py 的纯工具(只读依赖,不改动该文件;解析/输出口径完全一致)
+# ---------------------------------------------------------------------------
+
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+_spec = importlib.util.spec_from_file_location(
+    "flow_core_tools", os.path.join(_SCRIPT_DIR, "flow-core.py"))
+_fc = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(_fc)
+
+DENY_RE = _fc.DENY_RE            # 疑似 secret 正则(与 flow-core 同口径,§0.3)
+scan_args = _fc.scan_args        # 参数拆分 (positional, opts)
+emit = _fc.emit                  # stdout 单行 JSON
+emit_err = _fc.emit_err          # stderr 单行 JSON
+fail = _fc.fail                  # 错误输出,返回退出码
+now_iso = _fc.now_iso            # ISO8601 UTC(timespec="seconds")
+
+# ---------------------------------------------------------------------------
+# 常量(§1.2/§1.3)
+# ---------------------------------------------------------------------------
+
+TASK_ID_RE = re.compile(r"^t-[0-9a-f]{12}$")   # 任务 id 白名单,硬编码不进 config
+TASK_STATES = ("queued", "running", "done", "failed", "timeout")
+TERMINAL_STATES = ("done", "failed", "timeout")
+PRIORITIES = ("P0", "P1", "P2")
+PRIO_ORDER = {"P0": 0, "P1": 1, "P2": 2}
+SCHEMA_VERSION = 1
+RECONCILE_GRACE_S = 60   # pid=None(dispatch 提升后 runner 尚未写 pid 的窗口)的回收宽限秒数
+
+USAGE = """用法: flow task <sub> ...
+  flow task add       --command CMD [--workitem W] [--priority P0|P1|P2]
+                      [--expected-seconds N] [--kill-on-timeout] [--json]
+  flow task status    <id> [--json]
+  flow task list      [--state S] [--workitem W] [--json]
+  flow task log       <id> [--tail N] [--json]
+  flow task run       [--max-parallel N] [--json]
+  flow task reconcile [--json]
+退出码: 0 成功 / 1 运行失败 / 2 用法或前置错误(含幂等拒绝)/
+        124 仅任务命令语义(不进 CLI 顶层)。
+"""
+
+
+class UsageError(Exception):
+    """用法/前置错误(→ exit 2)。"""
+
+
+class TaskError(Exception):
+    """任务不存在(→ exit 2)。"""
+
+
+class DuplicateWorkitem(Exception):
+    """同 workitem 已有非终态任务(幂等拒绝,→ exit 2)。args=(已有 id, state)。"""
+
+
+class StoreError(Exception):
+    """注册表解析/写盘失败或疑似 secret(→ exit 2)。"""
+
+
+class CommandTimeout(Exception):
+    """无 timeout 二进制的 Python 降级路径:命令超时。"""
+
+
+# ---------------------------------------------------------------------------
+# 状态机纯函数(§1.3,零 I/O)
+# ---------------------------------------------------------------------------
+
+def terminal_state(exit_code, timed_out):
+    """命令结束 → 终态 + 原因码。零 I/O。"""
+    if timed_out or exit_code == 124:
+        return ("timeout", "timeout_exceeded")
+    if exit_code == 0:
+        return ("done", None)
+    return ("failed", f"exit_code={exit_code}")
+
+
+def sort_queue(tasks):
+    """排队优先级:P0 < P1 < P2;同级 FIFO(created_at);再按 id 字典序(确定性)。"""
+    q = [t for t in tasks if t.get("state") == "queued"]
+    q.sort(key=lambda t: (PRIO_ORDER.get(t.get("priority"), 99),
+                          t.get("created_at", ""), t.get("id", "")))
+    return q
+
+
+def plan_dispatch(reg, max_parallel):
+    """纯函数:空闲槽数 = max_parallel − running;返回应提升的任务列表(不改 reg)。"""
+    running = sum(1 for t in reg["tasks"].values() if t.get("state") == "running")
+    free = max(int(max_parallel) - running, 0)
+    return sort_queue(reg["tasks"].values())[:free]
+
+
+def _now_ms():
+    """毫秒级 ISO 时间戳：任务队列调度精度（同秒出队可区分，C26 优先级断言依赖）。"""
+    return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+
+
+def validate_entry(entry):
+    """fail-closed:state/priority/id 形状非法 → StoreError;未知字段忽略(向前兼容)。"""
+    st = entry.get("state")
+    if st not in TASK_STATES:
+        raise StoreError(f"非法 state: {st!r}")
+    prio = entry.get("priority")
+    if prio not in PRIORITIES:
+        raise StoreError(f"非法 priority: {prio!r}")
+    tid = entry.get("id")
+    if not TASK_ID_RE.fullmatch(str(tid)):
+        raise StoreError(f"非法 id 形状: {tid!r}")
+    return entry
+
+
+def extract_tail(path, max_bytes):
+    """日志尾部抽取(§1.4(5)):缺失→空串、超长→截断、非 UTF-8→errors=replace、secret→[REDACTED]。"""
+    if not os.path.isfile(path):
+        return ""
+    with open(path, "rb") as f:
+        f.seek(0, 2)
+        size = f.tell()
+        f.seek(max(0, size - max_bytes))
+        raw = f.read(max_bytes)
+    text = raw.decode("utf-8", errors="replace")
+    return DENY_RE.sub("[REDACTED]", text)
+
+
+# ---------------------------------------------------------------------------
+# 配置加载(§1.2:defaults 的 task 块 + user 合并 + env 覆盖)
+# ---------------------------------------------------------------------------
+
+def _merge(a, b):
+    out = dict(a)
+    for k, v in b.items():
+        if isinstance(v, dict) and isinstance(out.get(k), dict):
+            out[k] = _merge(out[k], v)
+        else:
+            out[k] = v
+    return out
+
+
+def _env_int(name):
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        return None
+
+
+def load_task_config():
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    defaults_path = os.environ.get("COLLABFLOW_DEFAULTS") or os.path.join(
+        script_dir, "..", "config", "defaults.yaml")
+    defaults = _fc.parse_yaml(_fc.read_file(defaults_path), defaults_path)
+    task = dict(defaults.get("task") or {})
+    user_path = os.environ.get("COLLABFLOW_CONFIG") or os.path.expanduser(
+        "~/.config/collabflow/config.yaml")
+    if os.path.isfile(user_path):
+        user = _fc.parse_yaml(_fc.read_file(user_path), user_path)
+        task = _merge(task, dict(user.get("task") or {}))
+    mp = _env_int("FLOW_TASK_MAX_PARALLEL")
+    if mp is not None:
+        task["max_parallel"] = mp
+    lb = _env_int("FLOW_TASK_LOG_TAIL_BYTES")
+    if lb is not None:
+        task["log_tail_bytes"] = lb
+    return {"task": task}
+
+
+# ---------------------------------------------------------------------------
+# store 层(§1.4:flock 注册表 + 原子写)
+# ---------------------------------------------------------------------------
+
+def task_dir():
+    """数据根目录;env FLOW_TASK_DIR 可覆盖(测试隔离必用),默认 ~/.collabflow。"""
+    return os.environ.get("FLOW_TASK_DIR") or os.path.expanduser("~/.collabflow")
+
+
+def registry_path():
+    return os.path.join(task_dir(), "tasks.json")
+
+
+def lock_path():
+    return registry_path() + ".lock"
+
+
+def logs_dir():
+    return os.path.join(task_dir(), "logs")
+
+
+def log_path(tid):
+    return os.path.join(logs_dir(), f"{tid}.log")
+
+
+def empty_registry():
+    return {"schema_version": SCHEMA_VERSION, "tasks": {}}
+
+
+def load_registry():
+    """读注册表:缺失 → 空注册表;非 JSON / 顶层非 dict / schema_version 非法 / 条目非法 → StoreError。"""
+    path = registry_path()
+    if not os.path.isfile(path):
+        return empty_registry()
+    try:
+        data = json.loads(_fc.read_file(path))
+    except ValueError:
+        raise StoreError(f"{path}: 注册表损坏(非 JSON)")
+    if not isinstance(data, dict):
+        raise StoreError(f"{path}: 注册表顶层必须是对象")
+    if data.get("schema_version") != SCHEMA_VERSION:
+        raise StoreError(f"{path}: schema_version 非法: {data.get('schema_version')!r}")
+    tasks = data.get("tasks")
+    if not isinstance(tasks, dict):
+        raise StoreError(f"{path}: tasks 必须是对象")
+    for tid, entry in tasks.items():
+        if not isinstance(entry, dict):
+            raise StoreError(f"{path}: 任务 {tid} 非法(非对象)")
+        validate_entry(dict(entry, id=entry.get("id", tid)))
+    return data
+
+
+def save_registry_atomic(reg):
+    """原子写(§4.1 同款):temp + fsync + os.replace;整表写入前过 DENY_RE。"""
+    path = registry_path()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    text = json.dumps(reg, ensure_ascii=False, indent=2) + "\n"
+    if DENY_RE.search(text):
+        raise StoreError("注册表含疑似 secret, 拒绝写入")
+    tmp = f"{path}.tmp.{os.getpid()}.{secrets.token_hex(4)}"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+
+
+def with_registry_flock(fn):
+    """flock sidecar 串行化读-改-写(§1.4);无 fcntl(非 POSIX)降级为无锁直执行。"""
+    if fcntl is None or not hasattr(fcntl, "flock"):
+        return fn()
+    os.makedirs(task_dir(), exist_ok=True)
+    fd = os.open(lock_path(), os.O_CREAT | os.O_RDWR, 0o644)
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    try:
+        return fn()
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
+def read_log(path, tail_bytes=None):
+    """读统一日志:缺失 → "";tail_bytes=None → 全量;输出过 DENY_RE(红线:日志不泄 secret)。"""
+    if not os.path.isfile(path):
+        return ""
+    with open(path, "rb") as f:
+        if tail_bytes is None:
+            raw = f.read()
+        else:
+            f.seek(0, 2)
+            size = f.tell()
+            f.seek(max(0, size - tail_bytes))
+            raw = f.read(tail_bytes)
+    text = raw.decode("utf-8", errors="replace")
+    return DENY_RE.sub("[REDACTED]", text)
+
+
+# ---------------------------------------------------------------------------
+# 运行层(§1.4(2)/§1.6:reconcile / dispatch / spawn / run_command)
+# ---------------------------------------------------------------------------
+
+def pid_alive(pid):
+    """探活:仅一处 os.kill(pid, 0);非 POSIX 降级恒真(依赖超时兜底)。"""
+    if pid is None:
+        return False
+    if fcntl is None:
+        return True
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except (ProcessLookupError, ValueError, TypeError):
+        return False
+    except PermissionError:
+        return True
+
+
+def reconcile_running(reg):
+    """失联回收(§1.4(4)):running + 死 pid → failed;running + pid=None 仅在陈旧后回收。
+
+    pid=None 同时覆盖两个场景:dispatch 刚提升、runner 尚未写 pid 的窗口(正常,不能回收),
+    与 spawn 崩溃残留(该回收)。以 started_at 年龄区分(RECONCILE_GRACE_S 宽限),
+    避免并发 dispatch 误杀刚提升的任务;真正失联的终会被回收,能力不削弱。
+    """
+    now = datetime.now(timezone.utc)
+    reaped = []
+    for tid, t in reg["tasks"].items():
+        if t.get("state") != "running":
+            continue
+        pid = t.get("pid")
+        if pid is not None and pid_alive(pid):
+            continue
+        if pid is None:
+            started = t.get("started_at")
+            if started:
+                try:
+                    if (now - datetime.fromisoformat(started)).total_seconds() < RECONCILE_GRACE_S:
+                        continue
+                except (TypeError, ValueError):
+                    pass  # 时间戳非法 → 按陈旧处理,回收
+        t["state"] = "failed"
+        t["exit_code"] = None
+        t["finished_at"] = _now_ms()
+        t["failure_tail"] = "runner 失联(进程不存在)"
+        reaped.append(tid)
+    return reaped
+
+
+def run_command(t, cfg):
+    """执行任务命令(§1.6.1):expected_seconds 用 timeout(coreutils)包裹;无该二进制走 Python 降级。"""
+    expected = t.get("expected_seconds")
+    if expected:
+        bin_ = shutil.which("timeout")
+        if bin_:
+            # design §1.6.1：超时优雅 TERM 终止（默认）；--kill-on-timeout 追加 KILL 兜底
+            base = [bin_, "--signal=TERM"]
+            if t.get("kill_on_timeout"):
+                base += ["--kill-after", str(cfg["task"].get("kill_grace_s", 5))]
+            base += [str(expected), "sh", "-c", t["command"]]
+            proc = subprocess.run(base)
+            rc = proc.returncode
+            # kill-on-timeout 且 SIGTERM 被忽略 → --kill-after 触发 SIGKILL,timeout 报
+            # 128+SIGKILL=137(而非 124);统一为超时语义,保证「超时→timeout」终态不削弱。
+            if t.get("kill_on_timeout") and rc == 137:
+                return 124
+            return rc
+        return _run_with_py_timeout(t)  # 降级:超时 SIGKILL(≈kill-on-timeout)
+    proc = subprocess.run(["sh", "-c", t["command"]])
+    return proc.returncode
+
+
+def _run_with_py_timeout(t):
+    """无 timeout 二进制降级(§1.6.6):subprocess.run(timeout=...) → 超时抛 CommandTimeout。"""
+    try:
+        proc = subprocess.run(["sh", "-c", t["command"]], timeout=t["expected_seconds"])
+        return proc.returncode
+    except subprocess.TimeoutExpired:
+        raise CommandTimeout()
+
+
+def spawn_runner(tid):
+    """分离式 spawn 落账 runner(§1.4(2) 锁外):stdout/stderr → logs/<id>.log,setssid 孤儿。"""
+    os.makedirs(logs_dir(), exist_ok=True)
+    log_fd = open(log_path(tid), "ab")
+    try:
+        popen_kw = {}
+        if os.name == "posix":
+            popen_kw["start_new_session"] = True
+        subprocess.Popen(
+            [sys.executable, os.path.abspath(__file__), "_runner", tid],
+            stdin=subprocess.DEVNULL, stdout=log_fd, stderr=subprocess.STDOUT,
+            env=dict(os.environ), close_fds=True, **popen_kw)
+    finally:
+        log_fd.close()
+
+
+def dispatch(cfg, max_parallel=None):
+    """调度(§1.4(2)):flock 内 reconcile → plan_dispatch(优先级+空闲槽) → 提升保存;锁外 spawn。"""
+    m = max_parallel if max_parallel is not None else int(cfg["task"]["max_parallel"])
+
+    def _do():
+        reg = load_registry()
+        reconcile_running(reg)
+        promoted = plan_dispatch(reg, m)
+        now = _now_ms()
+        for t in promoted:
+            t["state"] = "running"
+            t["started_at"] = now
+            t["pid"] = None  # runner 启动后自填(§1.4(2))
+        save_registry_atomic(reg)
+        return [t["id"] for t in promoted]
+
+    promoted_ids = with_registry_flock(_do)
+    for tid in promoted_ids:
+        spawn_runner(tid)
+    return promoted_ids
+
+
+def add_task(cfg, command, workitem=None, priority="P2",
+             expected_seconds=None, kill_on_timeout=False):
+    """幂等入队(§1.4(1)):flock 内去重(同 workitem 非终态 → DuplicateWorkitem) + 追加 + 自动 dispatch。"""
+    if command is None or command.strip() == "":
+        raise UsageError("--command 不能为空")
+    if priority not in PRIORITIES:
+        raise UsageError(f"--priority 必须为 {'/'.join(PRIORITIES)}: {priority}")
+    if expected_seconds is not None:
+        if not isinstance(expected_seconds, int) or expected_seconds <= 0:
+            raise UsageError(f"--expected-seconds 必须是正整数: {expected_seconds}")
+    if DENY_RE.search(command):
+        raise StoreError("command 含疑似 secret, 拒绝写入")
+
+    def _do():
+        reg = load_registry()
+        if workitem is not None:
+            for t in reg["tasks"].values():
+                if t.get("workitem") == workitem and t["state"] in ("queued", "running"):
+                    raise DuplicateWorkitem(t["id"], t["state"])
+        tid = "t-" + secrets.token_hex(6)
+        while tid in reg["tasks"]:  # 冲突则重试(§1.4(1))
+            tid = "t-" + secrets.token_hex(6)
+        reg["tasks"][tid] = {
+            "id": tid, "workitem": workitem, "command": command,
+            "priority": priority, "state": "queued",
+            "expected_seconds": expected_seconds, "kill_on_timeout": bool(kill_on_timeout),
+            "created_at": _now_ms(), "started_at": None, "finished_at": None,
+            "exit_code": None, "failure_tail": None, "pid": None, "heartbeat_at": None,
+        }
+        save_registry_atomic(reg)
+        return tid
+
+    tid = with_registry_flock(_do)
+    try:
+        dispatch(cfg)  # best-effort 自动出队;失败不回溯,任务留在 queued,run 可补
+    except (StoreError, OSError):
+        pass
+    return tid
+
+
+# ---------------------------------------------------------------------------
+# 落账 runner(§1.4(3):分离式 wrapper,命令结束 finally 自动状态流转)
+# ---------------------------------------------------------------------------
+
+def _runner(task_id, cfg):
+    """单任务落账(内部子命令,隐藏不入 help)。命令结束后 finally 写终态,再 dispatch 自续。"""
+    log_path_ = log_path(task_id)
+
+    def _boot():
+        reg = load_registry()
+        t = reg["tasks"].get(task_id)
+        if t is None or t["state"] != "running":
+            return None  # 已被 reconcile 或已终态 → no-op(幂等,§R10/E22)
+        t["pid"] = os.getpid()
+        t["heartbeat_at"] = _now_ms()
+        save_registry_atomic(reg)
+        return t
+
+    t = with_registry_flock(_boot)
+    if t is None:
+        return 0
+    print(f"=== {task_id} start pid={os.getpid()} ===", flush=True)
+    rc, timed_out = None, False
+    try:
+        rc = run_command(t, cfg)
+    except CommandTimeout:
+        rc, timed_out = 124, True
+    except OSError:
+        rc, timed_out = 127, False  # 命令无法启动 → failed
+    finally:
+        state, _reason = terminal_state(rc, timed_out)
+        tail = extract_tail(log_path_, int(cfg["task"].get("log_tail_bytes", 2000))) \
+            if state != "done" else None
+
+        def _settle():
+            reg = load_registry()
+            t2 = reg["tasks"].get(task_id)
+            if t2 is not None and t2["state"] == "running":  # 二次守卫:落账幂等
+                t2["state"] = state
+                t2["exit_code"] = rc
+                t2["finished_at"] = _now_ms()
+                t2["failure_tail"] = tail
+                save_registry_atomic(reg)
+
+        with_registry_flock(_settle)
+        print(f"=== {task_id} end state={state} exit={rc} ===", flush=True)
+    try:
+        dispatch(cfg)  # 释放槽位 → 触发下一批(自续队列)
+    except (StoreError, OSError):
+        pass
+    return 0
+
+
+def runner_main(argv):
+    """_runner <id> 子命令入口(spawn 直接调用,不经过 task 分发)。"""
+    if len(argv) != 1 or not TASK_ID_RE.fullmatch(argv[0]):
+        return 2
+    try:
+        cfg = load_task_config()
+    except (StoreError, OSError) as e:
+        return fail(1, str(e), None, False)
+    return _runner(argv[0], cfg)
+
+
+# ---------------------------------------------------------------------------
+# CLI 命令(§1.5)
+# ---------------------------------------------------------------------------
+
+def cmd_add(args, cfg):
+    pos, opts = scan_args(args, {"command", "workitem", "priority", "expected-seconds"})
+    json_mode = bool(opts.get("json"))
+    if pos:
+        return fail(2, "add 不接受位置参数", None, json_mode)
+    command = opts.get("command")
+    if command is None or command.strip() == "":
+        return fail(2, "missing command", "add 需要 --command CMD", json_mode)
+    workitem = opts.get("workitem")
+    priority = opts.get("priority") or str(cfg["task"].get("default_priority", "P2"))
+    expected_raw = opts.get("expected-seconds")
+    expected = None
+    if expected_raw is not None:
+        try:
+            expected = int(expected_raw)
+        except (TypeError, ValueError):
+            return fail(2, "invalid expected-seconds", expected_raw, json_mode)
+        if expected <= 0:
+            return fail(2, "invalid expected-seconds", "必须为正整数", json_mode)
+    try:
+        tid = add_task(cfg, command, workitem=workitem, priority=priority,
+                       expected_seconds=expected,
+                       kill_on_timeout=bool(opts.get("kill-on-timeout")))
+    except DuplicateWorkitem as e:
+        return fail(2, "duplicate_workitem", f"已有非终态任务 {e.args[0]} ({e.args[1]})", json_mode)
+    except UsageError as e:
+        return fail(2, str(e), None, json_mode)
+    except StoreError as e:
+        return fail(2, str(e), None, json_mode)
+    if json_mode:
+        emit({"status": "ok", "id": tid, "state": "queued",  # 入队确认(§1.5 契约)
+              "workitem": workitem, "priority": priority})
+    else:
+        print(f"task {tid}: queued")
+    return 0
+
+
+def cmd_status(args, cfg):
+    pos, opts = scan_args(args, set())
+    json_mode = bool(opts.get("json"))
+    if len(pos) != 1:
+        return fail(2, "status 需要 <id>", None, json_mode)
+    tid = pos[0]
+    if not TASK_ID_RE.fullmatch(tid):
+        return fail(2, "invalid task id", tid, json_mode)
+    try:
+        reg = load_registry()
+    except StoreError as e:
+        return fail(2, str(e), None, json_mode)
+    t = reg["tasks"].get(tid)
+    if t is None:
+        return fail(2, "task not found", tid, json_mode)
+    if json_mode:
+        emit({"status": "ok", "task": t})
+    else:
+        print(f"{tid} state={t['state']} priority={t['priority']} "
+              f"workitem={t.get('workitem') or '-'} exit_code={t.get('exit_code') if t.get('exit_code') is not None else '-'} "
+              f"created_at={t.get('created_at') or '-'} finished_at={t.get('finished_at') or '-'}")
+        if t.get("failure_tail"):
+            print(f"failure_tail: {t['failure_tail']}")
+    return 0
+
+
+def cmd_list(args, cfg):
+    pos, opts = scan_args(args, {"state", "workitem"})
+    json_mode = bool(opts.get("json"))
+    if pos:
+        return fail(2, "list 不接受位置参数", None, json_mode)
+    state_f = opts.get("state")
+    wi_f = opts.get("workitem")
+    if state_f is not None and state_f not in TASK_STATES:
+        return fail(2, "invalid state filter", state_f, json_mode)
+    try:
+        reg = load_registry()
+    except StoreError as e:
+        return fail(2, str(e), None, json_mode)
+    tasks = sorted(reg["tasks"].values(),
+                   key=lambda t: (t.get("created_at", ""), t.get("id", "")), reverse=True)
+    if state_f is not None:
+        tasks = [t for t in tasks if t["state"] == state_f]
+    if wi_f is not None:
+        tasks = [t for t in tasks if t.get("workitem") == wi_f]
+    if json_mode:
+        emit({"status": "ok", "count": len(tasks), "tasks": tasks})
+    else:
+        for t in tasks:
+            print(f"{t['id']} {t['state']:8s} {t.get('workitem') or '-':4s} "
+                  f"{t['priority']} exit={t.get('exit_code') if t.get('exit_code') is not None else '-'}")
+    return 0
+
+
+def cmd_log(args, cfg):
+    pos, opts = scan_args(args, {"tail"})
+    json_mode = bool(opts.get("json"))
+    if len(pos) != 1:
+        return fail(2, "log 需要 <id>", None, json_mode)
+    tid = pos[0]
+    if not TASK_ID_RE.fullmatch(tid):
+        return fail(2, "invalid task id", tid, json_mode)
+    try:
+        reg = load_registry()
+    except StoreError as e:
+        return fail(2, str(e), None, json_mode)
+    if tid not in reg["tasks"]:
+        return fail(2, "task not found", tid, json_mode)
+    tail_raw = opts.get("tail")
+    tail = None
+    if tail_raw is not None:
+        try:
+            tail = int(tail_raw)
+        except (TypeError, ValueError):
+            return fail(2, "invalid tail", tail_raw, json_mode)
+        if tail < 0:
+            return fail(2, "invalid tail", "必须 >= 0", json_mode)
+    text = read_log(log_path(tid), tail)
+    if json_mode:
+        emit({"status": "ok", "id": tid, "content": text})
+    else:
+        sys.stdout.write(text)
+        if text and not text.endswith("\n"):
+            sys.stdout.write("\n")
+    return 0
+
+
+def cmd_run(args, cfg):
+    pos, opts = scan_args(args, {"max-parallel"})
+    json_mode = bool(opts.get("json"))
+    if pos:
+        return fail(2, "run 不接受位置参数", None, json_mode)
+    mp_raw = opts.get("max-parallel")
+    mp = None
+    if mp_raw is not None:
+        try:
+            mp = int(mp_raw)
+        except (TypeError, ValueError):
+            return fail(2, "invalid max-parallel", mp_raw, json_mode)
+        if mp <= 0:
+            return fail(2, "invalid max-parallel", "必须为正整数", json_mode)
+    try:
+        promoted = dispatch(cfg, max_parallel=mp)
+    except StoreError as e:
+        return fail(2, str(e), None, json_mode)
+    except OSError as e:
+        return fail(1, f"写盘失败: {e}", None, json_mode)
+    if json_mode:
+        emit({"status": "ok", "promoted": promoted})
+    else:
+        print(f"promoted: {len(promoted)}")
+    return 0
+
+
+def cmd_reconcile(args, cfg):
+    pos, opts = scan_args(args, set())
+    json_mode = bool(opts.get("json"))
+    if pos:
+        return fail(2, "reconcile 不接受位置参数", None, json_mode)
+
+    def _do():
+        reg = load_registry()
+        reaped = reconcile_running(reg)
+        save_registry_atomic(reg)
+        return reaped
+
+    try:
+        reaped = with_registry_flock(_do)
+    except StoreError as e:
+        return fail(2, str(e), None, json_mode)
+    except OSError as e:
+        return fail(1, f"写盘失败: {e}", None, json_mode)
+    if json_mode:
+        emit({"status": "ok", "reaped": reaped})
+    else:
+        print(f"reaped: {len(reaped)}")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# 入口
+# ---------------------------------------------------------------------------
+
+SUBCOMMANDS = {
+    "add": cmd_add, "status": cmd_status, "list": cmd_list,
+    "log": cmd_log, "run": cmd_run, "reconcile": cmd_reconcile,
+}
+
+
+def main(argv):
+    if argv and argv[0] == "_runner":  # 内部隐藏入口,仅由 spawn_runner 调用
+        return runner_main(argv[1:])
+    if not argv or argv[0] in ("-h", "--help", "help"):
+        sys.stdout.write(USAGE)
+        return 0 if argv else 2
+    if argv[0] != "task":
+        sys.stderr.write(USAGE)
+        return 2
+    rest = argv[1:]
+    if not rest or rest[0] in ("-h", "--help", "help"):
+        sys.stdout.write(USAGE)
+        return 0 if rest else 2
+    sub = rest[0]
+    fn = SUBCOMMANDS.get(sub)
+    if fn is None:
+        sys.stderr.write(f"错误: 未知子命令 {sub}\n")
+        return 2
+    json_mode = "--json" in rest[1:]
+    try:
+        cfg = load_task_config()
+    except StoreError as e:
+        return fail(2, f"配置解析失败: {e}", None, json_mode)
+    except OSError as e:
+        return fail(2, f"配置不可用: {e}", None, json_mode)
+    try:
+        return fn(rest[1:], cfg)
+    except UsageError as e:
+        return fail(2, str(e), None, json_mode)
+    except StoreError as e:
+        return fail(2, str(e), None, json_mode)
+    except OSError as e:
+        return fail(1, f"写盘失败: {e}", None, json_mode)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

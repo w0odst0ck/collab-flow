@@ -18,6 +18,7 @@
 #   flow workitem design   <id> [--async [--expected N]] [--check] [--force] [--json]
 #   flow workitem execute  <id> [--executor NAME] [--timeout N] [--force] [--json]
 #   flow workitem decision <id> --verdict pass|reject|takeover [--defect-type T] [--summary S] [--json]
+#   flow task add/status/list/log/run/reconcile(M1 后台任务队列,见 flow-task-core.py)
 #
 # 退出码: 0 成功 / 1 运行失败(守卫拒绝等) / 2 用法或前置错误 /
 #         3 async 设计运行中(design --check) / 124 超时
@@ -29,6 +30,7 @@ set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 CORE="$SCRIPT_DIR/flow-core.py"
+TASK_CORE="$SCRIPT_DIR/flow-task-core.py"
 
 usage() {
   sed -n '2,32p' "$0" | sed 's/^# \{0,1\}//'
@@ -41,6 +43,11 @@ case "${1:-}" in
     shift
     [[ $# -ge 1 ]] || { usage >&2; exit 2; }
     exec python3 "$CORE" workitem "$@"
+    ;;
+  task)
+    shift
+    [[ $# -ge 1 ]] || { usage >&2; exit 2; }
+    exec python3 "$TASK_CORE" task "$@"
     ;;
   *)
     usage >&2
