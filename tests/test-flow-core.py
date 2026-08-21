@@ -5,12 +5,16 @@
 零 API、全程临时目录。单测直接 import 纯函数(transition/evaluate_guard 零 I/O)。
 """
 
+import contextlib
 import importlib.util
+import io
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -42,6 +46,23 @@ def _status(wi_id="w1", state="created"):
 def _event(ev, **meta):
     return {"ts": "2026-08-14T10:00:00+00:00", "event": ev, "from": None, "to": None,
             "actor": "flow:control", "guard": None, "reason": None, "meta": meta}
+
+
+# 故意拼接,避免源码静态 deny-list 命中(sk-[A-Za-z0-9]{10})
+_FAKE_KEY = "sk-" + "fake-async-test-key"
+
+
+# stub dsh(async 契约用;照 run-smoke.sh 模式,零 API,支持 DSH_STUB_SLEEP/DSH_STUB_EXIT)
+STUB_DSH_ASYNC = r'''#!/usr/bin/env bash
+set -u
+if [[ "${DSH_STUB_SLEEP:-0}" != "0" ]]; then sleep "$DSH_STUB_SLEEP"; fi
+cat << 'MD'
+# stub 方案
+
+这是 stub 输出的假方案内容，用于 async 契约测试。
+MD
+exit "${DSH_STUB_EXIT:-0}"
+'''
 
 
 class StateMachineTests(unittest.TestCase):
@@ -368,6 +389,248 @@ class StoreTests(unittest.TestCase):
         with open(path, encoding="utf-8") as f:
             after = f.read()
         self.assertTrue(after.startswith(before))  # 不删改既有行
+
+
+class AsyncDesignTests(unittest.TestCase):
+    """async-design-support 方案 A01-A11(§3.1):--async/--check + 同步不回归。stub 零 API。"""
+
+    _ENV_PREFIXES = ("FLOW_", "COLLABFLOW_", "STUB_", "DSH_", "DEEPSEEK", "HOME")
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="flow-async-")
+        self.workdir = os.path.join(self.tmp, "work")
+        os.makedirs(self.workdir, exist_ok=True)
+        self._saved = {k: v for k, v in os.environ.items()
+                       if k.startswith(self._ENV_PREFIXES)}
+        for k in list(self._saved):
+            os.environ.pop(k, None)
+        os.environ["FLOW_DATA_DIR"] = os.path.join(self.tmp, ".flow")
+        os.environ["FLOW_WORKDIR"] = self.workdir
+        os.environ["COLLABFLOW_CONFIG"] = os.path.join(self.tmp, "no-cfg.yaml")
+        os.environ["HOME"] = os.path.join(self.tmp, "home")
+        os.makedirs(os.environ["HOME"], exist_ok=True)
+        os.environ["DEEPSEEK_API_KEY"] = _FAKE_KEY
+        os.environ["DSH_HOME"] = os.path.join(self.tmp, "dshhome")
+        os.environ["DSH_DESIGN_PRO_PATCH"] = os.path.join(self.tmp, "pro.patch.yml")
+        self.stub_dsh = os.path.join(self.tmp, "stub-dsh.sh")
+        with open(self.stub_dsh, "w", encoding="utf-8") as f:
+            f.write(STUB_DSH_ASYNC)
+        os.chmod(self.stub_dsh, 0o755)
+        os.environ["DSH_BIN"] = self.stub_dsh
+
+    def tearDown(self):
+        try:  # 清理后台 worker,避免孤儿写已删目录
+            st = fc.load_status(os.path.join(fc.workitems_dir(), "w1"))
+            pid = (st.get("async") or {}).get("pid")
+            if pid is not None:
+                try:
+                    os.kill(int(pid), 9)
+                except (ProcessLookupError, PermissionError, ValueError):
+                    pass
+                try:
+                    os.waitpid(int(pid), 0)   # 收割僵尸,避免 os.kill(pid,0) 误判存活
+                except ChildProcessError:
+                    pass
+        except Exception:
+            pass
+        for k in [k for k in list(os.environ) if k.startswith(self._ENV_PREFIXES)]:
+            os.environ.pop(k, None)
+        os.environ.update(self._saved)
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _mk_wi(self, state="created"):
+        wi_dir = os.path.join(fc.workitems_dir(), "w1")
+        os.makedirs(wi_dir, exist_ok=True)
+        fc.save_status_atomic(wi_dir, _status("w1", state))
+        with open(os.path.join(wi_dir, "brief.md"), "w", encoding="utf-8") as f:
+            f.write("# brief\n")
+        return wi_dir
+
+    def _jload(self, path):
+        return json.loads(fc.read_file(path))
+
+    def _wait_result(self, wi_dir, timeout=20):
+        """轮询 design-async-result.json 出现(worker 完成),返回 bool。"""
+        path = os.path.join(wi_dir, "design-async-result.json")
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if os.path.isfile(path):
+                return True
+            time.sleep(0.1)
+        return False
+
+    def test_A01_async_phase_exhaustive(self):
+        # 纯函数穷举(不 sleep,pid_alive 传 lambda):done_ok/done_timeout/done_failed/
+        # running/over_expected/crashed
+        base = _status()
+        base["async"] = {"pid": 123, "started_at": "2026-08-21T01:00:00+00:00",
+                         "expected_seconds": 480, "finished_at": None, "exit_code": None}
+        now = fc.parse_iso("2026-08-21T01:05:00+00:00")  # elapsed=300
+        ph = fc.async_phase(base, {"exit_code": 0}, now, True)
+        self.assertEqual(ph["phase"], "done_ok")
+        self.assertIsNone(ph["alarm"])
+        ph = fc.async_phase(base, {"exit_code": 124}, now, True)
+        self.assertEqual(ph["phase"], "done_timeout")
+        self.assertEqual(ph["alarm"], "timeout")
+        ph = fc.async_phase(base, {"exit_code": 1}, now, True)
+        self.assertEqual(ph["phase"], "done_failed")
+        # running:无 result + pid 活 + 未超 expected
+        ph = fc.async_phase(base, None, now, True)
+        self.assertEqual(ph["phase"], "running")
+        self.assertEqual(ph["elapsed_seconds"], 300)
+        self.assertEqual(ph["remaining_seconds"], 180)
+        self.assertFalse(ph["over_expected"])
+        # over_expected:elapsed > expected 且仍在跑
+        far = fc.parse_iso("2026-08-21T01:10:00+00:00")  # elapsed=600 > 480
+        ph = fc.async_phase(base, None, far, True)
+        self.assertEqual(ph["phase"], "over_expected")
+        self.assertTrue(ph["over_expected"])
+        self.assertEqual(ph["alarm"], "timeout")
+        self.assertEqual(ph["remaining_seconds"], 0)
+        # crashed:无 result + pid 死
+        ph = fc.async_phase(base, None, now, False)
+        self.assertEqual(ph["phase"], "crashed")
+        # 无 async 块兜底 → crashed
+        ph = fc.async_phase({}, None, now, False)
+        self.assertEqual(ph["phase"], "crashed")
+
+    def test_A02_async_launch_marks_status(self):
+        wi_dir = self._mk_wi()
+        code = fc.cmd_design(["w1", "--async"], _cfg())
+        self.assertEqual(code, 0)
+        st = fc.load_status(wi_dir)
+        a = st["async"]
+        self.assertIn("pid", a)
+        self.assertIn("started_at", a)
+        self.assertEqual(a["expected_seconds"], 480)  # 默认回退
+        self.assertIsNone(a["finished_at"])
+        self.assertIsNone(a["exit_code"])
+        self.assertEqual(st["state"], "created")      # 标记写入不转移
+        self.assertTrue(os.path.isfile(os.path.join(wi_dir, "design-async.log")))
+        self.assertNotIn("design.md", os.listdir(wi_dir))  # 未落盘
+
+    def test_A03_usage_errors(self):
+        # UsageError 由 main() 捕获 → exit 2;直接调 cmd_design 断言异常类型
+        wi_dir = self._mk_wi()
+        with self.assertRaises(fc.UsageError):
+            fc.cmd_design(["w1", "--async", "--check"], _cfg())     # 互斥
+        with self.assertRaises(fc.UsageError):
+            fc.cmd_design(["w1", "--expected", "5"], _cfg())        # 无 --async
+        with self.assertRaises(fc.UsageError):
+            fc.cmd_design(["w1", "--expected", "0", "--async"], _cfg())  # 非正整数
+        st = fc.load_status(wi_dir)  # 校验均在 spawn 前:无 async 标记
+        self.assertNotIn("async", st)
+
+    def test_A04_check_idempotent(self):
+        wi_dir = self._mk_wi()
+        self.assertEqual(fc.cmd_design(["w1", "--async"], _cfg()), 0)
+        self.assertTrue(self._wait_result(wi_dir))
+        self.assertEqual(fc.cmd_design(["w1", "--check"], _cfg()), 0)
+        st = fc.load_status(wi_dir)
+        self.assertEqual(st["state"], "designed")
+        self.assertEqual(st["async"]["exit_code"], 0)
+        self.assertIsNotNone(st["async"]["finished_at"])
+        seq1 = st["event_seq"]
+        # 再次 --check:幂等 no-op,无副作用
+        self.assertEqual(fc.cmd_design(["w1", "--check"], _cfg()), 0)
+        st2 = fc.load_status(wi_dir)
+        self.assertEqual(st2["state"], "designed")
+        self.assertEqual(st2["event_seq"], seq1)
+        with open(os.path.join(wi_dir, "events.jsonl"), encoding="utf-8") as f:
+            events = [json.loads(ln) for ln in f if ln.strip()]
+        self.assertEqual(len([e for e in events if e["event"] == "design"]), 1)
+
+    def test_A05_completion_transitions(self):
+        wi_dir = self._mk_wi()
+        self.assertEqual(fc.cmd_design(["w1", "--async"], _cfg()), 0)
+        self.assertTrue(self._wait_result(wi_dir))
+        self.assertEqual(fc.cmd_design(["w1", "--check"], _cfg()), 0)
+        self.assertTrue(os.path.isfile(os.path.join(wi_dir, "design.md")))
+        self.assertTrue(os.path.isfile(os.path.join(wi_dir, "design-result.json")))
+        self.assertTrue(fc.read_file(os.path.join(wi_dir, "design.md")).strip())
+        st = fc.load_status(wi_dir)
+        self.assertEqual(st["state"], "designed")
+        with open(os.path.join(wi_dir, "events.jsonl"), encoding="utf-8") as f:
+            events = [json.loads(ln) for ln in f if ln.strip()]
+        self.assertTrue(any(e["event"] == "design" for e in events))
+
+    def test_A06_over_expected_alarm(self):
+        wi_dir = self._mk_wi()
+        os.environ["DSH_STUB_SLEEP"] = "3"
+        self.assertEqual(fc.cmd_design(["w1", "--async", "--expected", "1"], _cfg()), 0)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            code = fc.cmd_design(["w1", "--check", "--json"], _cfg())
+        self.assertEqual(code, 3)                       # running
+        self.assertEqual(json.loads(buf.getvalue())["status"], "running")
+        time.sleep(2)                                   # elapsed>expected 且仍在跑
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            code = fc.cmd_design(["w1", "--check", "--json"], _cfg())
+        self.assertEqual(code, 124)                     # over_expected 报警
+        obj = json.loads(buf.getvalue())
+        self.assertEqual(obj["alarm"], "timeout")
+        self.assertTrue(obj["over_expected"])
+        self.assertTrue(self._wait_result(wi_dir))      # 等 worker 结束再清理
+
+    def test_A07_worker_failure(self):
+        wi_dir = self._mk_wi()
+        os.environ["DSH_STUB_EXIT"] = "1"
+        self.assertEqual(fc.cmd_design(["w1", "--async"], _cfg()), 0)
+        self.assertTrue(self._wait_result(wi_dir))
+        code = fc.cmd_design(["w1", "--check"], _cfg())
+        self.assertEqual(code, 1)
+        self.assertEqual(fc.load_status(wi_dir)["state"], "created")  # 不转移
+        r = self._jload(os.path.join(wi_dir, "design-async-result.json"))
+        self.assertEqual(r["exit_code"], 1)
+        self.assertFalse(os.path.isfile(os.path.join(wi_dir, "design.md")))
+
+    def test_A08_hard_timeout(self):
+        wi_dir = self._mk_wi()
+        os.environ["DSH_STUB_SLEEP"] = "5"
+        os.environ["DSH_DESIGN_TIMEOUT"] = "1"   # flow-config 尊重已设 env
+        self.assertEqual(fc.cmd_design(["w1", "--async"], _cfg()), 0)
+        self.assertTrue(self._wait_result(wi_dir, timeout=30))
+        code = fc.cmd_design(["w1", "--check"], _cfg())
+        self.assertEqual(code, 124)
+        r = self._jload(os.path.join(wi_dir, "design-async-result.json"))
+        self.assertEqual(r["exit_code"], 124)
+        self.assertEqual(fc.load_status(wi_dir)["state"], "created")
+
+    def test_A09_crash(self):
+        wi_dir = self._mk_wi()
+        os.environ["DSH_STUB_SLEEP"] = "2"   # 保证 result.json 尚未写入时 kill
+        self.assertEqual(fc.cmd_design(["w1", "--async"], _cfg()), 0)
+        st = fc.load_status(wi_dir)
+        os.kill(int(st["async"]["pid"]), 9)
+        try:  # 收割僵尸,否则 os.kill(pid,0) 对僵尸仍返回 True
+            os.waitpid(int(st["async"]["pid"]), 0)
+        except ChildProcessError:
+            pass
+        code = fc.cmd_design(["w1", "--check"], _cfg())
+        self.assertEqual(code, 1)                       # crashed
+        self.assertEqual(fc.load_status(wi_dir)["state"], "created")
+        self.assertFalse(os.path.isfile(os.path.join(wi_dir, "design.md")))
+
+    def test_A10_sync_no_regression(self):
+        wi_dir = self._mk_wi()
+        self.assertEqual(fc.cmd_design(["w1"], _cfg()), 0)   # 无 flag 仍走同步
+        st = fc.load_status(wi_dir)
+        self.assertEqual(st["state"], "designed")
+        self.assertNotIn("async", st)                       # 同步不写 async 标记
+        self.assertTrue(os.path.isfile(os.path.join(wi_dir, "design.md")))
+
+    def test_A11_corrupt_result(self):
+        wi_dir = self._mk_wi()
+        self.assertEqual(fc.cmd_design(["w1", "--async"], _cfg()), 0)
+        self.assertTrue(self._wait_result(wi_dir))
+        with open(os.path.join(wi_dir, "design-async-result.json"), "w",
+                  encoding="utf-8") as f:
+            f.write("{not-valid-json")
+        code = fc.cmd_design(["w1", "--check"], _cfg())
+        self.assertEqual(code, 1)                       # fail-closed
+        self.assertFalse(os.path.isfile(os.path.join(wi_dir, "design.md")))
+        self.assertEqual(fc.load_status(wi_dir)["state"], "created")
 
 
 if __name__ == "__main__":

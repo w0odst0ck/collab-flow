@@ -191,6 +191,99 @@ else
   bad "C18" "run-smoke rc=$RC1 run-config-smoke rc=$RC2"
 fi
 
+# ---------- C19-C21: design --async / --check(stub dsh 零 API) ----------
+FAKE_KEY="sk-""fake-key-$(date +%s)"
+STUB_DSH="$WORK/stub-dsh.sh"
+cat > "$STUB_DSH" << 'STUB'
+#!/usr/bin/env bash
+# stub dsh(async 冒烟):env DSH_STUB_SLEEP/DSH_STUB_EXIT
+set -u
+if [[ "${DSH_STUB_SLEEP:-0}" != "0" ]]; then sleep "$DSH_STUB_SLEEP"; fi
+cat << 'MD'
+# stub 方案
+
+这是 stub 输出的假方案内容，用于 async 冒烟测试。
+MD
+exit "${DSH_STUB_EXIT:-0}"
+STUB
+chmod +x "$STUB_DSH"
+mkdir -p "$WORK/dshhome"
+
+run_design() { # run_design [args...] —— design 链路:注入 stub dsh 全套 env
+  env HOME="$WORK/home" FLOW_DATA_DIR="$DATA" COLLABFLOW_CONFIG="$WORK/no-cfg.yaml" \
+      DEEPSEEK_API_KEY="$FAKE_KEY" DSH_HOME="$WORK/dshhome" DSH_BIN="$STUB_DSH" \
+      DSH_DESIGN_PRO_PATCH="$WORK/pro.patch.yml" \
+      "$FLOW" "$@"
+}
+
+wait_async() { # wait_async <id> [timeout_s] —— 轮询 design-async-result.json 出现
+  local id="$1" t="${2:-20}" i=0
+  while [[ $i -lt $((t * 2)) ]]; do
+    [[ -f "$DATA/workitems/$id/design-async-result.json" ]] && return 0
+    sleep 0.5
+    i=$((i + 1))
+  done
+  return 1
+}
+
+async_pid() { # async_pid <id> —— status --json 中的 async.pid
+  run_design workitem status "$1" --json 2>/dev/null \
+    | python3 -c 'import sys,json;print((json.loads(sys.stdin.read()).get("async") or {}).get("pid",""))' 2>/dev/null
+}
+
+echo "== C19: design --async → --check 端到端(designed) =="
+run_design workitem new w3 --brief "$BRIEF_SRC" --json >/dev/null 2>&1
+OUT="$(run_design workitem design w3 --async 2>&1)"; RC=$?
+if [[ $RC -eq 0 ]] && echo "$OUT" | grep -q "pid="; then
+  ok "async 启动 exit0+输出 pid"
+else
+  bad "C19a" "rc=$RC out=$OUT"
+fi
+if wait_async w3; then
+  OUT="$(run_design workitem design w3 --check 2>&1)"; RC=$?
+  STATE="$(run_design workitem status w3 --json 2>/dev/null \
+           | python3 -c 'import sys,json;print(json.loads(sys.stdin.read())["state"])' 2>/dev/null)"
+  if [[ $RC -eq 0 ]] && [[ "$STATE" == "designed" ]] \
+     && [[ -s "$DATA/workitems/w3/design.md" ]]; then
+    ok "check exit0 → designed + design.md 非空"
+  else
+    bad "C19b" "rc=$RC state=$STATE"
+  fi
+else
+  bad "C19c" "worker 未在超时内完成"
+fi
+
+echo "== C20: --check 幂等 + --async/--check 互斥 =="
+OUT1="$(run_design workitem status w3 --json 2>/dev/null)"
+OUT="$(run_design workitem design w3 --check 2>&1)"; RC=$?
+OUT2="$(run_design workitem status w3 --json 2>/dev/null)"
+if [[ $RC -eq 0 ]] && [[ "$OUT1" == "$OUT2" ]]; then
+  ok "二次 --check exit0 幂等(状态不变,无重复事件)"
+else
+  bad "C20a" "rc=$RC"
+fi
+OUT="$(run_design workitem design w3 --async --check 2>&1)"; RC=$?
+if [[ $RC -eq 2 ]]; then ok "--async --check 互斥 exit2"; else bad "C20b" "rc=$RC out=$OUT"; fi
+
+echo "== C21: 超时报警(--expected 1 + DSH_STUB_SLEEP=3) =="
+run_design workitem new w4 --brief "$BRIEF_SRC" --json >/dev/null 2>&1
+OUT="$(DSH_STUB_SLEEP=2 run_design workitem design w4 --async --expected 1 --json 2>&1)"; RC=$?
+if [[ $RC -eq 0 ]]; then
+  OUT1="$(run_design workitem design w4 --check --json 2>&1)"; RC1=$?
+  sleep 2
+  OUT2="$(run_design workitem design w4 --check --json 2>&1)"; RC2=$?
+  if [[ $RC1 -eq 3 ]] && [[ $RC2 -eq 124 ]] \
+     && echo "$OUT2" | grep -q '"alarm":"timeout"'; then
+    ok "exit3(running) → exit124(alarm:timeout)"
+  else
+    bad "C21" "rc1=$RC1 rc2=$RC2 out1=$OUT1 out2=$OUT2"
+  fi
+  WPID="$(async_pid w4)"
+  [[ -n "$WPID" ]] && kill -9 "$WPID" 2>/dev/null   # 清理未结束的 worker
+else
+  bad "C21a" "async 启动 rc=$RC out=$OUT"
+fi
+
 echo
 echo "========== 结果: $PASS 通过 / $FAIL 失败 =========="
 if [[ $FAIL -gt 0 ]]; then

@@ -38,8 +38,10 @@
 ## 测试
 
 ```bash
-bash tests/run-smoke.sh        # 15 断言（stub 零 API）
-bash tests/run-config-smoke.sh # 17 断言（配置层，stub 零 API）
+python3 -m unittest discover tests   # 单测（状态机/store/执行器契约/verify 门/async 契约）
+bash tests/run-smoke.sh              # 15 断言（stub 零 API）
+bash tests/run-config-smoke.sh       # 17 断言（配置层，stub 零 API）
+bash tests/run-flow-smoke.sh         # C1-C21（flow CLI 冒烟，含 --async/--check）
 ```
 
 ## 目录
@@ -55,6 +57,25 @@ learning/         # 协作方法论（symlink → 个人笔记区，Obsidian 可
 ## 方法论
 
 - [长任务后台化与定时唤醒](learning/长任务后台化与定时唤醒.md) — 防上下文撑满：轮询上限 / 后台模式 / 定时唤醒协议 / 宿主集成示例（配合 flow workitem 的 `--async` / `--check`）
+
+## workitem 长设计（后台化，--async / --check）
+
+pro 模型设计耗时 5-8 分钟，前台同步阻塞会撑爆宿主上下文。三步后台化：
+
+```bash
+# 1. 后台起设计(立即返回,输出 worker pid + 日志路径)
+./scripts/flow workitem design w1 --async [--expected 480]
+
+# 2. 确认 pid 后设一次性定时唤醒,宿主结束回合(不轮询)
+
+# 3. 醒来后幂等查询(完成才落盘 design.md 并转 designed)
+./scripts/flow workitem design w1 --check
+```
+
+- `--check` 幂等：已完成再查 → exit 0 no-op（不重落盘、不重发 `design` 事件）；运行中/失败分支零写入，可无限重试
+- 退出码：`0` 完成 / `3` 运行中（未超预期，宿主继续等唤醒）/ `124` 超时报警（`alarm:"timeout"`，含超预期时长仍未完成）/ `1` 失败（dsh-design 失败、后台崩溃、结果损坏）/ `2` 用法或前置错误
+- 日志与完成记录：`<wi_dir>/design-async.log` + `design-async-result.json`（单真相源）；`expected_seconds` 默认 480（`config/defaults.yaml` 或 `--expected N` 覆盖，软截止非硬超时）
+- 失败重跑：`flow workitem design w1 --async` 直接重起（在途任务会被拒，先 `--check`）
 
 ## 路线图
 

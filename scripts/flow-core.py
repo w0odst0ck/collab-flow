@@ -10,7 +10,8 @@
   4. 命令实现(§3)—— new/status/transition/list/log/lock/unlock/show/guard/verify/decision。
 
 用法: flow-core.py workitem <sub> ...
-退出码: 0 成功 / 1 运行失败(守卫拒绝、写盘失败) / 2 用法或前置错误 / 124 预留。
+退出码: 0 成功 / 1 运行失败(守卫拒绝、写盘失败) / 2 用法或前置错误 /
+        3 async 设计运行中(design --check,新增,纯增量) / 124 超时。
 
 红线: 本文件零个人标识(actor/owner 用 flow:<plane_id>,不取 hostname/用户名);
       id 白名单正则硬编码;meta 写入前过 deny-list;transition()/evaluate_guard() 零 I/O。
@@ -66,6 +67,11 @@ class WorkitemError(Exception):
 
 
 class Locked(Exception):
+    """workitem 锁被其他持有者占用。"""
+
+
+class InFlight(Exception):
+    """已有进行中的 async 设计（锁内复查命中，TOCTOU 防御）。"""
     """锁被他人持有(→ exit 2)。"""
 
 
@@ -798,6 +804,9 @@ def load_config():
         workitem["plane_id"] = os.environ["FLOW_PLANE_ID"]
     if os.environ.get("FLOW_EXECUTOR"):
         executor["default"] = os.environ["FLOW_EXECUTOR"]
+    expected_s = _env_int("FLOW_DESIGN_EXPECTED_S")
+    if expected_s is not None:
+        workitem["design_expected_seconds"] = expected_s
     return {"workitem": workitem, "gates": gates, "executor": executor}
 
 
@@ -1374,11 +1383,14 @@ def cmd_status(args, cfg):
     wi_dir = resolve_wi_dir(wi_id, cfg)
     status = load_status(wi_dir)
     if json_mode:
-        emit({"id": wi_id, "state": status["state"], "iteration": status.get("iteration", 0),
-              "same_defect_count": status.get("same_defect_count", 0),
-              "takeover": status.get("takeover", False),
-              "locked_by": status.get("locked_by"), "lock_expires_at": status.get("lock_expires_at"),
-              "event_seq": status.get("event_seq"), "updated_at": status.get("updated_at")})
+        obj = {"id": wi_id, "state": status["state"], "iteration": status.get("iteration", 0),
+               "same_defect_count": status.get("same_defect_count", 0),
+               "takeover": status.get("takeover", False),
+               "locked_by": status.get("locked_by"), "lock_expires_at": status.get("lock_expires_at"),
+               "event_seq": status.get("event_seq"), "updated_at": status.get("updated_at")}
+        if status.get("async") is not None:   # 存在时透出(增量输出,不碰现有字段)
+            obj["async"] = status["async"]
+        emit(obj)
     else:
         for k in ("id", "state", "iteration", "same_defect_count", "takeover",
                   "locked_by", "lock_expires_at", "event_seq", "updated_at"):
@@ -1692,8 +1704,346 @@ def cmd_decision(args, cfg):
 # P3 命令:design / execute / verify --auto(§P3 §2)
 # ---------------------------------------------------------------------------
 
+def _invoke_design(flow_config, wdir, brief_path, out_dir):
+    """调用 flow-config → dsh-design(pro/read-only/回验/redact 继承),同步与异步共用。
+
+    返回 {"rc", "info", "error", "detail", "stdout", "stderr"}:
+      rc=0 且 info=dict(成功 JSON 输出);rc=2 仅用于「无法调用 flow-config」(OSError);
+      rc=124 硬超时;其余 rc 为 dsh 真实退出码(1/2),error="dsh-design 失败"。
+    """
+    cmd = [flow_config, "-d", wdir, "-o", out_dir, "--json", brief_path]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True)
+    except OSError as e:
+        return {"rc": 2, "info": None, "error": f"无法调用 flow-config: {e}",
+                "detail": None, "stdout": "", "stderr": ""}
+    if proc.returncode == 124:
+        return {"rc": 124, "info": None, "error": "设计超时",
+                "detail": None, "stdout": proc.stdout, "stderr": proc.stderr}
+    if proc.returncode != 0:
+        detail = (proc.stderr or "").strip().splitlines()
+        return {"rc": proc.returncode, "info": None, "error": "dsh-design 失败",
+                "detail": detail[-1] if detail else None,
+                "stdout": proc.stdout, "stderr": proc.stderr}
+    try:
+        info = json.loads(proc.stdout.strip().splitlines()[-1])
+    except (ValueError, IndexError):
+        return {"rc": 1, "info": None, "error": "dsh-design 输出非 JSON",
+                "detail": None, "stdout": proc.stdout, "stderr": proc.stderr}
+    if not isinstance(info, dict):
+        return {"rc": 1, "info": None, "error": "dsh-design 输出非 JSON 对象",
+                "detail": None, "stdout": proc.stdout, "stderr": proc.stderr}
+    return {"rc": 0, "info": info, "error": None, "detail": None,
+            "stdout": proc.stdout, "stderr": proc.stderr}
+
+
+# ---------------------------------------------------------------------------
+# design 异步支持(--async / --check;async-design-support 方案)
+# ---------------------------------------------------------------------------
+
+def _pid_alive(pid):
+    """探活:仅一处 os.kill(pid, 0);进程不存在/无权限/非法 → False。"""
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except (ProcessLookupError, PermissionError, ValueError, TypeError):
+        return False
+
+
+def async_phase(status, result, now, pid_alive):
+    """async 设计纯判定(零文件 I/O):result=None 表示 design-async-result.json 缺失。
+
+    status 需含 async 块(pid/started_at/expected_seconds);pid_alive 由调用方算好传入。
+    完成判定只看 result.json(单真相源);pid 存活仅用于区分「运行中 vs 崩溃」。
+    返回 {"phase", "elapsed_seconds", "over_expected", "alarm", "remaining_seconds"}。
+    """
+    a = status.get("async") or {}
+    started = a.get("started_at")
+    raw_expected = a.get("expected_seconds")
+    try:
+        expected = int(raw_expected) if raw_expected is not None else None
+    except (TypeError, ValueError):
+        raise StoreError("status.async.expected_seconds 非法")
+    if started:
+        try:
+            started_dt = parse_iso(started)
+        except (TypeError, ValueError):
+            raise StoreError("status.async.started_at 非法")
+        elapsed = max(0, int((now - started_dt).total_seconds()))
+    else:
+        elapsed = 0
+    remaining = max(0, (expected or 0) - elapsed)
+    over = bool(expected) and elapsed > expected
+
+    if result is not None:
+        ec = result.get("exit_code")
+        if ec == 0:
+            phase = "done_ok"
+        elif ec == 124:
+            phase = "done_timeout"
+        else:
+            phase = "done_failed"
+    elif pid_alive:
+        phase = "over_expected" if over else "running"
+    else:
+        phase = "crashed"
+    alarm = "timeout" if phase in ("over_expected", "done_timeout") else None
+    return {"phase": phase, "elapsed_seconds": elapsed, "over_expected": over,
+            "alarm": alarm, "remaining_seconds": remaining}
+
+
+def _read_result(wi_dir):
+    """读 design-async-result.json:缺失 → None;损坏 → StoreError(fail-closed)。"""
+    path = os.path.join(wi_dir, "design-async-result.json")
+    if not os.path.isfile(path):
+        return None
+    try:
+        data = json.loads(read_file(path))
+    except ValueError:
+        raise StoreError(f"{path}: design-async-result.json 损坏(非 JSON)")
+    if not isinstance(data, dict):
+        raise StoreError(f"{path}: design-async-result.json 顶层必须是对象")
+    return data
+
+
+def _append_log(wi_dir, text):
+    """worker 追加审计日志 design-async.log(始终保留)。"""
+    if not text:
+        return
+    path = os.path.join(wi_dir, "design-async.log")
+    with open(path, "a", encoding="utf-8", errors="replace") as f:
+        f.write(text)
+        if not text.endswith("\n"):
+            f.write("\n")
+
+
+def spawn_worker(wi_dir, brief_path, wdir, flow_config, log_path, started_at, expected_s):
+    """起后台 worker(--async-worker,setssid 孤儿)并返回 Popen 句柄;不 wait。
+
+    时序:先 spawn 得真实 pid,由调用方锁内写 status.async 标记;worker 与宿主
+    生命周期解耦。expected_seconds/started_at 经 env FLOW_ASYNC_* 传 worker。
+    """
+    env = dict(os.environ)
+    env["FLOW_ASYNC_STARTED_AT"] = started_at
+    env["FLOW_ASYNC_EXPECTED_S"] = str(expected_s)
+    log_fd = open(log_path, "ab")
+    try:
+        popen_kw = {}
+        if os.name == "posix":
+            popen_kw["start_new_session"] = True
+        proc = subprocess.Popen(
+            [sys.executable, os.path.abspath(__file__), "--async-worker",
+             wi_dir, brief_path, wdir, flow_config],
+            stdin=subprocess.DEVNULL, stdout=log_fd, stderr=subprocess.STDOUT,
+            env=env, **popen_kw)
+    finally:
+        log_fd.close()
+    return proc
+
+
+def _cmd_design_async(wi_id, wi_dir, brief_path, json_mode, cfg, opts):
+    """--async:后台起 worker + 锁内写 async 标记 + 立即返回 exit 0。"""
+    expected_raw = opts.get("expected")
+    if expected_raw is not None:
+        try:
+            expected = int(expected_raw)
+        except (TypeError, ValueError):
+            raise UsageError(f"--expected 必须是正整数: {expected_raw}")
+    else:
+        try:
+            expected = int(cfg["workitem"].get("design_expected_seconds", 480))
+        except (TypeError, ValueError):
+            expected = 480
+    if expected <= 0:
+        raise UsageError("--expected 必须是正整数")
+
+    status = load_status(wi_dir)
+    a = status.get("async") or {}
+    result_path = os.path.join(wi_dir, "design-async-result.json")
+    in_flight = (a.get("pid") is not None and a.get("finished_at") is None
+                 and not os.path.isfile(result_path) and _pid_alive(a["pid"]))
+    if in_flight:
+        return fail(2, "已有进行中的 async 设计(先 design --check)", None, json_mode)
+
+    flow_config = os.path.join(os.path.dirname(os.path.abspath(__file__)), "flow-config")
+    wdir = workdir()
+    started_at = now_iso()
+    log_path = os.path.join(wi_dir, "design-async.log")
+    proc = spawn_worker(wi_dir, brief_path, wdir, flow_config, log_path,
+                        started_at, expected)
+
+    def _do():
+        s = load_status(wi_dir)
+        if is_locked(s, now_dt()):
+            raise Locked(s["locked_by"])
+        # 锁内复查 async 状态（TOCTOU 防御：并发 --async 都过了锁外检查时，这里拦截后到者）
+        a = s.get("async") or {}
+        still_in_flight = (a.get("pid") is not None and a.get("finished_at") is None
+                           and not os.path.isfile(result_path) and _pid_alive(a["pid"]))
+        if still_in_flight:
+            raise InFlight()
+        s["async"] = {"pid": proc.pid, "started_at": started_at,
+                      "expected_seconds": expected, "finished_at": None, "exit_code": None}
+        save_status_atomic(wi_dir, s)
+        return s
+    try:
+        s = with_workitem_lock(wi_dir, _do)
+    except InFlight:
+        return fail(2, "已有进行中的 async 设计(先 design --check)", None, json_mode)
+    except Locked as e:
+        # 极端竞态:spawn 后锁被他人持有。worker 为孤儿会完成并写 result.json(审计留档),
+        # 但无 async 标记 → 用户可 --async 重跑(fail-safe,不杀 worker)。
+        return fail(2, f"锁被他人持有: {e}", None, json_mode)
+
+    if json_mode:
+        emit({"status": "ok", "id": wi_id, "state": s["state"],
+              "async": s["async"], "log": log_path})
+    else:
+        print(f"{wi_id}: async 设计已启动 pid={proc.pid} expected={expected}s "
+              f"(log: {log_path})")
+    return 0
+
+
+def _cmd_design_check(wi_id, wi_dir, json_mode, cfg):
+    """--check:幂等查询 → 完成则落盘 design.md/design-result.json 并锁内转 designed。"""
+    status = load_status(wi_dir)
+    if status["state"] == "designed":
+        if json_mode:
+            emit({"status": "ok", "id": wi_id, "state": "designed",
+                  "no_transition": True, "message": "already designed"})
+        else:
+            print(f"{wi_id}: already designed")
+        return 0
+    if status["state"] != "created":
+        return fail(2, f"design 前置状态不符: {status['state']}", None, json_mode)
+    a = status.get("async") or {}
+    if a.get("pid") is None:
+        return fail(2, "无进行中的 async 设计(先 design --async)", None, json_mode)
+    pid = a["pid"]
+
+    try:
+        result = _read_result(wi_dir)
+    except StoreError as e:
+        return fail(1, str(e), None, json_mode)
+    ph = async_phase(status, result, now_dt(), _pid_alive(pid))
+    log_path = os.path.join(wi_dir, "design-async.log")
+
+    if ph["phase"] == "running":
+        if json_mode:
+            emit({"status": "running", "id": wi_id, "state": status["state"],
+                  "async": a, "pid": pid, "log": log_path,
+                  "elapsed_seconds": ph["elapsed_seconds"],
+                  "remaining_seconds": ph["remaining_seconds"],
+                  "expected_seconds": a.get("expected_seconds")})
+        else:
+            print(f"{wi_id}: async 设计运行中 pid={pid} "
+                  f"elapsed={ph['elapsed_seconds']}s "
+                  f"remaining={ph['remaining_seconds']}s (log: {log_path})")
+        return 3
+    if ph["phase"] == "over_expected":
+        if json_mode:
+            emit({"status": "running", "alarm": "timeout", "over_expected": True,
+                  "id": wi_id, "state": status["state"], "async": a, "pid": pid,
+                  "log": log_path, "elapsed_seconds": ph["elapsed_seconds"],
+                  "expected_seconds": a.get("expected_seconds")})
+        else:
+            print(f"{wi_id}: async 设计已超预期时长仍在运行 "
+                  f"elapsed={ph['elapsed_seconds']}s "
+                  f"expected={a.get('expected_seconds')}s (log: {log_path})",
+                  file=sys.stderr)
+        return 124
+    if ph["phase"] == "done_timeout":
+        return fail(124, "设计超时", None, json_mode)
+    if ph["phase"] in ("done_failed", "crashed"):
+        if result is None:
+            err = "后台进程异常退出(无完成记录)"
+        else:
+            err = result.get("error") or "dsh-design 失败"
+        return fail(1, err, None, json_mode)
+
+    # done_ok:落盘 design.md + design-result.json → 锁内转 designed(与同步同源)
+    design_path = result.get("design")
+    if not design_path or not os.path.isfile(design_path):
+        return fail(1, "dsh-design 未产出方案文件", None, json_mode)
+    content = read_file(design_path)
+    if not content.strip():
+        return fail(1, "dsh-design 产出空方案", None, json_mode)
+    _atomic_write(os.path.join(wi_dir, "design.md"), content)
+    design_result = {"schema_version": 1, "adapter": "dsh-designer",
+                     "model": result.get("model"), "session": result.get("session"),
+                     "usage": result.get("usage"), "duration_s": result.get("duration_s"),
+                     "source": os.path.basename(design_path), "checked_at": now_iso()}
+    _atomic_write(os.path.join(wi_dir, "design-result.json"),
+                  json.dumps(design_result, ensure_ascii=False, separators=(",", ":")))
+    shutil.rmtree(os.path.join(wi_dir, ".design-async"), ignore_errors=True)
+
+    meta = {"adapter": "dsh-designer", "model": result.get("model")}
+
+    def _do():
+        s = load_status(wi_dir)
+        if s["state"] != "created":
+            return {"ok": True, "from": s["state"], "to": s["state"], "event": "design",
+                    "guard": None, "seq": None, "no_transition": True}
+        sa = s.setdefault("async", {})
+        sa["finished_at"] = result.get("finished_at")
+        sa["exit_code"] = 0
+        save_status_atomic(wi_dir, s)
+        return _do_transition(wi_dir, "created", "designed", "design", {}, meta, cfg)
+
+    try:
+        res = with_workitem_lock(wi_dir, _do)
+    except Locked as e:
+        return fail(2, f"锁被他人持有: {e}", None, json_mode)
+    if not res["ok"]:
+        return fail(1 if res["reason"].startswith("guard_failed:") else 2,
+                    res["reason"], res.get("detail"), json_mode)
+    if json_mode:
+        emit({"status": "ok", "id": wi_id, "from": res["from"], "to": res["to"],
+              "event": "design", "guard": res.get("guard"),
+              "design": os.path.relpath(os.path.join(wi_dir, "design.md"), workdir()),
+              "model": result.get("model"), "usage": result.get("usage"),
+              "duration_s": result.get("duration_s"), "async": load_status(wi_dir).get("async")})
+    else:
+        print(f"{wi_id}: async 设计完成 → designed (model={result.get('model')})")
+    return 0
+
+
+def async_worker_main(argv):
+    """内部隐藏入口(--async-worker):后台 worker 契约,用户不可见(不出现在 USAGE)。
+
+    argv = [wi_dir, brief_path, wdir, flow_config];expected_seconds/started_at 经
+    env FLOW_ASYNC_* 传入。本进程退出码恒 0(记录写盘成功),设计结果由
+    design-async-result.json 的 exit_code 承载,由 --check 判定。
+    """
+    wi_dir, brief_path, wdir, flow_config = argv
+    out_dir = os.path.join(wi_dir, ".design-async")
+    shutil.rmtree(out_dir, ignore_errors=True)
+    os.makedirs(out_dir, exist_ok=True)
+    r = _invoke_design(flow_config, wdir, brief_path, out_dir)
+    _append_log(wi_dir, (r["stdout"] or "") + (r["stderr"] or ""))
+    try:
+        expected = int(os.environ.get("FLOW_ASYNC_EXPECTED_S") or 480)
+    except ValueError:
+        expected = 480
+    rec = {"schema_version": 1, "id": os.path.basename(wi_dir),
+           "pid": os.getpid(),
+           "started_at": os.environ.get("FLOW_ASYNC_STARTED_AT") or now_iso(),
+           "expected_seconds": expected,
+           "exit_code": r["rc"], "finished_at": now_iso(),
+           "design": (r["info"] or {}).get("design"),
+           "model": (r["info"] or {}).get("model"),
+           "session": (r["info"] or {}).get("session"),
+           "usage": (r["info"] or {}).get("usage"),
+           "duration_s": (r["info"] or {}).get("duration_s"),
+           "turns": (r["info"] or {}).get("turns"),
+           "error": r["error"]}
+    _atomic_write(os.path.join(wi_dir, "design-async-result.json"),
+                  json.dumps(rec, ensure_ascii=False, separators=(",", ":")))
+    return 0
+
+
 def cmd_design(args, cfg):
-    pos, opts = scan_args(args, set())
+    pos, opts = scan_args(args, {"expected"})
     if not pos:
         raise UsageError("design 缺少 <id>")
     wi_id = pos[0]
@@ -1701,7 +2051,15 @@ def cmd_design(args, cfg):
         raise UsageError("design 多余参数")
     json_mode = bool(opts.get("json"))
     force = bool(opts.get("force"))
+    async_mode = bool(opts.get("async"))
+    check_mode = bool(opts.get("check"))
+    if async_mode and check_mode:
+        raise UsageError("--async 与 --check 互斥")
+    if opts.get("expected") is not None and not async_mode:
+        raise UsageError("--expected 仅用于 --async")
     wi_dir = resolve_wi_dir(wi_id, cfg)
+    if check_mode:
+        return _cmd_design_check(wi_id, wi_dir, json_mode, cfg)
 
     status = load_status(wi_dir)
     if not force and status["state"] != "created":
@@ -1709,34 +2067,24 @@ def cmd_design(args, cfg):
     brief_path = os.path.join(wi_dir, "brief.md")
     if not file_nonempty(brief_path):
         return fail(2, "brief.md 为空或缺失", None, json_mode)
+    if async_mode:
+        return _cmd_design_async(wi_id, wi_dir, brief_path, json_mode, cfg, opts)
 
-    # 复用 P1:flow-config 渲染 defaults+user → exec dsh-design(pro/read-only/回验/redact 继承)
+    # ── 同步路径(行为与现状逐分支一致;仅把 flow-config 调用提取为 _invoke_design) ──
     flow_config = os.path.join(os.path.dirname(os.path.abspath(__file__)), "flow-config")
     wdir = workdir()
     tmp_out = tempfile.mkdtemp(prefix="flow-design-")
-    try:
-        proc = subprocess.run([flow_config, "-d", wdir, "-o", tmp_out, "--json", brief_path],
-                              capture_output=True, text=True)
-    except OSError as e:
+    r = _invoke_design(flow_config, wdir, brief_path, tmp_out)
+    if r["rc"] == 2 and r["error"].startswith("无法调用 flow-config"):
         shutil.rmtree(tmp_out, ignore_errors=True)
-        return fail(2, f"无法调用 flow-config: {e}", None, json_mode)
-
-    if proc.returncode == 124:
+        return fail(2, r["error"], None, json_mode)
+    if r["rc"] == 124:
         shutil.rmtree(tmp_out, ignore_errors=True)
         return fail(124, "设计超时", None, json_mode)
-    if proc.returncode != 0:
+    if r["rc"] != 0:
         shutil.rmtree(tmp_out, ignore_errors=True)
-        detail = (proc.stderr or "").strip().splitlines()
-        return fail(1, "dsh-design 失败", detail[-1] if detail else None, json_mode)
-
-    try:
-        info = json.loads(proc.stdout.strip().splitlines()[-1])
-    except (ValueError, IndexError):
-        shutil.rmtree(tmp_out, ignore_errors=True)
-        return fail(1, "dsh-design 输出非 JSON", None, json_mode)
-    if not isinstance(info, dict):
-        shutil.rmtree(tmp_out, ignore_errors=True)
-        return fail(1, "dsh-design 输出非 JSON 对象", None, json_mode)
+        return fail(1, r["error"], r.get("detail"), json_mode)
+    info = r["info"]
     design_src = info.get("design")
     if not design_src or not os.path.isfile(design_src):
         shutil.rmtree(tmp_out, ignore_errors=True)
@@ -2031,7 +2379,7 @@ USAGE = """flow workitem <sub> ...
   unlock   <id> [--owner ID] [--force] [--json]
   show     <id> <artifact>
   guard    <id> --gate quality|test [--json]
-  design   <id> [--force] [--json]
+  design   <id> [--async [--expected N]] [--check] [--force] [--json]
   execute  <id> [--executor NAME] [--timeout N] [--force] [--json]
   verify   <id> [--auto] [--tests b] [--diff b] [--errors b] [--route design|impl] [--test-command CMD] [--scope FILE] [--no-transition] [--json]
   decision <id> --verdict pass|reject|takeover [--defect-type T] [--summary S] [--json]
@@ -2046,6 +2394,8 @@ SUBCOMMANDS = {
 
 
 def main(argv):
+    if argv and argv[0] == "--async-worker":   # 内部隐藏入口,仅由 design --async spawn
+        return async_worker_main(argv[1:])
     if not argv or argv[0] in ("-h", "--help", "help"):
         sys.stdout.write(USAGE)
         return 0 if argv else 2

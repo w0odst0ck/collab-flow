@@ -43,6 +43,7 @@ workitem:                      # P2 新增;全标量,保证 P1 解析器照常�
   lock_ttl_s: 3600             # 单写者锁默认 TTL(秒);env FLOW_LOCK_TTL_S 可覆盖
   plane_id: control            # 锁 owner/事件 actor 默认值(零个人标识,不取 hostname)
   id_max_len: 64               # work-item id 最大长度
+  design_expected_seconds: 480 # design --async 的 SLA 预估(软截止,非硬超时);env FLOW_DESIGN_EXPECTED_S 可覆盖
 gates:
   quality: true                # 质量门(decision.yaml.verdict)恒开
   test: true                   # 测试门(executor/verify.json 三条件)恒开
