@@ -16,7 +16,7 @@
 #   flow workitem guard    <id> --gate quality|test [--json]
 #   flow workitem verify   <id> [--tests b] [--diff b] [--errors b] [--route design|impl] [--json]
 #   flow workitem design   <id> [--async [--expected N]] [--check] [--force] [--json]
-#   flow workitem execute  <id> [--executor NAME] [--timeout N] [--force] [--json]
+#   flow workitem execute  <id> [--executor NAME] [--timeout N] [--model NAME] [--force] [--json]
 #   flow workitem decision <id> --verdict pass|reject|takeover [--defect-type T] [--summary S] [--json]
 #   flow task add/status/list/log/run/reconcile(M1 后台任务队列,见 flow-task-core.py)
 #

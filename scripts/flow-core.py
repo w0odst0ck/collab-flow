@@ -959,14 +959,17 @@ def load_executor_spec(name, exec_dir=None):
     return spec
 
 
-def run_executor(wrapper, taskbook_path, workdir_path, out_dir, timeout):
-    """调用 executor wrapper(§3.2 契约):<wrapper> --taskbook --workdir --out --timeout。
+def run_executor(wrapper, taskbook_path, workdir_path, out_dir, timeout, model=None):
+    """调用 executor wrapper(§3.2 契约):<wrapper> --taskbook --workdir --out --timeout [--model NAME]。
 
-    返回退出码(0/1/124 透传);wrapper 运行期间不持有 workitem 锁。
+    返回退出码(0/1/124/125 透传);wrapper 运行期间不持有 workitem 锁。
     外层超时 = 执行器 timeout + 60s 缓冲(防 wrapper 自身挂起,如 git 卡死)。
+    model 非空时追加 --model(模型决策交给 wrapper:CLI > 任务书阈值 > 默认)。
     """
     cmd = [wrapper, "--taskbook", taskbook_path, "--workdir", workdir_path,
            "--out", out_dir, "--timeout", str(timeout)]
+    if model:
+        cmd += ["--model", model]
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True,
                               timeout=timeout + 60)
@@ -2133,7 +2136,7 @@ def cmd_design(args, cfg):
 
 
 def cmd_execute(args, cfg):
-    pos, opts = scan_args(args, {"executor", "timeout"})
+    pos, opts = scan_args(args, {"executor", "timeout", "model"})
     if not pos:
         raise UsageError("execute 缺少 <id>")
     wi_id = pos[0]
@@ -2169,6 +2172,10 @@ def cmd_execute(args, cfg):
     else:
         timeout = int(spec["invoke"].get("timeout_s", 1800))
 
+    model = opts.get("model")
+    if model is not None and not model:
+        return fail(2, "--model 不能为空", None, json_mode)
+
     out_dir = os.path.join(wi_dir, "executor")
     os.makedirs(out_dir, exist_ok=True)
     wrapper = os.path.join(executors_dir(), executor_name, "wrapper.sh")
@@ -2176,7 +2183,7 @@ def cmd_execute(args, cfg):
         return fail(2, f"执行器 wrapper 缺失: {executor_name}", None, json_mode)
 
     # 调 wrapper(执行器子进程运行期间不持 workitem 锁)
-    run_executor(wrapper, taskbook_path, wdir, out_dir, timeout)
+    run_executor(wrapper, taskbook_path, wdir, out_dir, timeout, model=model)
 
     result_path = os.path.join(out_dir, "result.json")
     if not os.path.isfile(result_path):
@@ -2230,6 +2237,16 @@ def cmd_execute(args, cfg):
         return 1
     if st == "timeout":
         return fail(124, "执行器超时", None, json_mode)
+    if st == "partial-complete":
+        # 不转移(state 留 translated 可 resume 重跑),exit 124 透传超时语义
+        if json_mode:
+            emit_err({"status": "failed", "id": wi_id,
+                      "error": "执行器部分完成(超时但产出非空)",
+                      "hint": "rx --continue 续收尾后重跑 execute,或人工验收 diff 后 verify 走快速路",
+                      "detail": result.get("redacted_logs") or ""})
+        else:
+            print("提示: 执行器超时但产出非空(partial-complete)——可 rx --continue 续收尾后重跑 execute;或人工验收 diff 后 verify 走快速路", file=sys.stderr)
+        return 124
     return fail(2, f"非法 result.status: {st!r}", None, json_mode)
 
 
@@ -2380,7 +2397,7 @@ USAGE = """flow workitem <sub> ...
   show     <id> <artifact>
   guard    <id> --gate quality|test [--json]
   design   <id> [--async [--expected N]] [--check] [--force] [--json]
-  execute  <id> [--executor NAME] [--timeout N] [--force] [--json]
+  execute  <id> [--executor NAME] [--timeout N] [--model NAME] [--force] [--json]
   verify   <id> [--auto] [--tests b] [--diff b] [--errors b] [--route design|impl] [--test-command CMD] [--scope FILE] [--no-transition] [--json]
   decision <id> --verdict pass|reject|takeover [--defect-type T] [--summary S] [--json]
 """

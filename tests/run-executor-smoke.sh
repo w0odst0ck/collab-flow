@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# flow P3 CLI 冒烟(C19-C26,stub 零 API;方案 §6.2)
+# flow P3 CLI 冒烟(C19-C29,stub 零 API;方案 §6.2)
 # 用法: bash tests/run-executor-smoke.sh
 set -uo pipefail
 
@@ -43,6 +43,34 @@ exit 0
 DSH
 chmod +x "$STUB_DSH"
 
+# stub rx(reasonix wrapper 经 RX_BIN 注入,零 API):记录 argv/env 到 RX_STUB_RECORD,
+# 行为受 env 控制(RX_STUB_EXIT/DIFF/SLEEP/LEAK);故意忽略 RX_TIMEOUT(模拟 rx 内层自管,E13)。
+STUB_RX="$WORK/stub-rx.sh"
+cat > "$STUB_RX" << 'RX'
+#!/usr/bin/env bash
+set -u
+if [[ -n "${RX_STUB_RECORD:-}" ]]; then
+  {
+    printf 'argv:'
+    printf ' <%s>' "$@"
+    printf '\nRX_TIMEOUT=%s\nRX_MODEL=%s\n' "${RX_TIMEOUT:-}" "${RX_MODEL:-}"
+  } > "$RX_STUB_RECORD"
+fi
+if [[ "${RX_STUB_DIFF:-0}" == "1" ]]; then
+  echo "stub rx change $(date +%s)" >> README.md
+fi
+if [[ "${RX_STUB_SLEEP:-0}" != "0" ]]; then
+  sleep "${RX_STUB_SLEEP}"
+fi
+if [[ "${RX_STUB_LEAK:-0}" == "1" ]]; then
+  LEAK_PREFIX="sk-"
+  LEAK_SUFFIX="abcdefghijklmnopqrstuvwxyz1234"
+  echo "leak ${LEAK_PREFIX}${LEAK_SUFFIX}" >&2
+fi
+exit "${RX_STUB_EXIT:-0}"
+RX
+chmod +x "$STUB_RX"
+
 FAKE_KEY="sk-fake-test-key-$(date +%s)"
 
 run() { # run [args...] —— 统一注入隔离 env + stub designer/executor
@@ -81,6 +109,28 @@ diff_scope:
 TASKBOOK
   STUB_EXECUTOR_CHANGE_FILE="$cf" run workitem execute "$id" --executor stub >/dev/null 2>&1 \
     || { echo "make_executed:execute fail"; return 1; }
+}
+
+# make_translated <id> —— new→design→decision→reviewed→translated(不执行)
+make_translated() {
+  local id="$1"
+  local brief="$WORK/brief-$id.md"
+  echo "# brief $id" > "$brief"
+  run workitem new "$id" --brief "$brief" >/dev/null 2>&1 || { echo "make_translated:new fail"; return 1; }
+  run workitem design "$id" >/dev/null 2>&1 || { echo "make_translated:design fail"; return 1; }
+  run workitem decision "$id" --verdict pass >/dev/null 2>&1 || { echo "make_translated:decision fail"; return 1; }
+  run workitem transition "$id" reviewed >/dev/null 2>&1 || { echo "make_translated:reviewed fail"; return 1; }
+  run workitem transition "$id" translated >/dev/null 2>&1 || { echo "make_translated:translated fail"; return 1; }
+  cat > "$DATA/workitems/$id/taskbook.md" << 'TASKBOOK'
+# taskbook
+```flow
+test_command: /bin/true
+diff_scope:
+  allow:
+    - README.md
+  deny: []
+```
+TASKBOOK
 }
 
 state_of() { run workitem status "$1" --json 2>/dev/null | python3 -c 'import sys,json;print(json.loads(sys.stdin.read())["state"])' 2>/dev/null; }
@@ -196,6 +246,43 @@ if [[ $RC1 -eq 0 && $RC2 -eq 0 && $RC3 -eq 0 ]]; then
   ok "15+17+18 回归全绿"
 else
   bad "C26" "run-smoke rc=$RC1 run-config-smoke rc=$RC2 run-flow-smoke rc=$RC3"
+fi
+
+echo "== C27: reasonix wrapper 经 stub rx 正常路径(ok + model/duration_s 落盘) =="
+make_translated w7 >/dev/null 2>&1
+export RX_BIN="$STUB_RX" RX_STUB_EXIT=0 RX_STUB_DIFF=1 RX_STUB_SLEEP=0 RX_STUB_LEAK=0
+OUT="$(run workitem execute w7 --executor reasonix --timeout 7 2>&1)"; RC=$?
+if [[ $RC -eq 0 ]] && [[ "$(state_of w7)" == "executed" ]] \
+   && [[ -s "$DATA/workitems/w7/executor/diff.patch" ]] \
+   && python3 -c 'import json;r=json.load(open("'"$DATA"'/workitems/w7/executor/result.json",encoding="utf-8"));assert r["status"]=="ok" and r["model"]=="deepseek-v4-flash" and "duration_s" in r and r["rx_timeout_s"]==7' 2>/dev/null; then
+  ok "exit0 + executed + diff.patch + model/duration_s/rx_timeout_s"
+else
+  bad "C27" "rc=$RC state=$(state_of w7) out=$OUT"
+fi
+unset RX_BIN RX_STUB_EXIT RX_STUB_DIFF RX_STUB_SLEEP RX_STUB_LEAK
+
+echo "== C28: partial-complete 端到端(内层超时 + 产出非空 + redact) =="
+make_translated w8 >/dev/null 2>&1
+export RX_BIN="$STUB_RX" RX_STUB_EXIT=124 RX_STUB_DIFF=1 RX_STUB_SLEEP=3 RX_STUB_LEAK=1
+OUT="$(run workitem execute w8 --executor reasonix --timeout 1 2>&1)"; RC=$?
+if [[ $RC -eq 124 ]] && echo "$OUT" | grep -q "partial-complete" \
+   && [[ "$(state_of w8)" == "translated" ]] \
+   && python3 -c 'import json,re;r=json.load(open("'"$DATA"'/workitems/w8/executor/result.json",encoding="utf-8"));assert r["status"]=="partial-complete" and r["partial_complete"] and r["timeout_source"]=="rx" and r["redacted_logs"] and not re.search(r"sk-[A-Za-z0-9]{10}",r["redacted_logs"])' 2>/dev/null; then
+  ok "exit124 + 快速路提示 + 不转移 + result.json partial-complete + redact 无残留"
+else
+  bad "C28" "rc=$RC state=$(state_of w8) out=$OUT"
+fi
+unset RX_BIN RX_STUB_EXIT RX_STUB_DIFF RX_STUB_SLEEP RX_STUB_LEAK
+
+echo "== C29: 新增/改动文件 deny-list 零命中 =="
+if grep -En "$DENY_PAT" \
+     "$ROOT_DIR/executors/reasonix/wrapper.sh" "$ROOT_DIR/executors/reasonix/spec.yaml" \
+     "$ROOT_DIR/scripts/flow-core.py" "$ROOT_DIR/scripts/flow" \
+     "$ROOT_DIR/tests/test_executor_wrapper.py" "$ROOT_DIR/tests/run-executor-smoke.sh" \
+     >/dev/null 2>&1; then
+  bad "C29" "deny-list 命中"
+else
+  ok "新增/改动文件 deny-list 零命中"
 fi
 
 echo

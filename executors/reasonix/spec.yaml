@@ -17,6 +17,14 @@ invoke:
   args_template: run -y "TASKBOOK_CONTENT"
   timeout_s: 1800
   sandbox: workspace-write
+  # wrapper 超时韧性 env 契约(wrapper.sh 内部读取,flow-core 只透传 --timeout/--model):
+  #   RX_TIMEOUT            单超时源:跟随外层 --timeout N(rx 内层不再用 600s 默认值)。
+  #                         前提: rx 尊重该值且超时返回 124,partial-complete 判定才成立
+  #   RX_WRAPPER_GRACE_S    外层 guard 秒数,默认 30,clamp [1,50](N+GRACE 只防 rx 包装挂起)
+  #   RX_MODEL_DEFAULT      默认模型,deepseek-v4-flash
+  #   RX_MODEL_PRO          pro 模型,deepseek-v4-pro(rx 经 --pro 标志命中)
+  #   RX_MODEL_PRO_THRESHOLD_BYTES  任务书字节阈值(>= 切 pro),默认 8000
+  #   RX_BIN                执行面 rx 路径/可注入 stub(测试零 API,同 DSH_BIN 模式)
 input:
   taskbook: file
   workdir: dir
@@ -28,4 +36,9 @@ output:
 exit_codes:
   ok: 0
   failed: 1
-  timeout: 124
+  timeout: 124          # 内层 rx 超时(reasonix 任务超 N,timeout_source=rx)
+  timeout_wrapper: 125  # 外层 guard(rx 包装自身挂起,timeout_source=wrapper)
+model:
+  default: deepseek-v4-flash
+  pro: deepseek-v4-pro
+  pro_threshold_bytes: 8000
