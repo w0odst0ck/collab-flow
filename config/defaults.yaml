@@ -63,6 +63,10 @@ task:                          # M1 新增;全标量,P1 解析器照常通过(ta
     design: 480                # 对齐 workitem.design_expected_seconds
     execute: 1800              # 对齐 executor.timeout_s
   seed_history_len: 8          # M2 新增:每 kind 保留的 duration 样本数
+  prune_done_days: 3           # 写时自动清理:done 保留天数(§5.1),env FLOW_TASK_PRUNE_DONE_DAYS
+  prune_failed_days: 7         # 写时自动清理:failed/timeout/killed 保留天数(§5.1),env FLOW_TASK_PRUNE_FAILED_DAYS
+  task_cap: 100                # 注册表容量上限:超限删最老终态(§5.1),env FLOW_TASK_TASK_CAP
+  stale_after_s: 300           # 僵尸任务判定:running 心跳静默秒数(§5.2),env FLOW_TASK_STALE_AFTER_S
 host:                          # M2 新增:宿主集成钩子(全标量,均 null=关闭)
   notify: null                 # 通知命令模板;非空时终态把事件 JSON 走 stdin 喂给该命令
   wake_template: null          # 唤醒文本模板;null=内置默认;占位符渲染(design M2 §1.5)
