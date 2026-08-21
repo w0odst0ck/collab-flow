@@ -49,7 +49,12 @@ scripts/          # dsh-design(设计器 CLI) + flow-config(配置加载层) + s
 config/           # defaults.yaml + example
 tests/            # 冒烟测试（stub 模式，零 API 消耗）
 templates/        # 上下文包/任务书/审查清单模板（去标识，{{role}} 占位）
+learning/         # 协作方法论（symlink → 个人笔记区，Obsidian 可读改）
 ```
+
+## 方法论
+
+- [长任务后台化与定时唤醒](learning/长任务后台化与定时唤醒.md) — 防上下文撑满：轮询上限 / 后台模式 / 定时唤醒协议 / 宿主集成示例（配合 flow workitem 的 `--async` / `--check`）
 
 ## 路线图
 
