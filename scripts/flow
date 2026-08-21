@@ -43,6 +43,16 @@ case "${1:-}" in
   workitem)
     shift
     [[ $# -ge 1 ]] || { usage >&2; exit 2; }
+    # DSH_BIN 兜底探测（尽力而为：有则 export；无则留给 dsh-design 层 fail-closed 报错——
+    # flow 的其他子命令（status/list 等）不依赖 dsh，不能因 DSH_BIN 缺失整体失败）
+    if [[ -z "${DSH_BIN:-}" ]]; then
+      if command -v dsh >/dev/null 2>&1; then
+        export DSH_BIN="$(command -v dsh)"
+      else
+        NPX_DSH="$(ls -t "$HOME"/.npm/_npx/*/node_modules/.bin/dsh 2>/dev/null | head -1)"
+        [[ -n "$NPX_DSH" ]] && export DSH_BIN="$NPX_DSH"
+      fi
+    fi
     exec python3 "$CORE" workitem "$@"
     ;;
   task)

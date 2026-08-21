@@ -55,6 +55,21 @@ FLASH_MODEL="${DSH_DESIGN_FLASH_MODEL:-deepseek-v4-flash}"
 PROVIDER="${DSH_DESIGN_PROVIDER:-deepseek-official}"
 KEY_FILE="${DSH_DESIGN_KEY_FILE:-$HOME/.reasonix/.env}"
 DSH_HOME="${DSH_HOME:-$HOME/.dsh}"     # 修正：补全 usage 已声明的默认（未设时从「回验降级」变「正常回验」）
+
+# DSH_BIN 自动探测（2026-08-21 flow-call-friendly）：env 已设 > PATH 的 dsh > npx 缓存 glob > fail-closed
+if [[ -z "${DSH_BIN:-}" ]]; then
+  if command -v dsh >/dev/null 2>&1; then
+    DSH_BIN="$(command -v dsh)"
+  else
+    NPX_DSH="$(ls -t "$HOME"/.npm/_npx/*/node_modules/.bin/dsh 2>/dev/null | head -1)"
+    if [[ -n "$NPX_DSH" ]]; then
+      DSH_BIN="$NPX_DSH"
+    else
+      fail 2 "未找到 dsh 二进制——请 export DSH_BIN（或 npm i -g dsh）"
+    fi
+  fi
+  export DSH_BIN
+fi
 # 防注入：模型/provider 名限定安全字符集（供下方 grep/heredoc 使用）
 [[ "$PRO_MODEL" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]] || fail 2 "非法 pro 模型名: $PRO_MODEL"
 [[ "$FLASH_MODEL" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]] || fail 2 "非法 flash 模型名: $FLASH_MODEL"
