@@ -32,8 +32,8 @@ _tc_spec = importlib.util.spec_from_file_location("flow_task_core_m2", _TASK_COR
 tc = importlib.util.module_from_spec(_tc_spec)
 _tc_spec.loader.exec_module(tc)
 
-# 故意拼接,避免源码静态 deny-list 命中(sk-[A-Za-z0-9]{10})
-_FAKE_SECRET = "sk-" + "fakekey12345"
+# 故意拼接,避免源码静态 deny-list 命中(sk-[A-Za-z0-9]{16,});≥16 字符模拟真 key
+_FAKE_SECRET = "sk-" + "fakekey1234567890123456789"
 
 _ENV_PREFIXES = ("FLOW_", "COLLABFLOW_", "STUB_", "DSH_", "DEEPSEEK", "RX_")
 

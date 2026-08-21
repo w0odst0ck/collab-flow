@@ -27,6 +27,7 @@ import secrets
 import shutil
 import subprocess
 import sys
+import threading
 from datetime import datetime, timezone
 
 try:
@@ -58,6 +59,7 @@ now_iso = _fc.now_iso            # ISO8601 UTC(timespec="seconds")
 TASK_ID_RE = re.compile(r"^t-[0-9a-f]{12}$")   # 任务 id 白名单,硬编码不进 config
 TASK_STATES = ("queued", "running", "done", "failed", "timeout")
 TERMINAL_STATES = ("done", "failed", "timeout")
+PRUNE_STATES = ("done", "failed", "timeout", "killed")  # prune --state 白名单(killed 预留,无匹配幂等)
 KINDS = ("design", "execute")                  # M2:任务类型(决定事件/种子/partial-complete 语义)
 PRIORITIES = ("P0", "P1", "P2")
 PRIO_ORDER = {"P0": 0, "P1": 1, "P2": 2}
@@ -67,13 +69,15 @@ RECONCILE_GRACE_S = 60   # pid=None(dispatch 提升后 runner 尚未写 pid 的�
 USAGE = """用法: flow task <sub> ...
   flow task add       --command CMD [--workitem W] [--priority P0|P1|P2]
                       [--expected-seconds N] [--kill-on-timeout]
-                      [--kind design|execute] [--json]
+                      [--kind design|execute] [--workdir DIR] [--json]
   flow task status    <id> [--json]
   flow task list      [--state S] [--workitem W] [--json]
   flow task log       <id> [--tail N] [--json]
   flow task run       [--max-parallel N] [--json]
   flow task reconcile [--json]
   flow task wake-text <id> [--json]
+  flow task prune     [--state done|failed|timeout|killed] [--older-than N]
+                      [--force] [--json]
 退出码: 0 成功 / 1 运行失败 / 2 用法或前置错误(含幂等拒绝)/
         124 仅任务命令语义(不进 CLI 顶层)。
 """
@@ -202,6 +206,15 @@ def load_task_config():
     lb = _env_int("FLOW_TASK_LOG_TAIL_BYTES")
     if lb is not None:
         task["log_tail_bytes"] = lb
+    for env_key, cfg_key in (
+        ("FLOW_TASK_PRUNE_DONE_DAYS", "prune_done_days"),
+        ("FLOW_TASK_PRUNE_FAILED_DAYS", "prune_failed_days"),
+        ("FLOW_TASK_TASK_CAP", "task_cap"),
+        ("FLOW_TASK_STALE_AFTER_S", "stale_after_s"),
+    ):
+        v = _env_int(env_key)
+        if v is not None:
+            task[cfg_key] = v
     return {"task": task, "host": host}
 
 
@@ -339,15 +352,13 @@ def count_lines(path):
     return n
 
 
-def append_task_event(tid, record):
-    """events/<tid>.jsonl flock 追加;seq=行数+1;只增不删(open "a" 无截断路径);
-    写入前过 DENY_RE(fail-closed)。失败=best-effort(注册表仍是权威)。"""
-    path = event_path(tid)
-    os.makedirs(events_dir(), exist_ok=True)
+def _append_jsonl_locked(path, lockp, record):
+    """通用 jsonl flock 追加(事件/审计共用);seq=行数+1;只增不删;DENY_RE fail-closed。"""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
     text = json.dumps(record, ensure_ascii=False)
     if DENY_RE.search(text):
         raise StoreError("事件含疑似 secret, 拒绝写入")
-    fd = os.open(event_lock_path(tid), os.O_CREAT | os.O_RDWR, 0o644)
+    fd = os.open(lockp, os.O_CREAT | os.O_RDWR, 0o644)
     try:
         if fcntl is not None and hasattr(fcntl, "flock"):
             fcntl.flock(fd, fcntl.LOCK_EX)
@@ -364,6 +375,28 @@ def append_task_event(tid, record):
             fcntl.flock(fd, fcntl.LOCK_UN)
         os.close(fd)
     return seq
+
+
+def append_task_event(tid, record):
+    """events/<tid>.jsonl flock 追加;seq=行数+1;只增不删(open "a" 无截断路径);
+    写入前过 DENY_RE(fail-closed)。失败=best-effort(注册表仍是权威)。"""
+    return _append_jsonl_locked(event_path(tid), event_lock_path(tid), record)
+
+
+def append_audit_event(record):
+    """审计事件 events/pruned.jsonl 追加(§5.1/§5.2 清理/僵尸标记落账;无 tid 维度)。"""
+    return _append_jsonl_locked(
+        os.path.join(events_dir(), "pruned.jsonl"),
+        os.path.join(events_dir(), "pruned.jsonl.lock"),
+        record)
+
+
+def emit_audit_best_effort(record):
+    """审计事件 best-effort:失败仅告警,不影响清理主流程。"""
+    try:
+        append_audit_event(record)
+    except (StoreError, OSError) as e:
+        print(f"告警: 审计事件写入失败: {e}", file=sys.stderr)
 
 
 def _emit_task_event_best_effort(tid, record):
@@ -614,10 +647,12 @@ def dispatch(cfg, max_parallel=None):
 
 
 def add_task(cfg, command, workitem=None, priority="P2",
-             expected_seconds=None, kill_on_timeout=False, kind=None):
+             expected_seconds=None, kill_on_timeout=False, kind=None, workdir=None):
     """幂等入队(§1.4(1)):flock 内去重(同 workitem 非终态 → DuplicateWorkitem) + 追加 + 自动 dispatch。
 
     kind 非空时:缺省 expected_seconds → 种子回退(config 默认);注册表条目带 kind 字段。
+    workdir 默认 os.getcwd(),仅作跨项目归属记录(§1.2),不改变 runner 执行 cwd;
+    目录不存在也接受字符串不校验。
     queued 事件在注册表追加后 best-effort 写入(§1.3)。
     """
     if command is None or command.strip() == "":
@@ -638,6 +673,14 @@ def add_task(cfg, command, workitem=None, priority="P2",
             for t in reg["tasks"].values():
                 if t.get("workitem") == workitem and t["state"] in ("queued", "running"):
                     raise DuplicateWorkitem(t["id"], t["state"])
+        # 写时自动清理 + 僵尸标记(§5.1/§5.2):同锁内跑,审计事件 best-effort
+        pruned = auto_prune(reg, cfg)
+        stale = mark_stale_running(reg, cfg)
+        if pruned or stale:
+            emit_audit_best_effort({
+                "schema_version": EVENT_SCHEMA_VERSION, "ts": now_iso(),
+                "kind": "prune", "pruned": pruned, "stale": stale,
+            })
         tid = "t-" + secrets.token_hex(6)
         while tid in reg["tasks"]:  # 冲突则重试(§1.4(1))
             tid = "t-" + secrets.token_hex(6)
@@ -648,7 +691,8 @@ def add_task(cfg, command, workitem=None, priority="P2",
         reg["tasks"][tid] = {
             "id": tid, "workitem": workitem, "command": command,
             "priority": priority, "state": "queued", "kind": kind,
-            "expected_seconds": exp, "kill_on_timeout": bool(kill_on_timeout),
+            "workdir": workdir or os.getcwd(), "expected_seconds": exp,
+            "kill_on_timeout": bool(kill_on_timeout),
             "created_at": _now_ms(), "started_at": None, "finished_at": None,
             "exit_code": None, "failure_tail": None, "pid": None, "heartbeat_at": None,
         }
@@ -729,8 +773,33 @@ def _wallclock_seconds(started_at, finished_at):
         return None
 
 
-def _runner(task_id, cfg):
-    """单任务落账(内部子命令,隐藏不入 help)。命令结束后 finally 写终态,再 dispatch 自续。"""
+def _heartbeat_loop(task_id, stop_event, interval=30):
+    """运行中心跳(§1.1):每 interval 秒用 flock 更新当前任务 heartbeat_at。
+
+    daemon 后台线程:写 registry 失败(锁冲突等)静默重试,不影响主流程;
+    stop_event.wait(interval) 同时承担节拍与停止等待(被 set 立即退出)。
+    """
+    while not stop_event.wait(interval):
+        try:
+            def _beat():
+                reg = load_registry()
+                t = reg["tasks"].get(task_id)
+                if t is None or t["state"] != "running":
+                    return  # 已终态/已删 → 不再写
+                t["heartbeat_at"] = _now_ms()
+                save_registry_atomic(reg)
+            with_registry_flock(_beat)
+        except (StoreError, OSError):
+            pass  # 静默重试,不影响主流程
+        except Exception:
+            pass  # 兜底:任何未预期异常不杀 daemon 线程,下个节拍重试
+
+
+def _runner(task_id, cfg, heartbeat_interval=30):
+    """单任务落账(内部子命令,隐藏不入 help)。命令结束后 finally 写终态,再 dispatch 自续。
+
+    heartbeat_interval 可注入(测试用小间隔验证 heartbeat_at 前进;生产默认 30s)。
+    """
     log_path_ = log_path(task_id)
 
     def _boot():
@@ -747,6 +816,12 @@ def _runner(task_id, cfg):
     if t is None:
         return 0
     print(f"=== {task_id} start pid={os.getpid()} ===", flush=True)
+    stop_event = threading.Event()
+    hb_thread = threading.Thread(
+        target=_heartbeat_loop, args=(task_id, stop_event),
+        kwargs={"interval": heartbeat_interval}, daemon=True,
+        name=f"flow-heartbeat-{task_id}")
+    hb_thread.start()
     rc, timed_out = None, False
     try:
         rc = run_command(t, cfg)
@@ -755,6 +830,8 @@ def _runner(task_id, cfg):
     except OSError:
         rc, timed_out = 127, False  # 命令无法启动 → failed
     finally:
+        stop_event.set()            # 停心跳线程(§1.1)
+        hb_thread.join(timeout=5)   # daemon 线程:join 超时不等,随进程退出
         state, _reason = terminal_state(rc, timed_out)
         tail = extract_tail(log_path_, int(cfg["task"].get("log_tail_bytes", 2000))) \
             if state != "done" else None
@@ -816,7 +893,8 @@ def runner_main(argv):
 # ---------------------------------------------------------------------------
 
 def cmd_add(args, cfg):
-    pos, opts = scan_args(args, {"command", "workitem", "priority", "expected-seconds", "kind"})
+    pos, opts = scan_args(
+        args, {"command", "workitem", "priority", "expected-seconds", "kind", "workdir"})
     json_mode = bool(opts.get("json"))
     if pos:
         return fail(2, "add 不接受位置参数", None, json_mode)
@@ -824,6 +902,7 @@ def cmd_add(args, cfg):
     if command is None or command.strip() == "":
         return fail(2, "missing command", "add 需要 --command CMD", json_mode)
     workitem = opts.get("workitem")
+    workdir = opts.get("workdir")  # 可选;默认 os.getcwd()(add_task 内),不校验目录存在(§3 错误表 #2)
     priority = opts.get("priority") or str(cfg["task"].get("default_priority", "P2"))
     kind = opts.get("kind")
     expected_raw = opts.get("expected-seconds")
@@ -838,7 +917,8 @@ def cmd_add(args, cfg):
     try:
         tid = add_task(cfg, command, workitem=workitem, priority=priority,
                        expected_seconds=expected, kind=kind,
-                       kill_on_timeout=bool(opts.get("kill-on-timeout")))
+                       kill_on_timeout=bool(opts.get("kill-on-timeout")),
+                       workdir=workdir)
     except DuplicateWorkitem as e:
         return fail(2, "duplicate_workitem", f"已有非终态任务 {e.args[0]} ({e.args[1]})", json_mode)
     except UsageError as e:
@@ -856,6 +936,7 @@ def cmd_add(args, cfg):
                 pass
         emit({"status": "ok", "id": tid, "state": "queued",  # 入队确认(§1.5 契约)
               "workitem": workitem, "priority": priority, "kind": kind,
+              "workdir": workdir or os.getcwd(),
               "expected_seconds": exp})
     else:
         print(f"task {tid}: queued")
@@ -1001,6 +1082,192 @@ def cmd_reconcile(args, cfg):
     return 0
 
 
+def _prune_match(reg, states=None, older_than_days=None, now=None):
+    """纯函数:返回应删任务 id 列表(不改 reg);running/queued 绝不删(§1.3)。
+
+    states=None → 默认全部终态;older_than_days 按 finished_at 只删 N 天前的;
+    终态但 finished_at 缺失/非法 → 保守不删。无匹配 → 空列表(幂等)。
+    """
+    states = tuple(states) if states is not None else TERMINAL_STATES
+    now = now or datetime.now(timezone.utc)
+    out = []
+    for tid, t in reg["tasks"].items():
+        st = t.get("state")
+        if st in ("queued", "running"):  # 红线:非终态绝不删(双保险)
+            continue
+        if st not in states:
+            continue
+        if older_than_days is not None:
+            finished = t.get("finished_at")
+            if not finished:
+                continue
+            try:
+                finished_dt = datetime.fromisoformat(finished)
+                age_s = (now - finished_dt).total_seconds()
+            except (TypeError, ValueError):
+                continue  # 时间戳缺失/非法/naive(无时区) → 保守不删
+            if age_s < older_than_days * 86400:
+                continue
+        out.append(tid)
+    return out
+
+
+def prune_tasks(reg, states=None, older_than_days=None, now=None):
+    """删除终态任务;返回被删 id 列表(§1.3)。连带删 logs/<tid>.log(§5.3,幂等)。"""
+    removed = _prune_match(reg, states, older_than_days, now)
+    for tid in removed:
+        del reg["tasks"][tid]
+        _remove_log_best_effort(tid)
+    return removed
+
+
+def _remove_log_best_effort(tid):
+    """删 logs/<tid>.log;不存在/失败静默(§5.3,幂等)。"""
+    try:
+        os.remove(log_path(tid))
+    except OSError:
+        pass
+
+
+def auto_prune(reg, cfg, now=None):
+    """写时自动清理(§5.1):done 保留 prune_done_days,failed/timeout/killed 保留 prune_failed_days;
+    仍超 task_cap → 按 finished_at 升序删最老终态;running/queued 永不删。
+    有副作用:删 registry 条目 + best-effort 连带删 logs/<id>.log;返回被删 id 列表。
+    """
+    task_cfg = (cfg or {}).get("task") or {}
+    done_days = int(task_cfg.get("prune_done_days") or 3)
+    failed_days = int(task_cfg.get("prune_failed_days") or 7)
+    cap = int(task_cfg.get("task_cap") or 100)
+    now = now or datetime.now(timezone.utc)
+    removed = []
+
+    def _match(states, older):
+        return _prune_match(reg, states=states, older_than_days=older, now=now)
+
+    removed += _match(("done",), done_days)
+    removed += _match(("failed", "timeout", "killed"), failed_days)
+    for tid in set(removed):
+        del reg["tasks"][tid]
+        _remove_log_best_effort(tid)
+    removed = list(dict.fromkeys(removed))
+    # 容量上限:仍超 → 删最老终态(finished_at 升序),双保险保 running/queued
+    terminal = [(t.get("finished_at") or "", tid) for tid, t in reg["tasks"].items()
+                if t.get("state") in ("done", "failed", "timeout", "killed")]
+    over = len(reg["tasks"]) - cap
+    if over > 0 and terminal:
+        terminal.sort()
+        for _, tid in terminal[:over]:
+            if tid not in removed:
+                removed.append(tid)
+            del reg["tasks"][tid]
+            _remove_log_best_effort(tid)
+    return removed
+
+
+def mark_stale_running(reg, cfg, now=None):
+    """写时僵尸标记(§5.2):running 心跳 heartbeat_at 静默 > stale_after_s → 标 timeout。
+    有副作用:改 registry 条目 state(保留条目与诊断,不删);返回被标 id 列表。
+    心跳缺失 → 保守不动(交 reconcile)。
+    """
+    task_cfg = (cfg or {}).get("task") or {}
+    stale_after_s = int(task_cfg.get("stale_after_s") or 300)
+    now = now or datetime.now(timezone.utc)
+    out = []
+    for tid, t in reg["tasks"].items():
+        if t.get("state") != "running":
+            continue
+        hb = t.get("heartbeat_at")
+        if not hb:
+            continue  # 无心跳记录(旧任务/未知) → 保守不动
+        try:
+            hb_dt = datetime.fromisoformat(hb)
+            age_s = (now - hb_dt).total_seconds()
+        except (TypeError, ValueError):
+            continue  # 心跳非法 → 保守不动
+        if age_s <= stale_after_s:
+            continue
+        t["state"] = "timeout"
+        t["finished_at"] = now.isoformat()
+        t["failure_tail"] = f"stale: heartbeat 静默 {int(age_s)}s > {stale_after_s}s"
+        out.append(tid)
+    return out
+
+
+def cmd_prune(args, cfg):
+    """终态任务清理(§1.3):--state/--older-than/--force;非 tty 自动 --force;无匹配幂等 exit 0。
+
+    注册表条目 + logs/<id>.log 连带删除(§5.3)。
+    """
+    pos, opts = scan_args(args, {"state", "older-than"})  # force 为纯 flag,不入 value_opts
+    json_mode = bool(opts.get("json"))
+    if pos:
+        return fail(2, "prune 不接受位置参数", None, json_mode)
+    states = None
+    state_raw = opts.get("state")
+    if state_raw is not None:
+        states = tuple(s.strip() for s in state_raw.split(","))
+        for s in states:
+            if s not in PRUNE_STATES:
+                return fail(2, "invalid state", s, json_mode)
+    older = None
+    older_raw = opts.get("older-than")
+    if older_raw is not None:
+        try:
+            older = int(older_raw)
+        except (TypeError, ValueError):
+            return fail(2, "invalid older-than", older_raw, json_mode)
+        if older < 0:
+            return fail(2, "invalid older-than", "必须 >= 0", json_mode)
+    force = bool(opts.get("force"))
+    if not force and not sys.stdin.isatty():
+        force = True  # 非 tty 自动 --force(§1.3)
+    if not force:  # tty 交互确认
+        try:
+            reg0 = load_registry()
+        except StoreError as e:
+            return fail(2, str(e), None, json_mode)
+        n = len(_prune_match(reg0, states, older))
+        if n == 0:
+            if json_mode:
+                emit({"status": "ok", "pruned": []})
+            else:
+                print("无匹配")
+            return 0
+        answer = input(f"确认删除 {n} 个任务? [y/N] ").strip().lower()
+        if answer not in ("y", "yes"):
+            if json_mode:
+                emit({"status": "ok", "pruned": [], "cancelled": True})
+            else:
+                print("已取消")
+            return 0
+
+    def _do():
+        reg = load_registry()
+        removed = prune_tasks(reg, states, older)
+        save_registry_atomic(reg)
+        return removed
+
+    try:
+        removed = with_registry_flock(_do)
+    except StoreError as e:
+        return fail(2, str(e), None, json_mode)
+    except OSError as e:
+        return fail(1, f"写盘失败: {e}", None, json_mode)
+    if not removed:
+        if json_mode:
+            emit({"status": "ok", "pruned": []})
+        else:
+            print("无匹配")  # 幂等:无匹配 exit 0(§3 错误表 #4)
+    else:
+        if json_mode:
+            emit({"status": "ok", "pruned": removed})
+        else:
+            print(f"pruned: {len(removed)}")
+            for tid in removed:
+                print(f"  {tid}")
+    return 0
+
+
 # ---------------------------------------------------------------------------
 # 宿主集成(§1.5:wake 自包含文本 + notify 命令钩子;均 best-effort)
 # ---------------------------------------------------------------------------
@@ -1105,7 +1372,7 @@ def _notify_if_configured(cfg, event_record):
 SUBCOMMANDS = {
     "add": cmd_add, "status": cmd_status, "list": cmd_list,
     "log": cmd_log, "run": cmd_run, "reconcile": cmd_reconcile,
-    "wake-text": cmd_wake_text,
+    "wake-text": cmd_wake_text, "prune": cmd_prune,
 }
 
 

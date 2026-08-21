@@ -25,8 +25,8 @@ _spec = importlib.util.spec_from_file_location("flow_task_core", _TASK_CORE)
 tc = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(tc)
 
-# 故意拼接,避免源码静态 deny-list 命中(sk-[A-Za-z0-9]{10});串须匹配 DENY_RE(sk- 后 10 字母数字)
-_FAKE_SECRET = "sk-" + "fakekey12345"
+# 故意拼接,避免源码静态 deny-list 命中(sk-[A-Za-z0-9]{16,});串须匹配收紧后的 DENY_RE(sk- 后 ≥16 字母数字,模拟真 key)
+_FAKE_SECRET = "sk-" + "fakekey1234567890123456789"
 
 
 def _cfg(**kw):

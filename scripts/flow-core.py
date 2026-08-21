@@ -39,7 +39,7 @@ except ImportError:  # 非 POSIX 降级(§4.2)
 # ---------------------------------------------------------------------------
 
 ID_RE = re.compile(r"^[a-z0-9]+(-[a-z0-9]+)*$")   # id 白名单,硬编码不进 config
-DENY_RE = re.compile(r"sk-[A-Za-z0-9]{10}")        # meta 疑似 secret(§1.4)
+DENY_RE = re.compile(r"sk-[A-Za-z0-9]{16,}")       # meta 疑似 secret(§1.4;≥16 字符,防 workitem 名误报)
 
 STATES = (
     "created", "designed", "reviewed", "translated",

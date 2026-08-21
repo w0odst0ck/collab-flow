@@ -230,7 +230,7 @@ class ExecutorContractTests(_Base):
         wi_dir = self._mk_wi("translated")
         self._write_taskbook(wi_dir)
         os.environ["STUB_EXECUTOR_NO_RESULT"] = "1"
-        leak = "sk-" + "abcdefghij12345"
+        leak = "sk-" + "abcdefghij12345678901234567890"
         os.makedirs(os.path.join(wi_dir, "executor"), exist_ok=True)
         with open(os.path.join(wi_dir, "executor", "result.json"), "w", encoding="utf-8") as f:
             json.dump({"schema_version": 1, "executor": "stub", "status": "ok",
