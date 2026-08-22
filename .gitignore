@@ -6,3 +6,6 @@ __pycache__/
 *.key
 manifest.lock
 .flow/
+
+# dsh 设计文档（designs/ 不入仓）
+designs/
