@@ -24,22 +24,33 @@ import math
 import os
 import re
 import secrets
+import shlex
 import shutil
 import subprocess
 import sys
 import threading
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 try:
     import fcntl
 except ImportError:  # 非 POSIX 降级(§1.6.6)
     fcntl = None
 
+try:
+    from zoneinfo import ZoneInfo
+    TZ_CN = ZoneInfo("Asia/Shanghai")
+except Exception:  # 无 tzdata 兜底(本机 3.11+,理论不走)
+    TZ_CN = timezone(timedelta(hours=8), name="Asia/Shanghai")
+
 # ---------------------------------------------------------------------------
 # 复用 flow-core.py 的纯工具(只读依赖,不改动该文件;解析/输出口径完全一致)
 # ---------------------------------------------------------------------------
 
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+if _SCRIPT_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPT_DIR)
+import window  # 公共窗口模块(flow-cost-ledger D1:唯一权威实现,零重复)
+
 _spec = importlib.util.spec_from_file_location(
     "flow_core_tools", os.path.join(_SCRIPT_DIR, "flow-core.py"))
 _fc = importlib.util.module_from_spec(_spec)
@@ -57,28 +68,41 @@ now_iso = _fc.now_iso            # ISO8601 UTC(timespec="seconds")
 # ---------------------------------------------------------------------------
 
 TASK_ID_RE = re.compile(r"^t-[0-9a-f]{12}$")   # 任务 id 白名单,硬编码不进 config
-TASK_STATES = ("queued", "running", "done", "failed", "timeout")
+TASK_STATES = ("scheduled", "queued", "running", "done", "failed", "timeout")
+NON_TERMINAL = ("scheduled", "queued", "running")   # 非终态(幂等去重/容量 cap 按此计数)
 TERMINAL_STATES = ("done", "failed", "timeout")
 PRUNE_STATES = ("done", "failed", "timeout", "killed")  # prune --state 白名单(killed 预留,无匹配幂等)
-KINDS = ("design", "execute")                  # M2:任务类型(决定事件/种子/partial-complete 语义)
+KINDS = ("design", "execute")  # 任务类型白名单(2026-08-22 收窄:只留 LLM 设计/coding;verify/review/batch/reminder 拒)
 PRIORITIES = ("P0", "P1", "P2")
 PRIO_ORDER = {"P0": 0, "P1": 1, "P2": 2}
 SCHEMA_VERSION = 1
 RECONCILE_GRACE_S = 60   # pid=None(dispatch 提升后 runner 尚未写 pid 的窗口)的回收宽限秒数
 
+# 命令模板白名单(flow-cost-ledger §1.4,编译期常量硬编码不进 config;--force 仅撬本步)
+FLOW_WORKITEM_RE = re.compile(
+    r"^(?:\./|/)?[^\s]*flow\s+workitem\s+(design|execute)"
+    r"\s+([A-Za-z0-9][\w.-]*)(?:\s+--[\w-]+(?:[=\s]\S+)*)*$")
+RX_RE = re.compile(r"^(?:\./|/)?[^\s]*rx\s+\S+\s+\S+.*$")
+SCRIPT_RE = re.compile(r"^(?:bash|python|python3)\s+(?:\./|/)?[^\s]*/scripts/[^\s]+(?:\s+.*)?$")
+_PROJ_PATH_RE = re.compile(r"(?:^|\s)FLOW_WORKDIR=[^\s]*/projects/[^/\s]+|/projects/[^/\s]+")
+_HHMM_RE = re.compile(r"^\d{1,2}:\d{2}(?::\d{2})?$")
+
 USAGE = """用法: flow task <sub> ...
-  flow task add       --command CMD [--workitem W] [--priority P0|P1|P2]
-                      [--expected-seconds N] [--kill-on-timeout]
-                      [--kind design|execute] [--workdir DIR] [--json]
+  flow task add       --command CMD --kind design|execute
+                      [--workitem W] --priority P0|P1|P2 --expected-seconds N
+                      --why REASON [--at ISO|HH:MM] [--kill-on-timeout]
+                      [--workdir DIR] [--force --force-reason R] [--json]
   flow task status    <id> [--json]
   flow task list      [--state S] [--workitem W] [--json]
   flow task log       <id> [--tail N] [--json]
-  flow task run       [--max-parallel N] [--json]
+  flow task run       [<id>] [--max-parallel N] [--json]
+  flow task pump      [--json]
+  flow task reschedule <id> --at ISO|HH:MM [--json]
   flow task reconcile [--json]
   flow task wake-text <id> [--json]
   flow task prune     [--state done|failed|timeout|killed] [--older-than N]
                       [--force] [--json]
-退出码: 0 成功 / 1 运行失败 / 2 用法或前置错误(含幂等拒绝)/
+退出码: 0 成功 / 1 运行失败 / 2 用法或前置错误(含门禁拒绝)/
         124 仅任务命令语义(不进 CLI 顶层)。
 """
 
@@ -93,6 +117,14 @@ class TaskError(Exception):
 
 class DuplicateWorkitem(Exception):
     """同 workitem 已有非终态任务(幂等拒绝,→ exit 2)。args=(已有 id, state)。"""
+
+
+class QueueFull(Exception):
+    """队列非终态达容量上限 queue_cap(→ exit 2)。"""
+
+
+class GateReject(Exception):
+    """门禁校验拒绝(flow-cost-ledger §1.4,fail-closed)。args=(error_code, 友好文案)。"""
 
 
 class StoreError(Exception):
@@ -125,10 +157,177 @@ def sort_queue(tasks):
 
 
 def plan_dispatch(reg, max_parallel):
-    """纯函数:空闲槽数 = max_parallel − running;返回应提升的任务列表(不改 reg)。"""
+    """纯函数:空闲槽数 = max_parallel − running;返回应提升的任务列表(不改 reg)。
+    只取 queued(绝不碰 scheduled;与 plan_pump 源分离)。"""
     running = sum(1 for t in reg["tasks"].values() if t.get("state") == "running")
     free = max(int(max_parallel) - running, 0)
     return sort_queue(reg["tasks"].values())[:free]
+
+
+def plan_pump(reg, max_parallel, now):
+    """纯函数(pump,flow-cost-ledger §1.5(2)):到期 scheduled 排序 P0<P1<P2 +
+    scheduled_at 升序 + id 字典序;只取 scheduled(绝不碰 queued)。P0 无窗口判断,仅靠排序置前。
+
+    空槽 = max_parallel − running;无窗口硬门控(D4):到点即升,槽满留 scheduled 下轮再试。
+    """
+    def _due(t):
+        sa = t.get("scheduled_at")
+        if not sa:
+            return False
+        try:
+            return datetime.fromisoformat(sa) <= now
+        except (TypeError, ValueError):
+            return False  # 时间戳损坏 → 保守不入
+
+    due = [t for t in reg["tasks"].values()
+           if t.get("state") == "scheduled" and _due(t)]
+    due.sort(key=lambda t: (PRIO_ORDER.get(t.get("priority"), 99),
+                            t.get("scheduled_at", ""), t.get("id", "")))
+    running = sum(1 for t in reg["tasks"].values() if t.get("state") == "running")
+    return due[: max(int(max_parallel) - running, 0)]
+
+
+# ---------------------------------------------------------------------------
+# scheduled_at 解析 + 门禁校验链(flow-cost-ledger §1.4,fail-closed)
+# ---------------------------------------------------------------------------
+
+def parse_scheduled_at(s, now=None):
+    """--at 解析(纯函数,零 I/O):ISO8601 带偏移 → 归一 UTC;HH:MM[:SS] 简写 →
+    Asia/Shanghai 今日该时刻(已过则次日);naive 拒绝;过去时刻拒绝。
+    返回 UTC ISO(timespec="seconds")。"""
+    if s is None or str(s).strip() == "":
+        raise UsageError("--at 不能为空")
+    s = str(s).strip()
+    now = now or datetime.now(timezone.utc)
+    m = _HHMM_RE.fullmatch(s)
+    if m:
+        parts = [int(x) for x in s.split(":")]
+        hh, mm = parts[0], parts[1]
+        ss = parts[2] if len(parts) > 2 else 0
+        if not (0 <= hh <= 23 and 0 <= mm <= 59 and 0 <= ss <= 59):
+            raise UsageError("HH:MM[:SS] 时间非法")
+        cn_now = now.astimezone(TZ_CN)
+        cand = cn_now.replace(hour=hh, minute=mm, second=ss, microsecond=0)
+        if cand <= cn_now:  # 已过(含恰好)→ 次日
+            cand += timedelta(days=1)
+        return cand.astimezone(timezone.utc).isoformat(timespec="seconds")
+    try:
+        dt = datetime.fromisoformat(s)
+    except ValueError:
+        raise UsageError("时间格式非法:须 ISO8601 带偏移(如 2026-08-22T12:00:00+08:00)或 HH:MM 简写")
+    if dt.tzinfo is None:
+        raise UsageError("时间缺少时区(naive),请补 +08:00 偏移")
+    dt = dt.astimezone(timezone.utc)
+    if dt < now:
+        raise UsageError("时间为过去时刻,请改期或去掉 --at")
+    return dt.isoformat(timespec="seconds")
+
+
+def _gate_resolve_wi(wi_id, cfg):
+    """锚定解析:workitem 目录存在(.flow/workitems/<id> + status.yaml)→ True。"""
+    try:
+        _fc.resolve_wi_dir(wi_id, dict(cfg, workitem={
+            "id_max_len": 64, "plane_id": "control"}))
+        return True
+    except (_fc.UsageError, _fc.WorkitemError, KeyError, TypeError):
+        return False
+
+
+def _command_in_whitelist(command, cfg):
+    """命令模板白名单(§1.4 第 10 步):3 正则任一命中 + 存在性校验。"""
+    m = FLOW_WORKITEM_RE.match(command)
+    if m:
+        return _gate_resolve_wi(m.group(2), cfg)  # <id> 需 resolve_wi_dir 存在
+    if RX_RE.match(command):
+        return True
+    m = SCRIPT_RE.match(command)
+    if m:
+        try:
+            toks = shlex.split(command)
+        except ValueError:
+            return False
+        if len(toks) < 2:
+            return False
+        # 只校验脚本参数(命令后第一个 token)在磁盘解析存在;输出路径等其余参数不参与
+        script_arg = toks[1]
+        return "/scripts/" in script_arg and os.path.isfile(os.path.abspath(script_arg))
+    return False
+
+
+def gate_validate(opts, cfg):
+    """门禁校验链(§1.4,fail-closed 顺序 10 步)。任一不过 → 抛 GateReject(code, 文案)。
+    不猜默认:priority/expected/why 全部强制显式。audit.force_reason 由 add_task 统一维护
+    (单一来源防分叉),本函数不构造 patch。--force 仅跳过第 10 步模板白名单,其余 9 步不可绕过(G11 锁死)。"""
+    task_cfg = (cfg or {}).get("task") or {}
+    command = str(opts.get("command") or "").strip()
+    kind = opts.get("kind")
+    # 1) kind 白名单(2026-08-22 收窄:仅 design/execute 入队;verify/review/batch 拒,文案区分)
+    if kind not in KINDS:
+        if kind in ("verify", "review"):
+            raise GateReject("invalid_kind",
+                             f"kind={kind} 不入队:verify/review 走 flow workitem 同步命令,不入队。")
+        if kind == "batch":
+            raise GateReject("invalid_kind",
+                             "kind=batch 不入队:batch 是触发动作非任务。")
+        raise GateReject("invalid_kind",
+                         f"kind={kind} 不在任务白名单({'/'.join(KINDS)})。提醒请走 cron。")
+    # 2) command 非空
+    if not command:
+        raise GateReject("empty_command", "--command 为空。")
+    # 3) bash -n 语法(bash 缺失同拒,fail-closed)。
+    #    注意:runner 实际经 sh -c 执行,门禁是「防脏」下限而非等价校验(风险表 §3);
+    #    语法通过但 sh 语义不同 → 命令失败走 failed 终态 + failure_tail,安全侧不扩大。
+    try:
+        proc = subprocess.run(["bash", "-n", "-c", command],
+                              stdin=subprocess.DEVNULL,
+                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except OSError:
+        raise GateReject("command_syntax_error", "command 语法非法(bash 不可用)。")
+    if proc.returncode != 0:
+        raise GateReject("command_syntax_error", "command 语法非法(bash -n 失败)。")
+    # 4) 锚定:--workitem 存在 或 command 含项目路径
+    wi_id = opts.get("workitem")
+    anchored = (wi_id is not None and _gate_resolve_wi(wi_id, cfg)) \
+        or _PROJ_PATH_RE.search(command) is not None
+    if not anchored:
+        raise GateReject("not_anchored",
+                         "既无 --workitem 锚点(workitem 不存在)也无可解析项目路径。")
+    # 5) --priority 必填(不猜默认)
+    pri = opts.get("priority")
+    if pri not in PRIORITIES:
+        raise GateReject("priority_required", "--priority 必填,须为 P0/P1/P2。")
+    # 6) --expected-seconds 必填(正整数)
+    exp_raw = opts.get("expected-seconds")
+    try:
+        exp = int(exp_raw) if exp_raw is not None and str(exp_raw).strip() != "" else None
+    except (TypeError, ValueError):
+        exp = None
+    if exp is None or exp <= 0:
+        raise GateReject("expected_required",
+                         "--expected-seconds 必填(正整数,调度/窗口建议依赖)。")
+    # 7) 幂等 + 8) 容量(无锁前置检查;add_task 锁内再原子判定,防 TOCTOU)
+    reg = load_registry()
+    if wi_id is not None:
+        for t in reg["tasks"].values():
+            if t.get("workitem") == wi_id and t.get("state") in NON_TERMINAL:
+                raise GateReject("duplicate_workitem",
+                                 f"workitem={wi_id} 已有非终态任务 {t['id']}({t['state']})。")
+    cap = int(task_cfg.get("queue_cap") or 50)
+    if sum(1 for t in reg["tasks"].values() if t.get("state") in NON_TERMINAL) >= cap:
+        raise GateReject("queue_full",
+                         f"队列非终态已达上限 {cap},请先清理/完成后重试。")
+    # 9) --why 必填
+    why = opts.get("why")
+    if not why or not str(why).strip():
+        raise GateReject("why_required", "--why 必填(审计理由:这是否真是一个任务?)。")
+    # 10) 命令模板白名单(仅无 --force 时)
+    if not opts.get("force"):
+        if not _command_in_whitelist(command, cfg):
+            raise GateReject("command_not_whitelisted",
+                             "command 不在命令模板白名单(flow workitem …/rx …/bash|python …/scripts/…)。"
+                             "确需自由命令请显式 --force 并附 --force-reason。")
+    # audit.force_reason 由 add_task 统一维护(940 行),gate 不构造 patch(单一来源防分叉)
+    return None
 
 
 def _now_ms():
@@ -211,6 +410,7 @@ def load_task_config():
         ("FLOW_TASK_PRUNE_FAILED_DAYS", "prune_failed_days"),
         ("FLOW_TASK_TASK_CAP", "task_cap"),
         ("FLOW_TASK_STALE_AFTER_S", "stale_after_s"),
+        ("FLOW_TASK_QUEUE_CAP", "queue_cap"),
     ):
         v = _env_int(env_key)
         if v is not None:
@@ -568,9 +768,29 @@ def reconcile_running(reg):
     return reaped
 
 
+def _runner_env(t, base_env=None):
+    """任务命令执行 env(任务书 §4/设计 §1.6:跨仓 workitem 实测必修)。
+
+    显式跨仓(workdir ≠ 当前进程 cwd)时注入 FLOW_DATA_DIR=<workdir>/.flow +
+    FLOW_WORKDIR=<workdir>,使 workitem 解析落到任务归属仓而非 collab-flow
+    默认目录;默认归属(workdir==cwd,add 未显式 --workdir)保持 base_env 现状
+    (FLOW_DATA_DIR 未设 → cwd/.flow,与 flow-core.data_dir 口径一致)。
+    纯函数,零 I/O。"""
+    env = dict(base_env if base_env is not None else os.environ)
+    wd = (t or {}).get("workdir")
+    if wd and os.path.abspath(wd) != os.path.abspath(os.getcwd()):
+        env["FLOW_DATA_DIR"] = os.path.join(wd, ".flow")
+        env["FLOW_WORKDIR"] = wd
+    else:
+        env.setdefault("FLOW_DATA_DIR", os.path.join(os.getcwd(), ".flow"))
+    return env
+
+
 def run_command(t, cfg):
-    """执行任务命令(§1.6.1):expected_seconds 用 timeout(coreutils)包裹;无该二进制走 Python 降级。"""
+    """执行任务命令(§1.6.1):expected_seconds 用 timeout(coreutils)包裹;无该二进制走 Python 降级。
+    子进程 env 经 _runner_env 注入 workdir 的 FLOW_DATA_DIR/FLOW_WORKDIR(任务书 §4)。"""
     expected = t.get("expected_seconds")
+    env = _runner_env(t)
     if expected:
         bin_ = shutil.which("timeout")
         if bin_:
@@ -579,7 +799,7 @@ def run_command(t, cfg):
             if t.get("kill_on_timeout"):
                 base += ["--kill-after", str(cfg["task"].get("kill_grace_s", 5))]
             base += [str(expected), "sh", "-c", t["command"]]
-            proc = subprocess.run(base)
+            proc = subprocess.run(base, env=env)
             rc = proc.returncode
             # kill-on-timeout 且 SIGTERM 被忽略 → --kill-after 触发 SIGKILL,timeout 报
             # 128+SIGKILL=137(而非 124);统一为超时语义,保证「超时→timeout」终态不削弱。
@@ -587,31 +807,41 @@ def run_command(t, cfg):
                 return 124
             return rc
         return _run_with_py_timeout(t)  # 降级:超时 SIGKILL(≈kill-on-timeout)
-    proc = subprocess.run(["sh", "-c", t["command"]])
+    proc = subprocess.run(["sh", "-c", t["command"]], env=env)
     return proc.returncode
 
 
 def _run_with_py_timeout(t):
     """无 timeout 二进制降级(§1.6.6):subprocess.run(timeout=...) → 超时抛 CommandTimeout。"""
     try:
-        proc = subprocess.run(["sh", "-c", t["command"]], timeout=t["expected_seconds"])
+        proc = subprocess.run(["sh", "-c", t["command"]], timeout=t["expected_seconds"],
+                              env=_runner_env(t))
         return proc.returncode
     except subprocess.TimeoutExpired:
         raise CommandTimeout()
 
 
 def spawn_runner(tid):
-    """分离式 spawn 落账 runner(§1.4(2) 锁外):stdout/stderr → logs/<id>.log,setssid 孤儿。"""
+    """分离式 spawn 落账 runner(§1.4(2) 锁外):stdout/stderr → logs/<id>.log,setssid 孤儿。
+    子进程 env 注入任务 workdir 的 FLOW_DATA_DIR/FLOW_WORKDIR(任务书 §4:跨仓 workitem 解析);
+    entry 读取失败/缺失 → 回退环境默认(不阻断 spawn)。"""
     os.makedirs(logs_dir(), exist_ok=True)
     log_fd = open(log_path(tid), "ab")
     try:
         popen_kw = {}
         if os.name == "posix":
             popen_kw["start_new_session"] = True
+        env = os.environ
+        try:
+            entry = load_registry()["tasks"].get(tid)
+            if entry is not None:
+                env = _runner_env(entry)
+        except (StoreError, OSError):
+            pass  # 注册表读失败 → 回退 env/默认(不阻断 spawn)
         subprocess.Popen(
             [sys.executable, os.path.abspath(__file__), "_runner", tid],
             stdin=subprocess.DEVNULL, stdout=log_fd, stderr=subprocess.STDOUT,
-            env=dict(os.environ), close_fds=True, **popen_kw)
+            env=env, close_fds=True, **popen_kw)
     finally:
         log_fd.close()
 
@@ -647,12 +877,17 @@ def dispatch(cfg, max_parallel=None):
 
 
 def add_task(cfg, command, workitem=None, priority="P2",
-             expected_seconds=None, kill_on_timeout=False, kind=None, workdir=None):
+             expected_seconds=None, kill_on_timeout=False, kind=None, workdir=None,
+             why=None, scheduled_at=None, force=False, force_reason=None):
     """幂等入队(§1.4(1)):flock 内去重(同 workitem 非终态 → DuplicateWorkitem) + 追加 + 自动 dispatch。
 
     kind 非空时:缺省 expected_seconds → 种子回退(config 默认);注册表条目带 kind 字段。
     workdir 默认 os.getcwd(),仅作跨项目归属记录(§1.2),不改变 runner 执行 cwd;
     目录不存在也接受字符串不校验。
+    scheduled_at 非 None → state=scheduled 且不 auto-dispatch(交给 pump);否则 queued + auto-dispatch。
+    why 必填(非空白);force 落 audit.force_reason(仅模板白名单可撬,由 cmd_add gate 保证)。
+    完整 gate_validate 由 cmd_add(CLI 入口)强制;本函数保留形状校验 + 锁内原子幂等/容量
+    (防程序化误用与并发 TOCTOU 的双保险)。
     queued 事件在注册表追加后 best-effort 写入(§1.3)。
     """
     if command is None or command.strip() == "":
@@ -664,6 +899,8 @@ def add_task(cfg, command, workitem=None, priority="P2",
     if expected_seconds is not None:
         if not isinstance(expected_seconds, int) or expected_seconds <= 0:
             raise UsageError(f"--expected-seconds 必须是正整数: {expected_seconds}")
+    if why is not None and (not isinstance(why, str) or not why.strip()):
+        raise UsageError("--why 必填(审计理由:这是否真是一个任务?)")
     if DENY_RE.search(command):
         raise StoreError("command 含疑似 secret, 拒绝写入")
 
@@ -671,8 +908,11 @@ def add_task(cfg, command, workitem=None, priority="P2",
         reg = load_registry()
         if workitem is not None:
             for t in reg["tasks"].values():
-                if t.get("workitem") == workitem and t["state"] in ("queued", "running"):
+                if t.get("workitem") == workitem and t["state"] in NON_TERMINAL:
                     raise DuplicateWorkitem(t["id"], t["state"])
+        cap = int((cfg["task"].get("queue_cap") if cfg.get("task") else None) or 50)
+        if sum(1 for t in reg["tasks"].values() if t["state"] in NON_TERMINAL) >= cap:
+            raise QueueFull(cap)
         # 写时自动清理 + 僵尸标记(§5.1/§5.2):同锁内跑,审计事件 best-effort
         pruned = auto_prune(reg, cfg)
         stale = mark_stale_running(reg, cfg)
@@ -690,28 +930,32 @@ def add_task(cfg, command, workitem=None, priority="P2",
             exp = seed_expected(_load_seed_kind(kind), fallback)
         reg["tasks"][tid] = {
             "id": tid, "workitem": workitem, "command": command,
-            "priority": priority, "state": "queued", "kind": kind,
+            "priority": priority, "state": "scheduled" if scheduled_at else "queued",
+            "kind": kind,
             "workdir": workdir or os.getcwd(), "expected_seconds": exp,
             "kill_on_timeout": bool(kill_on_timeout),
+            "scheduled_at": scheduled_at, "why": why, "cost_usd": None,
+            "audit": {"force_reason": force_reason or why or "--force"} if force else None,
             "created_at": _now_ms(), "started_at": None, "finished_at": None,
             "exit_code": None, "failure_tail": None, "pid": None, "heartbeat_at": None,
         }
         save_registry_atomic(reg)
-        # queued 事件在注册表锁内写:保证先于任何并发 dispatch 的 running 事件落盘(事件流不倒挂)
+        # queued/scheduled 事件在注册表锁内写:保证先于任何并发 dispatch/pump 的事件落盘(事件流不倒挂)
         _emit_task_event_best_effort(tid, {
             "schema_version": EVENT_SCHEMA_VERSION, "ts": now_iso(),
             "task_id": tid, "workitem": workitem, "kind": kind,
-            "state": "queued", "exit_code": None, "duration_s": None,
+            "state": reg["tasks"][tid]["state"], "exit_code": None, "duration_s": None,
             "expected_seconds": exp, "started_at": None, "finished_at": None,
             "diagnostic": None, "partial_complete": False,
         })
         return tid, reg["tasks"][tid]
 
     tid, entry = with_registry_flock(_do)
-    try:
-        dispatch(cfg)  # best-effort 自动出队;失败不回溯,任务留在 queued,run 可补
-    except (StoreError, OSError):
-        pass
+    if not scheduled_at:  # 仅 queued 走既有 auto-dispatch;scheduled 交给 pump(§1.5(2))
+        try:
+            dispatch(cfg)  # best-effort 自动出队;失败不回溯,任务留在 queued,run 可补
+        except (StoreError, OSError):
+            pass
     return tid
 
 
@@ -870,11 +1114,144 @@ def _runner(task_id, cfg, heartbeat_interval=30):
             _notify_if_configured(cfg, event_record)
         except (StoreError, OSError) as e:
             print(f"告警: 终态事件/种子处理失败 {task_id}: {e}", file=sys.stderr)
+        # flow-cost-ledger §1.5(4):终态提交后锁外 best-effort 成本落账(失败留 null,不阻断流转)
+        _settle_cost(task_id, t, finished_at)
     try:
         dispatch(cfg)  # 释放槽位 → 触发下一批(自续队列)
     except (StoreError, OSError):
         pass
     return 0
+
+
+# ---------------------------------------------------------------------------
+# cost 摘取(§1.5(4):best-effort,价目表不硬编码;摘不到 → null,不阻断流转)
+# ---------------------------------------------------------------------------
+
+def _data_dir():
+    return os.environ.get("FLOW_DATA_DIR") or os.path.join(os.getcwd(), ".flow")
+
+
+def _reasonix_runs_dir():
+    """reasonix 运行日志目录(~/.reasonix/runs;测试经 HOME 隔离,不触真实目录)。"""
+    return os.path.join(os.path.expanduser("~"), ".reasonix", "runs")
+
+
+def extract_reasonix_cost(executor_dir, started_at, finished_at):
+    """reasonix 成本(§D6):1) executor/result.json.cost 优先;2) 退回 ~/.reasonix/runs/*.log
+    按 started_at±120s 就近匹配 + 累加所有 $[0-9]+.[0-9]+ 金额。失败/无匹配 → None。"""
+    rp = os.path.join(executor_dir, "result.json")
+    if os.path.isfile(rp):
+        try:
+            r = json.loads(_fc.read_file(rp))
+        except (ValueError, OSError):
+            r = None
+        if isinstance(r, dict):
+            c = r.get("cost")
+            if isinstance(c, (int, float)) and not isinstance(c, bool):
+                return float(c)
+    if not started_at:
+        return None
+    try:
+        st = datetime.fromisoformat(started_at).astimezone(TZ_CN)
+    except (TypeError, ValueError):
+        return None
+    runs_dir = _reasonix_runs_dir()
+    if not os.path.isdir(runs_dir):
+        return None
+    matches = []
+    try:
+        names = os.listdir(runs_dir)
+    except OSError:
+        return None
+    for name in names:
+        m = re.match(r"^(\d{4})(\d{2})(\d{2})-(\d{2})(\d{2})(\d{2})", name)
+        if not m:
+            continue
+        p = os.path.join(runs_dir, name)
+        if not os.path.isfile(p):  # 同名目录(非日志)不参与匹配
+            continue
+        y, mo, d, h, mi, s = (int(x) for x in m.groups())
+        try:
+            dt = datetime(y, mo, d, h, mi, s, tzinfo=TZ_CN)
+        except ValueError:
+            continue
+        delta = abs((dt - st).total_seconds())
+        if delta <= 120:
+            matches.append((delta, p))
+    if not matches:
+        return None
+    matches.sort(key=lambda x: x[0])  # 就近唯一化(多个候选取 started_at 最近者)
+    try:
+        text = _fc.read_file(matches[0][1])
+    except OSError:
+        return None
+    total = 0.0
+    found = False
+    for m in re.finditer(r"\$([0-9]+\.[0-9]+)", text):
+        total += float(m.group(1))
+        found = True
+    return total if found else None
+
+
+def extract_dsh_cost(wi_dir):
+    """dsh 成本(§D6):designs/.dsh-design/manifest.jsonl 找 cost_usd 字段;
+    现无 dollar 字段 → None(绝不擅自乘价目表,test_C4 锁死)。"""
+    if not wi_dir:
+        return None
+    manifest = os.path.join(os.path.dirname(os.path.dirname(wi_dir)),
+                            "designs", ".dsh-design", "manifest.jsonl")
+    if not os.path.isfile(manifest):
+        return None
+    try:
+        text = _fc.read_file(manifest)
+    except OSError:
+        return None
+    for line in text.splitlines():
+        try:
+            rec = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(rec, dict):
+            c = rec.get("cost_usd")
+            if isinstance(c, (int, float)) and not isinstance(c, bool):
+                return float(c)
+    return None
+
+
+def extract_cost_usd(t, started_at, finished_at):
+    """按 kind 摘取成本(§1.5(4)):execute → reasonix 主路径;design → dsh 后补;
+    其余 kind(已不入队,仅防御)无独立 dollar 产物 → None。"""
+    kind = t.get("kind")
+    wi = t.get("workitem")
+    if kind == "execute" and wi:
+        executor_dir = os.path.join(_data_dir(), "workitems", wi, "executor")
+        return extract_reasonix_cost(executor_dir, started_at, finished_at)
+    if kind == "design" and wi:
+        wi_dir = os.path.join(_data_dir(), "workitems", wi)
+        return extract_dsh_cost(wi_dir)
+    return None
+
+
+def _settle_cost(task_id, t, finished_at):
+    """终态后锁外 best-effort 回写 cost_usd(§1.5(4)):摘不到 → 保持 null,写失败静默。"""
+    try:
+        cost = extract_cost_usd(t, t.get("started_at"), finished_at)
+    except (StoreError, OSError):
+        return
+    if cost is None:
+        return  # 摘不到/不适用 → 保持 null,不阻断流转(E21)
+
+    def _do():
+        reg = load_registry()
+        t2 = reg["tasks"].get(task_id)
+        if t2 is not None and t2.get("cost_usd") is None:
+            t2["cost_usd"] = cost
+            save_registry_atomic(reg)  # 写盘前 DENY_RE 兜底(既有)
+
+    try:
+        with_registry_flock(_do)
+    except (StoreError, OSError):
+        pass
 
 
 def runner_main(argv):
@@ -894,7 +1271,8 @@ def runner_main(argv):
 
 def cmd_add(args, cfg):
     pos, opts = scan_args(
-        args, {"command", "workitem", "priority", "expected-seconds", "kind", "workdir"})
+        args, {"command", "workitem", "priority", "expected-seconds", "kind", "workdir",
+               "at", "why", "force-reason"})
     json_mode = bool(opts.get("json"))
     if pos:
         return fail(2, "add 不接受位置参数", None, json_mode)
@@ -903,43 +1281,61 @@ def cmd_add(args, cfg):
         return fail(2, "missing command", "add 需要 --command CMD", json_mode)
     workitem = opts.get("workitem")
     workdir = opts.get("workdir")  # 可选;默认 os.getcwd()(add_task 内),不校验目录存在(§3 错误表 #2)
-    priority = opts.get("priority") or str(cfg["task"].get("default_priority", "P2"))
+    priority = opts.get("priority")
     kind = opts.get("kind")
+    # ── 门禁校验链(fail-closed,先于一切写盘;任一不过 → 拒绝:<文案>,exit 2) ──
+    try:
+        gate_validate(opts, cfg)
+    except GateReject as e:
+        return fail(2, e.args[0], f"拒绝：{e.args[1]}", json_mode)
+    except StoreError as e:
+        return fail(2, str(e), None, json_mode)
     expected_raw = opts.get("expected-seconds")
-    expected = None
-    if expected_raw is not None:
+    try:
+        expected = int(expected_raw)
+    except (TypeError, ValueError):
+        return fail(2, "invalid expected-seconds", expected_raw, json_mode)
+    # gate_validate 第 6 步已强制 expected 为正整数,此处仅 int 转换(gate 后必成功)
+    # ── --at 解析(scheduled 分支) ──
+    scheduled = None
+    if opts.get("at"):
         try:
-            expected = int(expected_raw)
-        except (TypeError, ValueError):
-            return fail(2, "invalid expected-seconds", expected_raw, json_mode)
-        if expected <= 0:
-            return fail(2, "invalid expected-seconds", "必须为正整数", json_mode)
+            scheduled = parse_scheduled_at(opts["at"])
+        except UsageError as e:
+            return fail(2, "invalid scheduled-at", f"拒绝：{e}", json_mode)
     try:
         tid = add_task(cfg, command, workitem=workitem, priority=priority,
                        expected_seconds=expected, kind=kind,
                        kill_on_timeout=bool(opts.get("kill-on-timeout")),
-                       workdir=workdir)
+                       workdir=workdir, why=opts.get("why"),
+                       scheduled_at=scheduled, force=bool(opts.get("force")),
+                       force_reason=opts.get("force-reason"))
     except DuplicateWorkitem as e:
         return fail(2, "duplicate_workitem", f"已有非终态任务 {e.args[0]} ({e.args[1]})", json_mode)
+    except QueueFull as e:
+        cap = e.args[0] if e.args else 50
+        return fail(2, "queue_full", f"队列非终态已达上限 {cap},请先清理/完成后重试", json_mode)
     except UsageError as e:
         return fail(2, str(e), None, json_mode)
     except StoreError as e:
         return fail(2, str(e), None, json_mode)
+    state = "scheduled" if scheduled else "queued"
+    # ── suggest_wake:dt = scheduled or now(复用 window.window_suggest,D4 窗口仅建议) ──
+    try:
+        sug_dt = datetime.fromisoformat(scheduled) if scheduled else datetime.now(timezone.utc)
+        sug = window.window_suggest({"priority": priority, "expected_seconds": expected}, sug_dt)
+    except (TypeError, ValueError):
+        sug = None
     if json_mode:
-        exp = expected
-        if exp is None and kind is not None:  # 种子回退的实际落盘值(供入队方透传)
-            try:
-                entry = load_registry()["tasks"].get(tid)
-                if entry is not None:
-                    exp = entry.get("expected_seconds")
-            except (StoreError, KeyError, TypeError):
-                pass
-        emit({"status": "ok", "id": tid, "state": "queued",  # 入队确认(§1.5 契约)
+        emit({"status": "ok", "id": tid, "state": state,  # 入队确认(§1.5 契约)
               "workitem": workitem, "priority": priority, "kind": kind,
               "workdir": workdir or os.getcwd(),
-              "expected_seconds": exp})
+              "expected_seconds": expected, "scheduled_at": scheduled,
+              "why": opts.get("why"), "suggest_wake": sug})
     else:
-        print(f"task {tid}: queued")
+        print(f"task {tid}: {state}"
+              + (f" scheduled_at={scheduled}" if scheduled else "")
+              + (f" suggest_wake={sug}" if sug else ""))
     return 0
 
 
@@ -1034,7 +1430,50 @@ def cmd_run(args, cfg):
     pos, opts = scan_args(args, {"max-parallel"})
     json_mode = bool(opts.get("json"))
     if pos:
-        return fail(2, "run 不接受位置参数", None, json_mode)
+        # flow-cost-ledger §1.7:位置参数 <id> → 单任务强制触发(scheduled/queued→running,绕过窗口)
+        if len(pos) > 1:
+            return fail(2, "run 位置参数过多", None, json_mode)
+        tid = pos[0]
+        if not TASK_ID_RE.fullmatch(tid):
+            return fail(2, "invalid task id", tid, json_mode)
+
+        def _do():
+            reg = load_registry()
+            t = reg["tasks"].get(tid)
+            if t is None:
+                raise TaskError(tid)
+            if t["state"] not in ("queued", "scheduled"):
+                raise UsageError(f"仅 queued/scheduled 可强制触发,当前 state={t['state']}")
+            t["state"] = "running"
+            t["started_at"] = _now_ms()
+            t["pid"] = None  # runner 启动后自填(§1.4(2))
+            save_registry_atomic(reg)
+            return dict(t)
+
+        try:
+            t = with_registry_flock(_do)
+        except TaskError as e:
+            return fail(2, "task not found", e.args[0], json_mode)
+        except UsageError as e:
+            return fail(2, str(e), None, json_mode)
+        except StoreError as e:
+            return fail(2, str(e), None, json_mode)
+        except OSError as e:
+            return fail(1, f"写盘失败: {e}", None, json_mode)
+        _emit_task_event_best_effort(tid, {
+            "schema_version": EVENT_SCHEMA_VERSION, "ts": now_iso(),
+            "task_id": tid, "workitem": t.get("workitem"), "kind": t.get("kind"),
+            "state": "running", "exit_code": None, "duration_s": None,
+            "expected_seconds": t.get("expected_seconds"),
+            "started_at": t.get("started_at"), "finished_at": None,
+            "diagnostic": None, "partial_complete": False,
+        })
+        spawn_runner(tid)
+        if json_mode:
+            emit({"status": "ok", "promoted": [tid]})
+        else:
+            print(f"promoted: 1 ({tid})")
+        return 0
     mp_raw = opts.get("max-parallel")
     mp = None
     if mp_raw is not None:
@@ -1054,6 +1493,162 @@ def cmd_run(args, cfg):
         emit({"status": "ok", "promoted": promoted})
     else:
         print(f"promoted: {len(promoted)}")
+    return 0
+
+
+_NO_FCNTL_LOCK = -1  # 非 POSIX 降级哨兵(无 flock → 无锁直执行,非「被占」)
+
+
+def _pump_lock_acquire():
+    """pump 非阻塞 flock(pump.json.lock):已被占 → None(幂等跳过,E14)。
+    非 POSIX(无 fcntl)降级为恒获锁(返回哨兵 -1,不阻塞 pump)。"""
+    if fcntl is None or not hasattr(fcntl, "flock"):
+        return _NO_FCNTL_LOCK
+    os.makedirs(task_dir(), exist_ok=True)
+    fd = os.open(pump_lock_path(), os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(fd)
+        return None
+    return fd
+
+
+def _pump_lock_release(fd):
+    if fd is None or fd == _NO_FCNTL_LOCK:
+        return
+    try:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
+
+
+def pump_path():
+    """pump 心跳文件(独立于任务账本,D5:不污染 tasks.json)。"""
+    return os.path.join(task_dir(), "pump.json")
+
+
+def pump_lock_path():
+    return pump_path() + ".lock"
+
+
+def _pump_heartbeat(phase, promoted=None, last_error=None):
+    """写 pump.json 心跳(§1.5(2)/D5);best-effort:失败仅告警,不阻断提升(E15)。
+    写盘前过 DENY_RE(红线:落盘 JSON 兜底)。"""
+    try:
+        rec = {"schema_version": 1, "heartbeat_at": now_iso(), "last_run_at": now_iso(),
+               "phase": phase, "promoted": promoted or [], "pid": os.getpid(),
+               "last_error": last_error}
+        os.makedirs(task_dir(), exist_ok=True)
+        text = json.dumps(rec, ensure_ascii=False, indent=2) + "\n"
+        if DENY_RE.search(text):
+            raise StoreError("pump.json 含疑似 secret, 拒绝写入")
+        tmp = f"{pump_path()}.tmp.{os.getpid()}.{secrets.token_hex(4)}"
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, pump_path())
+    except (StoreError, OSError) as e:
+        print(f"告警: pump 心跳写入失败: {e}", file=sys.stderr)
+
+
+def cmd_pump(args, cfg):
+    """pump(§1.5(2)):flock 防并发(被占 → 直接返回幂等)→ 心跳 start → reconcile →
+    plan_pump(到期 scheduled,受 max_parallel 空槽)→ scheduled→running → 锁外 spawn → 心跳 end。
+    P0 立即、无窗口硬门控(D4)。"""
+    pos, opts = scan_args(args, set())
+    json_mode = bool(opts.get("json"))
+    if pos:
+        return fail(2, "pump 不接受位置参数", None, json_mode)
+    m = int(cfg["task"].get("max_parallel") or 2)
+    lock_fd = _pump_lock_acquire()
+    if lock_fd is None:
+        return 0  # 并发 pump 已持锁 → 跳过本轮(幂等,E14)
+    promoted = []
+    try:
+        _pump_heartbeat("start")
+        try:
+            def _do():
+                reg = load_registry()
+                reconcile_running(reg)
+                chosen = plan_pump(reg, m, datetime.now(timezone.utc))
+                now = _now_ms()
+                for t in chosen:
+                    t["state"] = "running"
+                    t["started_at"] = now
+                    t["pid"] = None
+                save_registry_atomic(reg)
+                return [(t["id"], dict(t)) for t in chosen]
+
+            promoted = with_registry_flock(_do)
+        except (StoreError, OSError) as e:
+            _pump_heartbeat("end", last_error=str(e))
+            raise
+        for tid, t in promoted:  # 锁外 spawn(Popen 立即返回,同 dispatch)
+            _emit_task_event_best_effort(tid, {
+                "schema_version": EVENT_SCHEMA_VERSION, "ts": now_iso(),
+                "task_id": tid, "workitem": t.get("workitem"), "kind": t.get("kind"),
+                "state": "running", "exit_code": None, "duration_s": None,
+                "expected_seconds": t.get("expected_seconds"),
+                "started_at": t.get("started_at"), "finished_at": None,
+                "diagnostic": None, "partial_complete": False,
+            })
+            spawn_runner(tid)
+        _pump_heartbeat("end", promoted=[tid for tid, _ in promoted])
+    except StoreError as e:
+        return fail(2, str(e), None, json_mode)
+    except OSError as e:
+        return fail(1, f"写盘失败: {e}", None, json_mode)
+    finally:
+        _pump_lock_release(lock_fd)
+    if json_mode:
+        emit({"status": "ok", "promoted": [tid for tid, _ in promoted]})
+    else:
+        print(f"promoted: {len(promoted)}")
+    return 0
+
+
+def cmd_reschedule(args, cfg):
+    """改期(§1.5(3)):仅 scheduled 可改期;naive/过去/非法 --at → 拒绝(E12/E13/E20)。"""
+    pos, opts = scan_args(args, {"at"})
+    json_mode = bool(opts.get("json"))
+    if len(pos) != 1:
+        return fail(2, "reschedule 需要 <id>", None, json_mode)
+    tid = pos[0]
+    if not TASK_ID_RE.fullmatch(tid):
+        return fail(2, "invalid task id", tid, json_mode)
+    at_raw = opts.get("at")
+    if not at_raw:
+        return fail(2, "reschedule 需要 --at", None, json_mode)
+    try:
+        new_at = parse_scheduled_at(at_raw)
+    except UsageError as e:
+        return fail(2, "invalid scheduled-at", f"拒绝：{e}", json_mode)
+
+    def _do():
+        reg = load_registry()
+        t = reg["tasks"].get(tid)
+        if t is None:
+            raise TaskError(tid)
+        if t["state"] != "scheduled":
+            raise UsageError(f"仅 scheduled 可改期,当前 state={t['state']}")
+        t["scheduled_at"] = new_at
+        save_registry_atomic(reg)
+        return dict(t)
+
+    try:
+        t = with_registry_flock(_do)
+    except TaskError as e:
+        return fail(2, "task not found", e.args[0], json_mode)
+    except UsageError as e:
+        return fail(2, str(e), None, json_mode)
+    except StoreError as e:
+        return fail(2, str(e), None, json_mode)
+    if json_mode:
+        emit({"status": "ok", "id": tid, "scheduled_at": new_at})
+    else:
+        print(f"task {tid}: scheduled_at={new_at}")
     return 0
 
 
@@ -1093,7 +1688,7 @@ def _prune_match(reg, states=None, older_than_days=None, now=None):
     out = []
     for tid, t in reg["tasks"].items():
         st = t.get("state")
-        if st in ("queued", "running"):  # 红线:非终态绝不删(双保险)
+        if st in NON_TERMINAL:  # 红线:非终态(含 scheduled)绝不删(双保险)
             continue
         if st not in states:
             continue
@@ -1372,6 +1967,7 @@ def _notify_if_configured(cfg, event_record):
 SUBCOMMANDS = {
     "add": cmd_add, "status": cmd_status, "list": cmd_list,
     "log": cmd_log, "run": cmd_run, "reconcile": cmd_reconcile,
+    "pump": cmd_pump, "reschedule": cmd_reschedule,
     "wake-text": cmd_wake_text, "prune": cmd_prune,
 }
 

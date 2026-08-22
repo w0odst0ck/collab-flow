@@ -29,6 +29,19 @@ run_mp() { # run_mp <max-parallel> [args...] —— 注入 FLOW_TASK_MAX_PARALLE
       FLOW_TASK_MAX_PARALLEL="$1" COLLABFLOW_CONFIG="$WORK/no-cfg.yaml" "$FLOW" "${@:2}"
 }
 
+# ── flow-task-ledger 门禁(§1.4,fail-closed) ─────────────────────────────
+# task add 需 kind/priority/expected-seconds/why + 锚定(workitem 或项目路径);
+# 自由命令不在模板白名单 → 显式 --force + --force-reason。既有自由命令用例经
+# smoke_add/smoke_add_mp 统一注入(用例可后覆盖 priority/expected-seconds 等)。
+smoke_add() { # smoke_add [add args...] —— 注入门禁参数后透传(默认 queued 语义不变)
+  run task add --kind design --priority P2 --expected-seconds 30 --why smoke \
+      --force --force-reason smoke "$@"
+}
+smoke_add_mp() { # smoke_add_mp <max-parallel> [add args...]
+  run_mp "$1" task add --kind design --priority P2 --expected-seconds 30 --why smoke \
+      --force --force-reason smoke "${@:2}"
+}
+
 task_id() { # task_id —— 从 add 的 --json 输出取 id
   printf '%s' "$1" | python3 -c 'import sys,json;print(json.loads(sys.stdin.read()).get("id",""))' 2>/dev/null
 }
@@ -300,7 +313,7 @@ fi
 # 全程 stub(sleep / sh -c "exit N")零 API;FLOW_TASK_DIR 已由 run()/run_mp() 注入临时目录。
 
 echo "== C22: task add+status(add 返回 queued,status id 一致) =="
-OUT="$(run task add --command "sleep 1" --json 2>&1)"; RC=$?
+OUT="$(smoke_add --command "FLOW_WORKDIR=/projects/smoke sleep 1" --json 2>&1)"; RC=$?
 TID="$(task_id "$OUT")"
 if [[ $RC -eq 0 ]] && json_ok "$OUT" >/dev/null \
    && [[ $(printf '%s' "$OUT" | grep -c .) -eq 1 ]] \
@@ -319,9 +332,9 @@ else
 fi
 
 echo "== C23: 幂等拒绝(同 workitem 非终态 → exit2+duplicate_workitem) =="
-OUT="$(run task add --workitem w1 --command "sleep 2" --json 2>&1)"; RC=$?
+OUT="$(smoke_add --workitem w1 --command "FLOW_WORKDIR=/projects/smoke sleep 2" --json 2>&1)"; RC=$?
 if [[ $RC -eq 0 ]]; then
-  OUT="$(run task add --workitem w1 --command "sleep 1" --json 2>&1)"; RC=$?
+  OUT="$(smoke_add --workitem w1 --command "FLOW_WORKDIR=/projects/smoke sleep 1" --json 2>&1)"; RC=$?
   if [[ $RC -eq 2 ]] && echo "$OUT" | grep -q '"error":"duplicate_workitem"'; then
     ok "重复 add exit2+duplicate_workitem"
   else
@@ -333,7 +346,7 @@ else
 fi
 
 echo "== C24: E2E 自动流转 done(add→done,exit_code=0,finished_at 非空) =="
-OUT="$(run task add --command "sleep 2" --json 2>&1)"; RC=$?
+OUT="$(smoke_add --command "FLOW_WORKDIR=/projects/smoke sleep 2" --json 2>&1)"; RC=$?
 TID="$(task_id "$OUT")"
 sleep 3
 OUT="$(run task status "$TID" --json 2>&1)"; RC=$?
@@ -354,7 +367,7 @@ fi
 echo "== C25: 并发排队(--max-parallel 2,running 不超限,最终全 done) =="
 TIDS25=()
 for i in 1 2 3 4; do
-  OUT="$(run_mp 2 task add --command "sleep 1" --json 2>&1)"
+  OUT="$(smoke_add_mp 2 --command "FLOW_WORKDIR=/projects/smoke sleep 1" --json 2>&1)"
   TIDS25+=("$(task_id "$OUT")")
 done
 OUT="$(run_mp 2 task list --state running --json 2>&1)"
@@ -377,11 +390,11 @@ else
 fi
 
 echo "== C26: 优先级排队(P0 先于 P2 出队,--max-parallel 1) =="
-OUT="$(run_mp 1 task add --command "sleep 1" --json 2>&1)"
+OUT="$(smoke_add_mp 1 --command "FLOW_WORKDIR=/projects/smoke sleep 1" --json 2>&1)"
 BLOCK_ID="$(task_id "$OUT")"
-OUT="$(run_mp 1 task add --command "sleep 0.2" --priority P2 --json 2>&1)"
+OUT="$(smoke_add_mp 1 --command "FLOW_WORKDIR=/projects/smoke sleep 0.2" --priority P2 --json 2>&1)"
 P2_ID="$(task_id "$OUT")"
-OUT="$(run_mp 1 task add --command "sleep 0.2" --priority P0 --json 2>&1)"
+OUT="$(smoke_add_mp 1 --command "FLOW_WORKDIR=/projects/smoke sleep 0.2" --priority P0 --json 2>&1)"
 P0_ID="$(task_id "$OUT")"
 sleep 4
 S_P0="$(run_mp 1 task status "$P0_ID" --json 2>/dev/null \
@@ -395,7 +408,7 @@ else
 fi
 
 echo "== C27: 超时熔断(--expected-seconds 1 + sleep 5 → timeout/124) =="
-OUT="$(run task add --command "sleep 5" --expected-seconds 1 --json 2>&1)"; RC=$?
+OUT="$(smoke_add --command "FLOW_WORKDIR=/projects/smoke sleep 5" --expected-seconds 1 --json 2>&1)"; RC=$?
 TID="$(task_id "$OUT")"
 sleep 3
 OUT="$(run task status "$TID" --json 2>&1)"
@@ -407,7 +420,7 @@ else
 fi
 
 echo "== C28: 失败诊断(failed+failure_tail 含 boom) =="
-OUT="$(run task add --command "sh -c 'echo boom; exit 3'" --json 2>&1)"; RC=$?
+OUT="$(smoke_add --command "FLOW_WORKDIR=/projects/smoke sh -c 'echo boom; exit 3'" --json 2>&1)"; RC=$?
 TID="$(task_id "$OUT")"
 sleep 2
 OUT="$(run task status "$TID" --json 2>&1)"
@@ -638,7 +651,7 @@ else
 fi
 
 echo "== C37: 事件失败诊断(failed + diagnostic 含 boom) =="
-OUT="$(run task add --command "sh -c 'echo boom; exit 3'" --json 2>&1)"; RC=$?
+OUT="$(smoke_add --command "FLOW_WORKDIR=/projects/smoke sh -c 'echo boom; exit 3'" --json 2>&1)"; RC=$?
 TID37="$(task_id "$OUT")"
 sleep 2
 if python3 - "$WORK/task/events/$TID37.jsonl" << 'PY'
@@ -682,7 +695,9 @@ host:
 EOF
 OUT="$(env HOME="$WORK/home" FLOW_DATA_DIR="$DATA" FLOW_TASK_DIR="$WORK/task" \
     COLLABFLOW_CONFIG="$WORK/notify-cfg.yaml" "$FLOW" \
-    task add --command "echo notify-test" --json 2>&1)"; RC=$?
+    task add --command "FLOW_WORKDIR=/projects/smoke echo notify-test" \
+    --kind design --priority P2 --expected-seconds 30 --why smoke \
+    --force --force-reason smoke --json 2>&1)"; RC=$?
 TID39="$(task_id "$OUT")"
 sleep 2
 if [[ $RC -eq 0 ]] && [[ -f "$NOTIFY_RECORD" ]] && grep -q "$TID39" "$NOTIFY_RECORD"; then
@@ -706,6 +721,170 @@ else
   else
     bad "C40" "run-smoke=$RC1 run-config=$RC2 run-executor=$RC3 unittest=$RC4"
   fi
+fi
+
+# ---------- C41-C47: flow-task-ledger 门禁/scheduled/pump/reschedule/cost/--force(§2.2) ----------
+FUTURE_AT="$(python3 -c 'from datetime import datetime,timedelta,timezone; \
+print((datetime.now(timezone.utc)+timedelta(hours=6)).isoformat(timespec="seconds"))')"
+FUTURE_AT2="$(python3 -c 'from datetime import datetime,timedelta,timezone; \
+print((datetime.now(timezone.utc)+timedelta(hours=10)).isoformat(timespec="seconds"))')"
+
+echo "== C41: 门禁拒绝(kind 白名单 + why 必填) =="
+OUT="$(run task add --command "flow workitem design x --sync --json" --workitem x \
+    --kind reminder --priority P2 --expected-seconds 480 --why test --json 2>&1)"; RC=$?
+if [[ $RC -eq 2 ]] && echo "$OUT" | grep -q "提醒请走 cron"; then
+  ok "kind=reminder 拒绝 + 文案含「提醒请走 cron」"
+else
+  bad "C41a" "rc=$RC out=$OUT"
+fi
+OUT="$(run task add --command "FLOW_WORKDIR=/projects/smoke sleep 1" \
+    --kind design --priority P2 --expected-seconds 30 \
+    --force --force-reason smoke --json 2>&1)"; RC=$?
+if [[ $RC -eq 2 ]] && echo "$OUT" | grep -q "拒绝"; then
+  ok "缺 --why 拒绝(exit 2)"
+else
+  bad "C41b" "rc=$RC out=$OUT"
+fi
+
+echo "== C42: 合法入队(kind/why/audit 落账) =="
+run workitem new x --json >/dev/null 2>&1
+OUT="$(run task add --command "flow workitem design x --sync --json" --workitem x \
+    --kind design --priority P2 --expected-seconds 480 --why test --json 2>&1)"; RC=$?
+TID42="$(task_id "$OUT")"
+if [[ $RC -eq 0 ]] && [[ "$TID42" =~ ^t-[0-9a-f]{12}$ ]]; then
+  LIST42="$(run task list --json 2>&1)"
+  if echo "$LIST42" | grep -q '"kind":"design"' && echo "$LIST42" | grep -q '"why":"test"' \
+     && echo "$LIST42" | grep -q '"audit"'; then
+    ok "list --json 含 kind/why/audit"
+  else
+    bad "C42b" "list 缺字段: $(echo "$LIST42" | head -c 300)"
+  fi
+else
+  bad "C42a" "rc=$RC out=$OUT"
+fi
+
+echo "== C43: scheduled 入队(--at → scheduled + 不 auto-dispatch) =="
+wait_task "$TID42" >/dev/null 2>&1   # C42 的 workitem x 任务需先终态(幂等 gate 不阻塞)
+OUT="$(run task add --command "flow workitem design x --sync --json" --workitem x \
+    --kind design --priority P2 --expected-seconds 480 --why test \
+    --at "$FUTURE_AT" --json 2>&1)"; RC=$?
+TID43="$(task_id "$OUT")"
+if [[ $RC -eq 0 ]] && echo "$OUT" | grep -q '"state":"scheduled"' \
+   && echo "$OUT" | grep -q '"scheduled_at"'; then
+  ok "add --at → state=scheduled + scheduled_at 落账"
+else
+  bad "C43a" "rc=$RC out=$OUT"
+fi
+ST43="$(run task status "$TID43" --json 2>/dev/null \
+        | python3 -c 'import sys,json;print((json.loads(sys.stdin.read()).get("task") or {}).get("state",""))' 2>/dev/null)"
+if [[ "$ST43" == "scheduled" ]]; then
+  ok "不 auto-dispatch(仍 scheduled)"
+else
+  bad "C43b" "state=$ST43(应为 scheduled)"
+fi
+
+echo "== C44: pump E2E(到点 scheduled → running → done + pump.json 心跳) =="
+OUT="$(smoke_add --command "FLOW_WORKDIR=/projects/smoke sleep 0.5" \
+    --at "$FUTURE_AT" --json 2>&1)"; RC=$?
+TID44="$(task_id "$OUT")"
+if [[ $RC -eq 0 ]]; then
+  # 注入已到点(直接改注册表;pump 无窗口硬门控,D4,到点即升)
+  python3 - "$WORK/task/tasks.json" "$TID44" << 'PY'
+import json, os, sys
+from datetime import datetime, timedelta, timezone
+path, tid = sys.argv[1], sys.argv[2]
+reg = json.load(open(path, encoding="utf-8"))
+past = (datetime.now(timezone.utc) - timedelta(seconds=30)).isoformat(timespec="seconds")
+reg["tasks"][tid]["scheduled_at"] = past
+# 原子写(temp + os.replace),防中断截断注册表
+tmp = path + f".tmp{os.getpid()}"
+with open(tmp, "w", encoding="utf-8") as f:
+    json.dump(reg, f, ensure_ascii=False, indent=2)
+os.replace(tmp, path)
+PY
+  OUT="$(run task pump --json 2>&1)"; RC=$?
+  if [[ $RC -eq 0 ]] && wait_task "$TID44"; then
+    T44="$(run task status "$TID44" --json 2>/dev/null)"
+    if echo "$T44" | grep -q '"state":"done"' && echo "$T44" | grep -q '"exit_code":0'; then
+      ok "pump 提升 → done+exit_code=0"
+    else
+      bad "C44b" "pump 后非 done: $T44"
+    fi
+  else
+    bad "C44a" "rc=$RC out=$OUT"
+  fi
+else
+  bad "C44c" "add rc=$RC out=$OUT"
+fi
+if [[ -f "$WORK/task/pump.json" ]] && grep -q '"heartbeat_at"' "$WORK/task/pump.json"; then
+  ok "pump.json 心跳落盘"
+else
+  bad "C44d" "pump.json 缺失或无心跳"
+fi
+
+echo "== C45: reschedule(scheduled 改期成功;非 scheduled 改期拒) =="
+OUT="$(run task reschedule "$TID43" --at "$FUTURE_AT2" --json 2>&1)"; RC=$?
+if [[ $RC -eq 0 ]] && echo "$OUT" | grep -q '"scheduled_at"'; then
+  ok "scheduled 改期成功"
+else
+  bad "C45a" "rc=$RC out=$OUT"
+fi
+OUT="$(run task reschedule "$TID42" --at "$FUTURE_AT2" --json 2>&1)"; RC=$?
+if [[ $RC -eq 2 ]] && echo "$OUT" | grep -q "仅 scheduled 可改期"; then
+  ok "非 scheduled 改期拒绝"
+else
+  bad "C45b" "rc=$RC out=$OUT"
+fi
+
+echo "== C46: cost --json(list 含 cost_usd/scheduled_at/audit) =="
+LIST46="$(run task list --json 2>&1)"
+if echo "$LIST46" | grep -q '"cost_usd"' && echo "$LIST46" | grep -q '"scheduled_at"' \
+   && echo "$LIST46" | grep -q '"audit"'; then
+  ok "list --json 含 cost_usd/scheduled_at/audit"
+else
+  bad "C46" "list 缺字段: $(echo "$LIST46" | head -c 300)"
+fi
+
+echo "== C47: --force(自由命令 + --force-reason → audit.force_reason 落账) =="
+OUT="$(run task add --command "FLOW_WORKDIR=/projects/smoke true" \
+    --kind design --priority P2 --expected-seconds 30 --why test \
+    --force --force-reason r47 --json 2>&1)"; RC=$?
+TID47="$(task_id "$OUT")"
+if [[ $RC -eq 0 ]] && [[ "$TID47" =~ ^t-[0-9a-f]{12}$ ]]; then
+  if run task status "$TID47" --json 2>/dev/null | grep -q '"audit":{"force_reason":"r47"}'; then
+    ok "audit.force_reason=r47 落账"
+  else
+    bad "C47b" "audit 缺失: $(run task status "$TID47" --json 2>&1 | head -c 300)"
+  fi
+else
+  bad "C47a" "rc=$RC out=$OUT"
+fi
+
+# ── ENV1: 跨仓 workitem 执行(任务书 §4/§6:workdir 指向独立仓时 workitem 可解析) ──
+echo "== ENV1: 跨仓 workitem 执行(workdir 独立仓可解析,产物落独立仓) =="
+INDEP="$WORK/indep-repo"
+mkdir -p "$INDEP/.flow/workitems/cross"
+printf 'state: translated\n' > "$INDEP/.flow/workitems/cross/status.yaml"
+printf '# cross taskbook\n验证跨仓解析\n' > "$INDEP/.flow/workitems/cross/taskbook.md"
+( cd "$INDEP" && git init -q && git add . \
+  && git -c user.email=smoke@t -c user.name=smoke commit -qm init ) 2>/dev/null
+# add 进程 FLOW_DATA_DIR 指向独立仓(gate 锚定/模板白名单可见);workdir 记录独立仓;
+# runner 子进程经 spawn_runner env 注入 FLOW_DATA_DIR/FLOW_WORKDIR(任务书 §4)后解析落到独立仓。
+OUT="$(env HOME="$WORK/home" FLOW_DATA_DIR="$INDEP/.flow" FLOW_TASK_DIR="$WORK/task" \
+    COLLABFLOW_CONFIG="$WORK/no-cfg.yaml" "$FLOW" \
+    task add --command "flow workitem execute cross --sync --executor stub --timeout 3 --json" \
+    --workitem cross --workdir "$INDEP" --kind execute --priority P2 \
+    --expected-seconds 120 --why smoke --json 2>&1)"; RC=$?
+TIDENV="$(task_id "$OUT")"
+if [[ $RC -eq 0 ]] && [[ "$TIDENV" =~ ^t-[0-9a-f]{12}$ ]] && wait_task "$TIDENV"; then
+  if [[ -f "$INDEP/.flow/workitems/cross/executor/result.json" ]] \
+     && ! [[ -f "$DATA/workitems/cross/executor/result.json" ]]; then
+    ok "跨仓 workitem 可解析,result.json 落独立仓(默认仓无产物)"
+  else
+    bad "ENV1b" "独立仓 result.json 缺失或默认仓误产: $(run task status "$TIDENV" --json 2>/dev/null | head -c 300)"
+  fi
+else
+  bad "ENV1a" "rc=$RC out=$OUT"
 fi
 
 echo

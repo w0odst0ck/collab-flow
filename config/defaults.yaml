@@ -62,7 +62,10 @@ task:                          # M1 新增;全标量,P1 解析器照常通过(ta
   expected_seconds_seed:       # M2 新增:队列 SLA 硬超时种子(软截止先验,非硬超时本身)
     design: 480                # 对齐 workitem.design_expected_seconds
     execute: 1800              # 对齐 executor.timeout_s
+                               # (2026-08-22 收窄:仅 design/execute 入队,verify/review/batch 不再有 seed)
   seed_history_len: 8          # M2 新增:每 kind 保留的 duration 样本数
+  queue_cap: 50                # 新增:非终态硬拒上限(入队拒绝),env FLOW_TASK_QUEUE_CAP
+                               # 与 task_cap(100,写时删最老终态)语义分离:queue_cap=入队拒、task_cap=保留清理
   prune_done_days: 3           # 写时自动清理:done 保留天数(§5.1),env FLOW_TASK_PRUNE_DONE_DAYS
   prune_failed_days: 7         # 写时自动清理:failed/timeout/killed 保留天数(§5.1),env FLOW_TASK_PRUNE_FAILED_DAYS
   task_cap: 100                # 注册表容量上限:超限删最老终态(§5.1),env FLOW_TASK_TASK_CAP

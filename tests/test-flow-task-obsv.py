@@ -230,8 +230,13 @@ class WorkdirTests(ObsvIsoBase):
         """cmd_add --workdir + cmd_list --json 均输出 workdir(§4 验收 2)。"""
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
-            rc = tc.cmd_add(["--command", "sleep 0.01", "--workitem", "wd2",
-                             "--workdir", "/opt/proj-b", "--json"],
+            # flow-task-ledger 门禁(§1.4):补 kind/priority/expected/why + 项目路径锚定
+            # + --force(自由命令不在模板白名单,显式撬开;audit.force_reason 落账)
+            rc = tc.cmd_add(["--command", "FLOW_WORKDIR=/projects/wd2 sleep 0.01",
+                             "--workitem", "wd2", "--workdir", "/opt/proj-b",
+                             "--kind", "design", "--priority", "P2",
+                             "--expected-seconds", "30", "--why", "test",
+                             "--force", "--force-reason", "test", "--json"],
                             _cfg(max_parallel=0))
         self.assertEqual(rc, 0)
         info = json.loads(buf.getvalue().strip().splitlines()[-1])

@@ -241,7 +241,7 @@ fi
 echo "== C26: 回归 run-smoke(15) + run-config-smoke(17) + run-flow-smoke(18) =="
 bash "$ROOT_DIR/tests/run-smoke.sh" >"$WORK/reg1.log" 2>&1; RC1=$?
 bash "$ROOT_DIR/tests/run-config-smoke.sh" >"$WORK/reg2.log" 2>&1; RC2=$?
-bash "$ROOT_DIR/tests/run-flow-smoke.sh" >"$WORK/reg3.log" 2>&1; RC3=$?
+FLOW_SMOKE_NESTED=1 bash "$ROOT_DIR/tests/run-flow-smoke.sh" >"$WORK/reg3.log" 2>&1; RC3=$?
 if [[ $RC1 -eq 0 && $RC2 -eq 0 && $RC3 -eq 0 ]]; then
   ok "15+17+18 回归全绿"
 else

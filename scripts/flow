@@ -18,7 +18,8 @@
 #   flow workitem design   <id> [--async [--expected N]] [--check] [--sync] [--force] [--json]
 #   flow workitem execute  <id> [--sync] [--executor NAME] [--timeout N] [--model NAME] [--force] [--json]
 #   flow workitem decision <id> --verdict pass|reject|takeover [--defect-type T] [--summary S] [--json]
-#   flow task add/status/list/log/run/reconcile/wake-text/prune(M1/M2 后台任务队列,见 flow-task-core.py)
+#   flow task add/status/list/log/run/pump/reschedule/reconcile/wake-text/prune
+#       (M1/M2/flow-task-ledger 后台任务队列,见 flow-task-core.py)
 #
 # 退出码: 0 成功 / 1 运行失败(守卫拒绝等) / 2 用法或前置错误 /
 #         3 async 设计运行中(design --check) / 124 超时

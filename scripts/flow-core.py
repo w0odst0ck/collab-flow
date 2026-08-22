@@ -790,6 +790,7 @@ def load_config():
     workitem = dict(merged.get("workitem") or {})
     gates = dict(merged.get("gates") or {})
     executor = dict(merged.get("executor") or {})
+    task = dict(merged.get("task") or {})  # flow-task-ledger:入队侧补参读取 default_priority/seed
 
     # env 覆盖(§7.1):环境已设即覆盖
     ttl = _env_int("FLOW_LOCK_TTL_S")
@@ -808,7 +809,7 @@ def load_config():
     expected_s = _env_int("FLOW_DESIGN_EXPECTED_S")
     if expected_s is not None:
         workitem["design_expected_seconds"] = expected_s
-    return {"workitem": workitem, "gates": gates, "executor": executor}
+    return {"workitem": workitem, "gates": gates, "executor": executor, "task": task}
 
 
 def data_dir():
@@ -2047,10 +2048,21 @@ def _enqueue_workitem_op(cfg, sub, wi_id, inner_argv, kind, json_mode, state_bef
     command = " ".join(shlex.quote(a) for a in ([flow_bin] + inner_argv))
     if DENY_RE.search(command):
         return fail(2, "入队命令含疑似 secret, 拒绝入队", None, json_mode)
+    # flow-task-ledger 门禁(§1.6):补 --priority/--why/--expected-seconds,否则新门禁打断
+    # async-first 入队(E25);命令串仍命中 FLOW_WORKITEM_RE(白名单),无需 --force。
+    # _SEED_FALLBACK 为 cfg 缺 task 块(测试/旧调用)时的硬编码兜底,与 config/defaults.yaml 对齐。
+    # 2026-08-22 收窄:仅 design/execute 入队(verify/review/batch 已不入队)。
+    task_cfg = cfg.get("task") or {}
+    _SEED_FALLBACK = {"design": 480, "execute": 1800}
     cmd = [flow_bin, "task", "add", "--command", command,
-           "--workitem", wi_id, "--kind", kind]
+           "--workitem", wi_id, "--kind", kind,
+           "--priority", str(task_cfg.get("default_priority") or "P2"),
+           "--why", f"workitem {sub} {wi_id}"]
     if kind == "execute":
         cmd += ["--expected-seconds", str(timeout + 115)]  # 外层安全网 ≥ 内层 timeout+缓冲
+    else:
+        seed = (task_cfg.get("expected_seconds_seed") or {}).get(kind)
+        cmd += ["--expected-seconds", str(seed if seed else _SEED_FALLBACK.get(kind, 480))]
     cmd += ["--json"]
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True)
