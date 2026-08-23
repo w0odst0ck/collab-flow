@@ -32,6 +32,7 @@
 
 - `config/defaults.yaml` — 全局默认（零个人标识）
 - `config/config.example.yaml` — 用户配置示例
+- `config/pricing.yaml` — **DeepSeek 计费模式唯一真相源**（高峰时段/工作日限定/时区/价目；官方 api-docs.deepseek.com 同步）。改计费模式只改此文件，`scripts/window.py`（selftest）与 flowq/flow-task 自动跟随，勿在任何代码/文档硬编码时段数字；`scripts/check-pricing.py` 可手动对比官方页
 - 合并优先级：`CLI flag > 环境变量 > user config > defaults`
 - key 只允许环境变量引用（`${DEEPSEEK_API_KEY}`），明文拒绝
 

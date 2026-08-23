@@ -67,6 +67,7 @@ def _load_pricing():
             "weekday_only": bool(peak.get("weekday_only", True)),
             "tz": str(peak.get("tz", "Asia/Shanghai")),
             "spans": spans,
+            "prices": cfg.get("prices", {}),  # 价目(元/百万 token,仅供参考/展示)
         }
     except Exception as e:
         raise RuntimeError(f"window: 计费配置校验失败({_CFG_PATH}): {e}") from e
@@ -76,6 +77,12 @@ _PRICING = _load_pricing()
 _SPANS = _PRICING["spans"]                        # ((9,12),(14,18)) 小时 [lo,hi)
 _WEEKDAY_ONLY = _PRICING["weekday_only"]
 _TZ_NAME = _PRICING["tz"]
+_PRICES = _PRICING.get("prices", {})              # 价目表(消费方:dsh-design 成本估算等)
+
+
+def get_prices():
+    """价目表(元/百万 tokens,peak/offpeak 双价)。供成本估算/展示,与时段判定无关。"""
+    return dict(_PRICES)
 
 if _HAS_ZONEINFO:
     try:
