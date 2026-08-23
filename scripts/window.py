@@ -34,6 +34,7 @@ except Exception:  # Python <3.9 或无 tzdata 兜底(本机 3.11+,理论不走)
 
 _DIR = os.path.dirname(os.path.abspath(__file__))
 _CFG_PATH = os.environ.get("PRICING_CONFIG") or os.path.join(_DIR, "..", "config", "pricing.yaml")
+_SCHEMA_VERSION = 3  # pricing.yaml 的 version 主版本(与 config 文件内 version 字段对应)
 
 # 内置默认规则(v3,2026-08-23 官方确认)——仅在 config 缺失/解析失败时兜底
 _DEFAULT_PEAK = {
@@ -59,6 +60,10 @@ def _load_pricing():
     except Exception as e:
         raise RuntimeError(f"window: 计费配置读取失败({_CFG_PATH}): {e}") from e
     try:
+        version = cfg.get("version")
+        if version != _SCHEMA_VERSION:
+            raise ValueError(f"version={version!r} 不支持(当前 schema v{_SCHEMA_VERSION}); "
+                             f"请升级 window.py 或改回旧版本")
         peak = cfg["peak"]
         spans = tuple((int(a), int(b)) for a, b in peak["spans"])
         if not spans or any(not (0 <= a < b <= 23) for a, b in spans):
@@ -148,6 +153,23 @@ def next_peak_start(dt_utc):
     lo0 = _PEAK_SPANS[0][0]
     start = day.replace(hour=lo0 // 60, minute=lo0 % 60, second=0, microsecond=0)
     return start.astimezone(timezone.utc)
+
+
+def daypart_label(dt_utc):
+    """空闲窗口的时段标签(供 flowq 排队标注等):清晨/午间/晚间/周末。
+    由 config spans 推导(非硬编码):首 span 前=清晨,首 span 后-次 span 前=午间,
+    末 span 后=晚间;周末(weekday_only)=周末。peak 返回空串(调用方先判 peak)。"""
+    if window_kind(dt_utc) != "offpeak":
+        return ""
+    t = _cn_dt(dt_utc)
+    if _WEEKDAY_ONLY and t.weekday() >= 5:
+        return "周末"
+    m = t.hour * 60 + t.minute
+    if m < _PEAK_SPANS[0][0]:
+        return "清晨"
+    if len(_PEAK_SPANS) > 1 and m < _PEAK_SPANS[1][0]:
+        return "午间"
+    return "晚间"
 
 
 def window_state_line(dt_utc):

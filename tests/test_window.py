@@ -97,6 +97,53 @@ class WindowSuggestTests(unittest.TestCase):
             self.assertEqual(window.window_suggest(t, dt), expect, (t, dt))
 
 
+class WindowExtrasTests(unittest.TestCase):
+    """WN5:状态行/跨周末剩余/时段标签/价目——config 驱动断言(防回归)。"""
+
+    def test_WN5_state_line_formats(self):
+        """状态行:高峰/空闲/跨周末(周X)/长窗口(XdXh)格式。"""
+        wk = window._anchor_day(0)   # 未来周一
+        at = lambda h, m: wk.replace(hour=h, minute=m, tzinfo=window.TZ_CN).astimezone(timezone.utc)
+        # 高峰中:⛰️ 高峰 至 <末 span hi>
+        lo0, hi0 = window._SPANS[0]
+        self.assertIn("⛰️ 高峰", window.window_state_line(at(lo0 + 1, 0)))
+        # 午间空闲:🌙 空闲 至 今日 <hi0>
+        self.assertIn("🌙 空闲", window.window_state_line(at(hi0, 30)))
+        # 周末:显示周X(周一 09:00 或 首 span lo)而非「明日」
+        we = window._anchor_day(5)
+        line = window.window_state_line(
+            we.replace(hour=lo0 + 1, minute=0, tzinfo=window.TZ_CN).astimezone(timezone.utc))
+        self.assertIn("周一", line)
+
+    def test_WN5_offpeak_remaining_cross_weekend(self):
+        """周五晚间剩余秒数跨周末实算(到周一 09:00,非固定 18:00 起算)。"""
+        fr = window._anchor_day(4)   # 未来周五
+        lo0 = window._SPANS[0][0]
+        dt = fr.replace(hour=lo0 + 9, minute=30, tzinfo=window.TZ_CN).astimezone(timezone.utc)
+        rem = window.offpeak_remaining_sec(dt)
+        self.assertGreater(rem, 24 * 3600, "周五晚间剩余应 >24h(连周末到周一 09:00)")
+
+    def test_WN5_daypart_label(self):
+        """时段标签由 config spans 推导:清晨/午间/晚间/周末。"""
+        wk = window._anchor_day(0)
+        we = window._anchor_day(5)
+        lo0, hi0 = window._SPANS[0]
+        lo1, hi1 = window._SPANS[-1]
+        at = lambda d, h, m: d.replace(hour=h, minute=m, tzinfo=window.TZ_CN).astimezone(timezone.utc)
+        self.assertEqual(window.daypart_label(at(wk, 8, 30)), "清晨")
+        self.assertEqual(window.daypart_label(at(wk, hi0 + 1, 0)), "午间")
+        self.assertEqual(window.daypart_label(at(wk, hi1 + 1, 0)), "晚间")
+        if window._WEEKDAY_ONLY:
+            self.assertEqual(window.daypart_label(at(we, lo0 + 1, 0)), "周末")
+        self.assertEqual(window.daypart_label(at(wk, lo0 + 1, 0)), "")  # peak 空串
+
+    def test_WN5_get_prices(self):
+        """价目表暴露(config prices 段),与时段判定无关。"""
+        prices = window.get_prices()
+        self.assertIn("flash", prices)
+        self.assertIn("pro", prices)
+
+
 class WindowConsistencyTests(unittest.TestCase):
     """WN4:与 flowq 宿主同实现一致性(验收 7);flowq 缺失/未迁移公共模块时 skip。"""
 
