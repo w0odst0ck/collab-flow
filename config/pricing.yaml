@@ -1,0 +1,34 @@
+# =============================================================================
+# pricing.yaml —— DeepSeek 计费模式唯一真相源（公开仓，零个人标识）
+#
+# 定位：所有峰谷判定（window.py / flowq / flow-task / 文档）都从本文件读取，
+#       禁止在任何代码/文档里硬编码时段数字。改计费模式 = 只改本文件。
+#
+# 同步源：官方 https://api-docs.deepseek.com/zh-cn/quick_start/pricing
+#         脚注「高峰时段为北京时间周一至周五 9:00 - 12:00、14:00 - 18:00（其余为空闲时段）」
+# 验证：python3 scripts/window.py（selftest 从本文件自动生成时段边界用例）
+#
+# 注意：spans 用「本地时间（tz 字段）」，hours 为 0-23 整数闭区间起点；
+#       判定为 [lo, hi) 半开区间——hi 整点起即空闲。
+# =============================================================================
+
+version: 3                     # 配置 schema 主版本；window.py 拒绝未知主版本
+
+peak:
+  weekday_only: true           # 高峰仅限工作日（周六/周日全天谷价）
+  tz: Asia/Shanghai            # 时段判定时区（北京）
+  spans:                       # 高峰时段 [lo, hi)，本地时间
+    - [9, 12]
+    - [14, 18]
+
+# 价目（元/百万 tokens，缓存命中 ≈1/30）——仅供文档/成本估算参考，
+# 不参与 window.py 时段判定；dsh-design 成本估算仍走 DSH_DESIGN_PRICES env。
+prices:
+  flash:
+    input_miss: {peak: 3.0, offpeak: 1.5}
+    input_hit:  {peak: 0.10, offpeak: 0.05}
+    output:     {peak: 9.0, offpeak: 4.5}
+  pro:
+    input_miss: {peak: 9.0, offpeak: 4.5}
+    input_hit:  {peak: 0.30, offpeak: 0.15}
+    output:     {peak: 27.0, offpeak: 13.5}
