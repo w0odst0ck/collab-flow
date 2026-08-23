@@ -7,17 +7,15 @@
 行为:
   - 抓官方定价页 → 正则解析「高峰时段为北京时间周一至周五 9:00 - 12:00、14:00 - 18:00」
   - 与本地 config/pricing.yaml 的 peak 段对比
-  - 一致 → exit 0;不一致 → 打印差异 + exit 1(cron 侧据 exit code 推送)
+  - 一致 → exit 0;不一致 → 打印差异 + exit 1(改 config/pricing.yaml 后重跑即绿)
   - 网络/解析失败 → 打印原因 + exit 2(不误报:只提示「无法确认」)
 
-用法:
+用法(手动):
   python3 scripts/check-pricing.py                # 默认读 ../config/pricing.yaml
   PRICING_CONFIG=/path/pricing.yaml python3 ...   # 覆盖 config 路径
   python3 scripts/check-pricing.py --json         # 机器可读输出
 
-cron 建议(零 LLM,不受峰谷约束):工作日 09:05 每天一次(官方若改价多为工作日发布)
-  openclaw cron add check-pricing --cron "5 9 * * 1-5" --command \
-    "bash -lc 'python3 ~/.openclaw/workspace/projects/collab-flow/scripts/check-pricing.py || ~/.openclaw/workspace/scripts/feishu_push.py ...'"
+注:不做 cron 自动巡检——改价由用户主动告知,此脚本用于改价后自查/对账。
 """
 
 import argparse
