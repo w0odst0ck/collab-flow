@@ -195,6 +195,109 @@ class ReasonixWrapperTests(unittest.TestCase):
         self.assertNotIn("--pro", rec)
         self.assertEqual(self._result()["model"], "deepseek-v4-flash")
 
+    # ---- cost-opt-model-gating(B4): 显式 model: 声明 + 阈值 8000→16000 + --model 最优先 ----
+
+    def test_B4_declared_pro(self):
+        """正文首部独立行 `model: pro`(小字节)→ pro + --pro(显式声明 > 字节阈值)。"""
+        self._write_taskbook("model: pro\n# 小任务书\n")
+        p = self._run()
+        self.assertEqual(p.returncode, 0)
+        rec = self._record()
+        self.assertIn("RX_MODEL=deepseek-v4-pro", rec)
+        self.assertIn("<--pro>", rec)
+        self.assertEqual(self._result()["model"], "deepseek-v4-pro")
+
+    def test_B4_declared_flash_overrides_threshold(self):
+        """大字节 + `model: flash`(env 阈值压到 10 保证超阈)→ flash、不加 --pro(声明覆盖阈值)。"""
+        self._write_taskbook("model: flash\n# " + "x" * 20 + "\n")
+        p = self._run(extra={"RX_MODEL_PRO_THRESHOLD_BYTES": "10"})
+        self.assertEqual(p.returncode, 0)
+        rec = self._record()
+        self.assertIn("RX_MODEL=deepseek-v4-flash", rec)
+        self.assertNotIn("--pro", rec)
+        self.assertEqual(self._result()["model"], "deepseek-v4-flash")
+
+    def test_B4_threshold_fallback_pro(self):
+        """无声明 + 字节 >= 阈值(env 10)→ pro + --pro(字节阈值 fallback)。"""
+        self._write_taskbook("# " + "x" * 20 + "\n")
+        p = self._run(extra={"RX_MODEL_PRO_THRESHOLD_BYTES": "10"})
+        self.assertEqual(p.returncode, 0)
+        rec = self._record()
+        self.assertIn("RX_MODEL=deepseek-v4-pro", rec)
+        self.assertIn("<--pro>", rec)
+
+    def test_B4_cli_highest_priority(self):
+        """--model flash + 声明 `model: pro` → flash、无 --pro(CLI 最优先,覆盖声明)。"""
+        self._write_taskbook("model: pro\n# 小任务书\n")
+        p = self._run(model="deepseek-v4-flash")
+        self.assertEqual(p.returncode, 0)
+        rec = self._record()
+        self.assertIn("RX_MODEL=deepseek-v4-flash", rec)
+        self.assertNotIn("--pro", rec)
+
+    def test_B4_threshold_default_16000(self):
+        """无 env 阈值、无声明,9000 字节任务书 → flash(旧默认 8000 会误升 pro,锁死默认值变更)。"""
+        self._write_taskbook("# " + "x" * 8997 + "\n")  # 9000 字节 < 16000
+        p = self._run()
+        self.assertEqual(p.returncode, 0)
+        self.assertIn("RX_MODEL=deepseek-v4-flash", self._record())
+        self.assertEqual(self._result()["model"], "deepseek-v4-flash")
+
+    def test_B4_illegal_env_fallback_16000(self):
+        """RX_MODEL_PRO_THRESHOLD_BYTES=abc + 9000 字节 → flash(非法 env 回退 16000,非旧 8000)。"""
+        self._write_taskbook("# " + "x" * 8997 + "\n")  # 9000 字节 < 16000
+        p = self._run(extra={"RX_MODEL_PRO_THRESHOLD_BYTES": "abc"})
+        self.assertEqual(p.returncode, 0)
+        self.assertIn("RX_MODEL=deepseek-v4-flash", self._record())
+
+    def test_B4_declaration_from_flow_block(self):
+        """taskbook 含 ```flow 前置块,块内 `model: pro`(与 test_command 并存)→ pro + --pro。"""
+        self._write_taskbook(
+            "```flow\n"
+            "test_command: python3 -m unittest discover tests\n"
+            "model: pro\n"
+            "```\n"
+            "# 正文\n"
+        )
+        p = self._run()
+        self.assertEqual(p.returncode, 0)
+        rec = self._record()
+        self.assertIn("RX_MODEL=deepseek-v4-pro", rec)
+        self.assertIn("<--pro>", rec)
+
+    def test_B4_invalid_or_inline_not_matched(self):
+        """非法声明/正文内联示例均不匹配 → 回退字节阈值(小字节 → flash,不误升 pro、不 crash)。"""
+        cases = [
+            "model: foo\n# tb\n",            # 非法值
+            'model: "pro"\n# tb\n',          # 加引号
+            "示例：含 model: pro 的写法\n# tb\n",  # 正文内联,行首非 model:
+        ]
+        for tb in cases:
+            with self.subTest(tb=tb):
+                self._write_taskbook(tb)
+                p = self._run()
+                self.assertEqual(p.returncode, 0)
+                self.assertIn("RX_MODEL=deepseek-v4-flash", self._record())
+
+    def test_B4_first_declaration_wins(self):
+        """歧义:同时含 `model: pro` 与 `model: flash` → head -1 取首个(pro 在前 → pro)。"""
+        self._write_taskbook("model: pro\n# 正文\nmodel: flash\n")
+        p = self._run()
+        self.assertEqual(p.returncode, 0)
+        rec = self._record()
+        self.assertIn("RX_MODEL=deepseek-v4-pro", rec)
+        self.assertIn("<--pro>", rec)
+
+    def test_B4_threshold_boundary_16000_pro(self):
+        """字节数恰等于阈值 16000 → >= 严格比较 → 升 pro(边界锁死)。"""
+        self._write_taskbook("# " + "x" * 15997 + "\n")  # 恰 16000 字节
+        p = self._run()
+        self.assertEqual(p.returncode, 0)
+        rec = self._record()
+        self.assertIn("RX_MODEL=deepseek-v4-pro", rec)
+        self.assertIn("<--pro>", rec)
+        self.assertEqual(self._result()["model"], "deepseek-v4-pro")
+
 
 # ---------------------------------------------------------------------------
 # flow-core 增量(design §2.3.4):partial-complete 分支 + --model 解析透传

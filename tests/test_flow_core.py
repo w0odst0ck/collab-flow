@@ -16,3 +16,5 @@ _spec.loader.exec_module(_impl)
 StateMachineTests = _impl.StateMachineTests
 StoreTests = _impl.StoreTests
 AsyncDesignTests = _impl.AsyncDesignTests
+ChainHookTests = _impl.ChainHookTests
+ChainConfigTests = _impl.ChainConfigTests

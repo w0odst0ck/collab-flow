@@ -661,8 +661,13 @@ class SuggestWakeTests(LedgerIsoBase):
         now = datetime.now(timezone.utc)
         expect = window.window_suggest({"priority": "P2", "expected_seconds": 2400}, now)
         self.assertEqual(info["suggest_wake"], expect)
-        self.assertIn(info["suggest_wake"],
-                      ("立即", "现在可跑", "顺延18:00", "12:00 午间", "18:00 晚间"))
+        # 文案形态 ∈ window_suggest 决策表(动态「顺延今日 HH:MM」等,不穷举具体值;
+        # 精确一致性已由上一行 assertEqual 保证;ocr round2:旧固定集合不含动态形态,
+        # 随时间段变化会假失败)
+        self.assertRegex(
+            info["suggest_wake"],
+            r"^(立即|现在可跑|顺延(今日|明日|周[一二三四五六日]) \d{2}:\d{2}"
+            r"|\d{2}:\d{2} (午间|晚间))$")
 
 
 # ---------------------------------------------------------------------------

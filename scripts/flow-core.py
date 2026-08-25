@@ -19,6 +19,7 @@
 
 import fnmatch
 import json
+import math
 import os
 import re
 import secrets
@@ -33,6 +34,11 @@ try:
     import fcntl
 except ImportError:  # 非 POSIX 降级(§4.2)
     fcntl = None
+
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+if _SCRIPT_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPT_DIR)
+import window  # 公共窗口模块(flow-cost-ledger D1:唯一权威实现,零重复)
 
 # ---------------------------------------------------------------------------
 # 常量(§1.2/§2.1)
@@ -58,9 +64,38 @@ DEFECT_TYPES = (
 VERDICTS = ("pass", "reject", "takeover")
 ROUTES = ("design", "impl")
 
+# chain-on-transition §1.3:事件 → 钩子开关名(按 event 派发,不用 to-state;
+# verify_fail/feedback/takeover/accept/retro 显式无钩子,切断失败路径自动环)。
+CHAIN_HOOKS = {
+    "design": "on_designed",
+    "review": "on_reviewed",
+    "translate": "on_translated",
+    "execute": "on_executed",
+    "verify": "on_verified",
+}
+
+# 链递归深度守卫(§1.3 ②):_chain_depth 全局计数 + 上限防风暴
+CHAIN_MAX_DEPTH = 8
+_chain_depth = 0
+
+# executor-size-gating W-S1 §3.1:size 三档 + 硬编码兜底(config 缺失/损坏时
+# fail-safe,不 brick execute;与 _SEED_FALLBACK 同模式)。
+SIZE_TIERS = ("small", "medium", "large")
+SIZE_DEFAULTS = {
+    "small":  {"model": "deepseek-v4-flash", "timeout_s": 1200},
+    "medium": {"model": "deepseek-v4-flash", "timeout_s": 1800},
+    "large":  {"model": "deepseek-v4-pro",   "timeout_s": 2400},
+}
+SIZE_EST_DEFAULTS = {"design_bytes_large": 30720, "changed_files_large": 5}
+# 30KB = 30720 字节;>30720 或 >5 文件 → large(严格大于,边界见 W-S1 §7)
+
 
 class UsageError(Exception):
     """用法/前置错误(→ exit 2)。"""
+
+
+class GateReject(Exception):
+    """门禁拒绝(executor-size-gating W-S1 §3.4,fail-closed)。args=(error_code, 友好文案)。"""
 
 
 class WorkitemError(Exception):
@@ -791,6 +826,7 @@ def load_config():
     gates = dict(merged.get("gates") or {})
     executor = dict(merged.get("executor") or {})
     task = dict(merged.get("task") or {})  # flow-task-ledger:入队侧补参读取 default_priority/seed
+    chain = dict(merged.get("chain") or {})  # chain-on-transition:post-transition 钩子链
 
     # env 覆盖(§7.1):环境已设即覆盖
     ttl = _env_int("FLOW_LOCK_TTL_S")
@@ -809,7 +845,17 @@ def load_config():
     expected_s = _env_int("FLOW_DESIGN_EXPECTED_S")
     if expected_s is not None:
         workitem["design_expected_seconds"] = expected_s
-    return {"workitem": workitem, "gates": gates, "executor": executor, "task": task}
+    if os.environ.get("FLOW_CHAIN_DRY_RUN"):  # env 覆盖全局 dry-run(chain-on-transition §1.2)
+        chain["dry_run"] = _parse_bool(os.environ["FLOW_CHAIN_DRY_RUN"])
+    # chain 段校验(fail-closed,chain-on-transition §1.2/E1-E2)
+    if chain.get("on_designed") not in ("off", "auto_review"):
+        raise StoreError("chain.on_designed 必须是 off|auto_review")
+    for k in ("enabled", "on_reviewed", "on_translated", "on_executed", "on_verified",
+              "review_llm", "dry_run"):
+        if not isinstance(chain.get(k, False), bool):
+            raise StoreError(f"chain.{k} 必须是布尔")
+    return {"workitem": workitem, "gates": gates, "executor": executor,
+            "task": task, "chain": chain}
 
 
 def data_dir():
@@ -827,7 +873,9 @@ def actor(cfg):
 def resolve_wi_dir(wi_id, cfg):
     if not ID_RE.fullmatch(wi_id):
         raise UsageError(f"非法 id: {wi_id}")
-    max_len = int(cfg["workitem"].get("id_max_len", 64))
+    # ocr7-H1:W-B 的 load_task_config 配置只含 task/host/chain,无 workitem 段;
+    # 缺段 → 默认 64(不再 KeyError,W-B _read_wi_state_safe/_trigger_chain 可用)
+    max_len = int((cfg.get("workitem") or {}).get("id_max_len", 64))
     if len(wi_id) > max_len:
         raise UsageError(f"id 超长(>{max_len}): {wi_id}")
     wi_dir = os.path.join(workitems_dir(), wi_id)
@@ -848,6 +896,11 @@ def _do_transition(wi_dir, from_state, to, event, overrides, meta, cfg, force=Fa
     → save_status_atomic。from_state 为 None 时不校验前置状态(交由 transition 判定形状)。
     返回 {"ok": True, "from", "to", "event", "guard", "seq"} 或
          {"ok": False, "reason", "detail", "guard"}。
+
+    ocr F4:post-transition 钩子链(§1.3)不在本函数内执行——auto_review/auto_translate
+    的 LLM 子进程(timeout=120)与 auto_enqueue 的 task add 子进程(timeout=60)不得在
+    workitem 锁内运行(长链持锁数分钟,挡其他 workitem 操作);锁外触发统一由
+    _with_transition_hooks / _transition_with_hooks 负责。
     """
     status = load_status(wi_dir)
     now = now_dt()
@@ -884,6 +937,299 @@ def _do_transition(wi_dir, from_state, to, event, overrides, meta, cfg, force=Fa
             "guard": r["guard"], "seq": seq}
 
 
+def _with_transition_hooks(wi_dir, _do, cfg, holder=None):
+    """锁内执行 _do → 锁外跑 post-transition 钩子链(ocr F4:LLM/task add 不持锁)。
+
+    _do 在 with_workitem_lock 临界区内完成「读-判-转移-落盘」(调 _do_transition);
+    _do 返回转移结果 dict 时直接取用,返回退出码等非 dict 时由调用方经
+    holder["res"] 传出。转移成功且非 no_transition 时,释放锁后同步执行
+    _run_post_transition_hooks 并把输出注入 result["chain"]。返回 _do 的原返回值
+    (保持调用方退出码/结果契约)。"""
+    res = with_workitem_lock(wi_dir, _do)
+    tres = holder.get("res") if holder is not None else res
+    if isinstance(tres, dict) and tres.get("ok") and not tres.get("no_transition"):
+        chain_out = _run_post_transition_hooks(wi_dir, tres, cfg)
+        if chain_out is not None:
+            tres["chain"] = chain_out
+    return res
+
+
+def _transition_with_hooks(wi_dir, from_state, to, event, overrides, meta, cfg, force=False):
+    """hook 链内递归转移入口(ocr F4):自取 workitem 锁完成纯转移,锁外触发下一级
+    hook。cmd 路径由 _with_transition_hooks 在锁外统一跑链;hook 执行阶段锁已释放,
+    此处必须自取,保证「读-判-转移-落盘」串行化(与 cmd 路径同一把 .lock)。"""
+    def _do():
+        return _do_transition(wi_dir, from_state, to, event, overrides, meta, cfg,
+                              force=force)
+    return _with_transition_hooks(wi_dir, _do, cfg)
+
+
+def _update_chain_fail_count(wi_dir, fails, frozen=False, reset_frozen=False):
+    """锁内读-改-写 chain_fail_count/chain_frozen(ocr F4:hook 阶段已无锁,与转移
+    同一把 .lock 串行化,避免并发推进状态时旧快照覆盖 event_seq/state)。
+    ocr9b-M1:verify 成功路径 reset_frozen=True 时连同清除 chain_frozen(与
+    fail_count 一起重置),否则解冻后 auto_translate/auto_enqueue 仍因
+    chain_frozen bail out,链卡死。"""
+    def _do():
+        latest = load_status(wi_dir)
+        latest["chain_fail_count"] = fails
+        if frozen:
+            latest["chain_frozen"] = True
+        elif reset_frozen:
+            latest.pop("chain_frozen", None)
+        save_status_atomic(wi_dir, latest)
+        return latest
+    return with_workitem_lock(wi_dir, _do)
+
+
+# ---------------------------------------------------------------------------
+# chain-on-transition 框架(§1.3):dispatch / audit / notify / dry-run / graceful
+# ---------------------------------------------------------------------------
+
+def _json_safe(v):
+    """audit 载荷 JSON 安全化:非 JSON 可序列化值(异常等)repr 兜底。"""
+    if v is None or isinstance(v, (str, int, float, bool)):
+        return v
+    if isinstance(v, (list, tuple)):
+        return [_json_safe(x) for x in v]
+    if isinstance(v, dict):
+        return {str(k): _json_safe(x) for k, x in v.items()}
+    return repr(v)
+
+
+def audit_chain(wi_dir, action, *, input=None, output=None, result=None,
+                error=None, dry_run=False):
+    """所有自动动作落盘 <wi_dir>/events/audit.jsonl(§1.3 ③)。
+
+    flock + seq=行数+1(复用 append_event 临界区写法);dry_run=True 零写入。
+    E17:写失败 best-effort(不抛,不阻塞钩子)。
+    """
+    if dry_run:
+        return {"schema_version": 1, "ts": now_iso(), "action": action,
+                "input": _json_safe(input), "output": _json_safe(output),
+                "result": _json_safe(result), "error": error, "dry_run": True,
+                "would_write": [action]}
+    path = os.path.join(wi_dir, "events", "audit.jsonl")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    rec = {"schema_version": 1, "ts": now_iso(), "action": action,
+           "input": _json_safe(input), "output": _json_safe(output),
+           "result": _json_safe(result), "error": error, "dry_run": False}
+    fd = os.open(path + ".lock", os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        if fcntl is not None and hasattr(fcntl, "flock"):
+            fcntl.flock(fd, fcntl.LOCK_EX)
+        rec["seq"] = count_lines(path) + 1  # 读取行数 + 追加 同一临界区
+        line = json.dumps(rec, ensure_ascii=False, separators=(",", ":")) + "\n"
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(line)
+            f.flush()
+            os.fsync(f.fileno())
+    except OSError:  # E17:audit 写失败 best-effort,钩子继续
+        pass
+    finally:
+        if fcntl is not None and hasattr(fcntl, "flock"):
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+    return rec
+
+
+# 通知命令模板白名单(§1.3 ④,仿 FLOW_WORKITEM_RE 模式):模板按 shlex 拆成
+# 「命令 + 参数」token 列表,任一 token 含 shell 元字符(管道/重定向/分号/子 shell/
+# 引号/通配/变量展开等) → 拒绝;payload 始终经 stdin 传入,绝不拼进 shell 串
+# (ocr M1:防 chain.notify 配置注入任意代码执行)。
+# ocr F4:校验范围 \x00-\x20 → \x00-\x1f——空格(0x20)是合法 token 分隔符,
+# shlex.split 已正确处理空格与引号(/usr/local/bin/notify.sh、引号参数 "hello world"),
+# 只禁控制字符(可隐藏进 argv 的 \x00-\x1f)。
+_SHELL_META_RE = re.compile(r"[\x00-\x1f|&;<>()$`\"'\\!*?\[\]{}~#]")
+# ocr F4:空格放行后,字符层面无法区分「sh -c 'echo x'」子 shell 包装与普通含空格
+# 参数(/usr/local/bin/notify.sh --msg 'hello world');按解释器名 fail-closed 补拒:
+# argv 任一位置出现 shell 解释器且其后跟含 c 的短标志参数(容忍 -- 分隔)→ 任意
+# 命令字符串可被重新解释执行(防注入回归 C29,含 env sh -c / sh -- -c / bash -lc
+# / busybox sh -c 变体)。
+# ocr5-M2:裸解释器(无 -c 也无脚本文件参数)同样构成注入面——payload 经 stdin
+# 传入时,裸 sh/bash/python 会把 stdin 当脚本执行(如通知 body 含 $(...) 即被
+# 重新解释);故「命令位置」的解释器缺脚本参数 → 一并拒绝。参数位置的解释器名
+# (如 notify --mode sh)只是普通字符串,不构成 wrapper,不误伤。
+# ocr6-F2:黑名单不只 shell——node/deno/ruby/perl/php/awk/sed/lua/julia/R 等
+# 解释器同样能从 stdin 读取代码执行(裸解释器 + -c 类包装),是 shell-wrapper
+# 注入的等价绕过面;统一并入 _SCRIPT_INTERP_RE fail-closed,含 python 版本变体
+# (python3.12 等)与 pypy3/luajit/Rscript/tclsh/wish/bun 常见解释器。
+_SCRIPT_INTERP_RE = re.compile(
+    r"(?:^|/)(?:sh|bash|dash|zsh|ksh|csh|tcsh|python[0-9.]*|pypy[0-9]*|"
+    r"node|deno|bun|ruby|perl|php|awk|sed|lua|luajit|julia|R|Rscript|tclsh|wish)$")
+
+
+# ocr9-F3:env 带值选项——值以单独 token(-u NAME/-C DIR)或以 --opt=VALUE 形式
+# 出现,值同样不可能是命令,须连同值一起跳过;否则「env -u FOO node」会把 "FOO"
+# 误判为命令位置,绕过裸解释器拦截(把 payload 经 stdin 喂给 node/python3 执行)。
+_ENV_VALUE_OPTS = ("-u", "--unset", "-C", "--chdir")
+
+
+def _cmd_slot(argv):
+    """命令位置:argv[0];或 env(含绝对路径 /usr/bin/env)前缀后的首个非 flag/非
+    赋值 token。仅命令位置的解释器才构成「shell wrapper 注入面」。无 → None。
+    ocr9-F3:env 带值选项(-u/--unset/-C/--chdir)连同值跳过;尊重 -- 分隔符
+    (-- 之后首个 token 即命令,不再解释选项)。"""
+    if argv and argv[0] != "env" and not argv[0].endswith("/env"):
+        return 0
+    n = len(argv)
+    k = 1
+    while k < n:
+        tok = argv[k]
+        if tok == "--":
+            return k + 1 if k + 1 < n else None   # -- 之后首个 token 即命令
+        if "=" in tok:                             # NAME=val 赋值 / --unset=FOO / --chdir=DIR
+            k += 1
+            continue
+        if tok in _ENV_VALUE_OPTS:                 # -u NAME / -C DIR 等:值在下一 token
+            k += 2
+            continue
+        if tok.startswith("-"):                    # 其它 flag(-i/-0/...)
+            k += 1
+            continue
+        return k
+    return None
+
+
+def _notify_argv(tmpl):
+    """notify 模板 → argv 白名单解析;非法模板/含 shell 元字符 → None(调用方拒绝执行)。"""
+    if not isinstance(tmpl, str) or not tmpl.strip():
+        return None
+    try:
+        argv = shlex.split(tmpl)
+    except ValueError:                                   # 引号未闭合等 → fail-closed
+        return None
+    if not argv:
+        return None
+    if any(_SHELL_META_RE.search(tok) for tok in argv):  # 拒绝 shell 元字符/管道/重定向
+        return None
+    # ocr9-F3:env -S/--split-string 会把紧随其后的字符串重切成新 argv,argv 层
+    # 检查(拆出的 token 含空格、非解释器名)不可靠,直接 fail-closed 拒绝。
+    if any(tok == "-S" or tok == "--split-string" or tok.startswith("--split-string=")
+           for tok in argv):
+        return None
+    for i, tok in enumerate(argv):
+        if not _SCRIPT_INTERP_RE.search(tok):
+            continue                                    # search:含 /sh、/bash 等结尾均命中
+        j = i + 1
+        saw_c = False
+        while j < len(argv) and argv[j].startswith("-"):
+            if argv[j] == "--":                         # sh -- -c 'x' 变体
+                j += 1
+                continue
+            if re.match(r"^-.*c", argv[j]):             # -c / -lc / -ec / 组合前位
+                saw_c = True
+                break
+            j += 1
+        if saw_c:
+            return None                                 # 子 shell 包装(sh -e -c '...' 等)
+    cmd_i = _cmd_slot(argv)
+    if cmd_i is not None and _SCRIPT_INTERP_RE.search(argv[cmd_i]):
+        j = cmd_i + 1
+        while j < len(argv) and argv[j].startswith("-"):
+            if argv[j] == "--":                         # sh -- 'x' 变体
+                j += 1
+                continue
+            if re.match(r"^-.*c", argv[j]):             # 已由上一循环拦截,防御性
+                return None
+            j += 1
+        if j >= len(argv):
+            return None                                 # 裸解释器(stdin 即脚本,ocr5-M2)
+    return argv
+
+
+def notify_chain(wi_dir, cfg, title, body, meta=None, dry_run=False):
+    """推送(§1.3 ④):chain.notify 非空时,把通知 JSON 经 stdin 喂给命令。
+
+    模板白名单化为「命令 + 参数」argv(ocr M1):含 shell 元字符/管道/重定向 → 拒绝,
+    payload 经 stdin 传入,不跑任意 shell 模板。best-effort(E19):命令不可调用/
+    非零退出/超时 → 仅 stderr 告警,不抛。dry_run=True → 零写入契约(ocr F2)。
+    """
+    if dry_run:
+        return
+    chain = cfg.get("chain") or {}
+    tmpl = chain.get("notify")
+    if not tmpl:
+        return
+    argv = _notify_argv(tmpl)
+    if argv is None:
+        print(f"chain notify 模板被拒(非法/含 shell 元字符): {tmpl!r}", file=sys.stderr)
+        return
+    if isinstance(meta, dict) and "event" in meta:
+        meta = dict(meta)
+        meta.pop("event", None)
+    payload = {"title": title, "body": body, "meta": meta}
+    try:  # best-effort:status 缺失时仍推送(E19 不阻塞)
+        st = load_status(wi_dir)
+        payload["workitem"] = st.get("id")
+        payload["state"] = st.get("state")
+    except Exception:  # noqa: BLE001, S110
+        pass
+    text = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    try:
+        proc = subprocess.run(argv, input=text, capture_output=True,  # noqa: PLW1510
+                              text=True, timeout=60)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        print(f"chain notify 失败: {e}", file=sys.stderr)
+        return
+    if proc.returncode != 0:
+        tail = ((proc.stderr or "") + (proc.stdout or "")).strip()[-200:]
+        print(f"chain notify 失败(rc={proc.returncode}): {tail}", file=sys.stderr)
+
+
+def _run_post_transition_hooks(wi_dir, res, cfg):
+    """转移后钩子链分发入口(§1.3 ①):_do_transition 落盘成功后、返回前调用。
+
+    - chain.enabled=false → 首行返回,零钩子、零 audit、零新增文件(完全退化)
+    - 事件不在 CHAIN_HOOKS(verify_fail 等) → 不派发(切断失败路径自动环)
+    - on_designed=off → 仅 notify「待 review」,不 audit 不写盘
+    - 递归深度 ≥ max_depth → audit chain_depth_exceeded 后停止(防风暴)
+    - 钩子内异常被各自 try/except 吞掉,不向 _do_transition 冒泡
+    - dry_run=True 时返回 {"dry_run": True, "hook": ..., "would_write": [...]} 供
+      cmd_transition --json 透出;其余情况返回 None(不改变既有返回形状)
+    """
+    chain = cfg.get("chain") or {}
+    if not chain.get("enabled"):
+        return None  # 完全退化
+    event = res.get("event")
+    hook = CHAIN_HOOKS.get(event)
+    if hook is None:
+        return None  # verify_fail/feedback/takeover/accept/retro 无钩子
+    dry_run = bool(chain.get("dry_run"))
+    global _chain_depth
+    try:  # 配置非法值不崩溃(fail-safe 用默认上限)
+        max_depth = int(chain.get("max_depth", CHAIN_MAX_DEPTH))
+    except (TypeError, ValueError):
+        max_depth = CHAIN_MAX_DEPTH
+    if _chain_depth >= max_depth:
+        audit_chain(wi_dir, "chain_depth_exceeded", input=res,
+                    error="递归深度超限", dry_run=dry_run)
+        return None
+    spec = chain.get(hook)
+    if hook == "on_designed" and spec == "off":
+        # 默认:仅推送「待 review」提醒,不写 decision.yaml、不 audit
+        notify_chain(wi_dir, cfg, "design_done", "design 完成待 review",
+                     {"event": event}, dry_run=dry_run)
+        return None
+    if spec is False or spec is None:
+        return None
+    _chain_depth += 1
+    try:
+        out = HOOK_IMPL[hook](wi_dir, cfg, dry_run)
+    except Exception as e:  # 钩子顶层兜底(双保险;钩子内部已有 try/except)  # noqa: BLE001
+        audit_chain(wi_dir, f"{hook}_error", input=res,
+                    error=f"{type(e).__name__}: {e}", dry_run=dry_run)
+        out = None
+    finally:
+        _chain_depth -= 1
+    if dry_run:
+        would_write = []
+        if isinstance(out, dict) and isinstance(out.get("would_write"), list):
+            would_write = out["would_write"]
+        return {"dry_run": True, "hook": hook, "would_write": would_write}
+    return None
+
+
 def _atomic_write(path, text):
     """原子写(P3):temp + fsync + os.replace,读方永不观察半写。"""
     tmp = f"{path}.tmp.{os.getpid()}.{secrets.token_hex(4)}"
@@ -904,6 +1250,129 @@ def _atomic_write(path, text):
 def workdir():
     """执行面工作目录(§P3 §2.1):FLOW_WORKDIR 可覆盖,默认 cwd(项目仓根)。"""
     return os.environ.get("FLOW_WORKDIR") or os.getcwd()
+
+
+# ---------------------------------------------------------------------------
+# executor-size-gating W-S1 §3:size 解析 / size→(model,timeout) 映射 / 门禁
+# ---------------------------------------------------------------------------
+
+def _design_bytes(wi_dir):
+    """design.md 字节数(§3.2);缺失/不可读 → 0(不抛)。"""
+    path = os.path.join(wi_dir, "design.md")
+    try:
+        return os.path.getsize(path)
+    except OSError:
+        return 0
+
+
+def _changed_files(wi_dir):
+    """改动文件数(§3.2):design.md 声明的 diff_scope.allow / 改动清单长度;失败 → 0。"""
+    try:
+        return len(extract_change_list(wi_dir))
+    except Exception:  # noqa: BLE001
+        return 0  # 估算容错:任何解析失败按 0 处理(仅字节尺子)
+
+
+def resolve_size(wi_dir, cfg):
+    """size 判定(§3.2):taskbook ```flow 块声明优先,缺失 → 按 design.md 字节 +
+    改动文件数估算(>30KB 或 >5 文件 → large,否则 medium;永不自动降 small)。
+    声明值非法 → GateReject("invalid_size") fail-closed。"""
+    fb = parse_flow_block(wi_dir)
+    declared = (fb or {}).get("size") if isinstance(fb, dict) else None
+    if declared is not None:
+        if declared not in SIZE_TIERS:
+            raise GateReject("invalid_size",
+                             f"size={declared!r} 非 small|medium|large(fail-closed)")
+        return {"size": declared, "source": "declared",
+                "design_bytes": _design_bytes(wi_dir),
+                "changed_files": _changed_files(wi_dir)}
+    est = (cfg.get("executor") or {}).get("size_estimate") or SIZE_EST_DEFAULTS
+    try:  # config 段损坏 → 硬编码兜底(fail-safe)
+        db_large = int(est.get("design_bytes_large",
+                               SIZE_EST_DEFAULTS["design_bytes_large"]))
+        cf_large = int(est.get("changed_files_large",
+                               SIZE_EST_DEFAULTS["changed_files_large"]))
+    except (TypeError, ValueError):
+        db_large = SIZE_EST_DEFAULTS["design_bytes_large"]
+        cf_large = SIZE_EST_DEFAULTS["changed_files_large"]
+    db = _design_bytes(wi_dir)
+    cf = _changed_files(wi_dir)
+    if db > db_large or cf > cf_large:
+        return {"size": "large", "source": "estimated",
+                "design_bytes": db, "changed_files": cf}
+    return {"size": "medium", "source": "estimated",
+            "design_bytes": db, "changed_files": cf}
+
+
+def executor_params_for(size, cfg):
+    """size → {model, timeout_s}(§3.3):config executor.size.<tier> 可配;
+    段缺失/值非法 → 硬编码 SIZE_DEFAULTS 兜底(fail-safe)。"""
+    raw = ((cfg.get("executor") or {}).get("size") or {}).get(size)
+    tier = raw if isinstance(raw, dict) else {}
+    tier = tier or SIZE_DEFAULTS[size]
+    model = tier.get("model") or SIZE_DEFAULTS[size]["model"]
+    try:
+        timeout = int(tier.get("timeout_s"))
+    except (TypeError, ValueError):
+        timeout = SIZE_DEFAULTS[size]["timeout_s"]
+    if timeout <= 0:
+        timeout = SIZE_DEFAULTS[size]["timeout_s"]
+    return {"model": model, "timeout_s": timeout}
+
+
+def resolve_execute_params(wi_dir, cfg, cli_model=None, cli_timeout=None,
+                           force=False, force_reason=None, cli_size=None):
+    """execute 参数合并 + 门禁(§3.4 核心,纯判定;仅 resolve_size 触 I/O)。
+
+    模型/超时机器强制:size==large 且显式降级(--model ≠ pro / --timeout < 2400)
+    → 无 --force → GateReject("size_gate");--force 但缺非空 --force-reason →
+    GateReject("force_reason_required")。返回
+    {size, source, model, timeout_s, design_bytes, changed_files}。
+    ocr7-M6:cli_size 非 None(内部 --size,async 入队固化值)→ 跳过 resolve_size
+    重算,保证与预解析一致(design.md 增长/改动清单变化不再使档位漂移);
+    source 视为显式声明。"""
+    if cli_size is not None:
+        if cli_size not in SIZE_TIERS:
+            raise GateReject("invalid_size",
+                             f"size={cli_size!r} 非 small|medium|large(fail-closed)")
+        size_info = {"size": cli_size, "source": "declared",
+                     "design_bytes": _design_bytes(wi_dir),
+                     "changed_files": _changed_files(wi_dir)}
+    else:
+        size_info = resolve_size(wi_dir, cfg)
+    size = size_info["size"]
+    base = executor_params_for(size, cfg)
+
+    if cli_timeout is not None:
+        try:
+            timeout = int(cli_timeout)
+        except (TypeError, ValueError):
+            raise UsageError(f"非法 --timeout: {cli_timeout}")
+        if timeout <= 0:
+            raise UsageError(f"--timeout 必须是正整数: {timeout}")
+    else:
+        timeout = base["timeout_s"]
+
+    if cli_model is not None and cli_model == "":
+        raise UsageError("--model 不能为空")
+    model = cli_model if cli_model else base["model"]
+
+    # ── 门禁(仅 large 且降级触发)──
+    downgrade = (size == "large" and (
+        (cli_model is not None and cli_model != base["model"]) or
+        (cli_timeout is not None and timeout < base["timeout_s"])))
+    if downgrade and not force:
+        raise GateReject("size_gate",
+                         f"size=large 强制 {base['model']} / ≥{base['timeout_s']}s;"
+                         "显式降级需 --force --force-reason")
+    if downgrade and force and not (force_reason and str(force_reason).strip()):
+        raise GateReject("force_reason_required",
+                         "size=large 降级需 --force 并附 --force-reason(审计理由)")
+
+    return {"size": size, "source": size_info["source"],
+            "model": model, "timeout_s": timeout,
+            "design_bytes": size_info.get("design_bytes"),
+            "changed_files": size_info.get("changed_files")}
 
 
 # ---------------------------------------------------------------------------
@@ -1250,6 +1719,90 @@ def _write_verify_md(wi_dir, verify):
     _atomic_write(os.path.join(wi_dir, "verify.md"), "".join(lines))
 
 
+def run_verify_auto_core(wi_id, wi_dir, opts, cfg, dry_run=False):
+    """verify --auto 核心(chain-on-transition §1.4.4 纯重构):CLI 与 on_executed 钩子共用。
+
+    读 result.json/diff.patch → tests → diff scope → error table → 组装 verify
+    → 写 executor/verify.json + verify.md(dry_run=True 时跳过写盘)。
+    返回 {"ok", "gate_pass", "route", "tests_result", "diff_result",
+          "errors_result", "verify", "error"}:
+      ok=False 时 error 为缺失/损坏原因(fail-closed;CLI 映射 exit 2,
+      钩子降级 audit+notify 不转移,E13)。
+    本函数不重新加锁、不转移(调用方已在 with_workitem_lock 临界区)。
+    """
+    result_path = os.path.join(wi_dir, "executor", "result.json")
+    diff_path = os.path.join(wi_dir, "executor", "diff.patch")
+    if not os.path.isfile(result_path):
+        return {"ok": False, "error": "executor/result.json 缺失"}
+    if not os.path.isfile(diff_path):
+        return {"ok": False, "error": "executor/diff.patch 缺失"}
+    try:
+        result = json.loads(read_file(result_path))
+    except (ValueError, OSError) as e:
+        return {"ok": False, "error": f"executor/result.json 损坏: {e}"}
+    if not isinstance(result, dict):
+        return {"ok": False, "error": "executor/result.json 顶层必须是映射"}
+
+    wdir = workdir()
+
+    # 1) tests(§4.1)
+    tc = resolve_test_command(wi_dir, wdir, cli_command=opts.get("test-command"), result=result)
+    if tc["command"] is None:
+        tests_result = {"pass": False, "command": None, "exit_code": None,
+                        "output_tail": "", "reason": "command_unresolved", "source": None}
+    else:
+        run = _run_tests(wdir, tc["command"])
+        tests_result = {"pass": run["pass"], "command": tc["command"],
+                        "exit_code": run.get("exit_code"), "output_tail": run.get("output_tail", ""),
+                        "reason": run.get("reason"), "source": tc["source"]}
+    tests_pass = tests_result["pass"]
+
+    # 2) diff(§4.2)
+    try:
+        diff_result = check_diff_scope(wi_dir, result, cli_scope_file=opts.get("scope"))
+    except (UsageError, StoreError) as e:
+        return {"ok": False, "error": str(e)}
+    diff_match = diff_result["match"]
+
+    # 3) errors(§4.3)
+    errors_result = check_error_table(wi_dir)
+    error_table_match = errors_result["match"]
+
+    gate_pass = tests_pass and diff_match and error_table_match
+
+    # 4) route 推导(§4.4)
+    route = opts.get("route")
+    if route is None and not gate_pass:
+        route = _derive_route(tests_result, diff_result, errors_result)
+
+    # 5) 组装 verify;dry_run 时不写盘(§1.3 ⑤ 零写入)
+    verify = {"schema_version": 1, "tests_pass": tests_pass, "diff_match": diff_match,
+              "error_table_match": error_table_match, "route": route if not gate_pass else None,
+              "checked_at": now_iso(),
+              "details": {
+                  "tests": {"command": tests_result.get("command"), "exit_code": tests_result.get("exit_code"),
+                            "output_tail": tests_result.get("output_tail", ""),
+                            "reason": tests_result.get("reason"), "source": tests_result.get("source")},
+                  "diff": {"scope_verdict": diff_result["scope_verdict"],
+                           "out_of_scope": diff_result["out_of_scope"],
+                           "changed_files": diff_result["changed_files"],
+                           "allow": diff_result["allow"], "deny": diff_result["deny"],
+                           "reason": diff_result["reason"]},
+                  "error_table": {"total": errors_result["total"], "covered": errors_result["covered"],
+                                  "uncovered": errors_result["uncovered"],
+                                  "human_review": errors_result["human_review"],
+                                  "reason": errors_result["reason"]},
+              }}
+    if not dry_run:
+        os.makedirs(os.path.join(wi_dir, "executor"), exist_ok=True)
+        _atomic_write(os.path.join(wi_dir, "executor", "verify.json"),
+                      json.dumps(verify, ensure_ascii=False, separators=(",", ":")))
+        _write_verify_md(wi_dir, verify)
+    return {"ok": True, "gate_pass": gate_pass, "route": route,
+            "tests_result": tests_result, "diff_result": diff_result,
+            "errors_result": errors_result, "verify": verify}
+
+
 # ---------------------------------------------------------------------------
 # 输出辅助
 # ---------------------------------------------------------------------------
@@ -1420,6 +1973,8 @@ def cmd_transition(args, cfg):
         raise UsageError(f"非法目标状态: {to}")
     wi_dir = resolve_wi_dir(wi_id, cfg)
 
+    holder = {}                       # ocr F4:_do 返回退出码,_do_transition 结果经此传出供锁外 hook
+
     def _do():
         status = load_status(wi_dir)
         now = now_dt()
@@ -1435,6 +1990,7 @@ def cmd_transition(args, cfg):
         if opts.get("approve"):
             overrides["approve_confirmed"] = True
         res = _do_transition(wi_dir, from_state, to, ev, overrides, {}, cfg, force=force)
+        holder["res"] = res
         if not res["ok"]:
             if res["reason"].startswith("guard_failed:"):
                 if json_mode:
@@ -1444,21 +2000,30 @@ def cmd_transition(args, cfg):
                     print(f"错误: {res['reason']} ({res.get('detail')})", file=sys.stderr)
                 return 1
             return fail(2, res["reason"], res.get("detail"), json_mode)
-        if json_mode:
-            emit({"status": "ok", "id": wi_id, "from": res["from"], "to": res["to"],
-                  "event": res["event"], "guard": res["guard"], "event_seq": res["seq"]})
-        else:
-            print(f"{wi_id}: {res['from']} → {res['to']} (event={res['event']}, guard={res['guard']}, seq={res['seq']})")
         return 0
 
     try:
-        return with_workitem_lock(wi_dir, _do)
+        code = _with_transition_hooks(wi_dir, _do, cfg, holder)
     except Locked as e:
         return fail(2, f"锁被他人持有: {e}", None, json_mode)
     except UsageError as e:
         return fail(2, str(e), None, json_mode)
     except StoreError as e:
         return fail(2, str(e), None, json_mode)
+    if code == 0:
+        # ocr F4:成功分支输出移到锁外——chain 由 _with_transition_hooks 在
+        # 锁外注入 holder["res"],此处才能透出 dry-run 摘要(修复前 emit 在 _do
+        # 内,res.get("chain") 恒假)
+        res = holder["res"]
+        if json_mode:
+            obj = {"status": "ok", "id": wi_id, "from": res["from"], "to": res["to"],
+                   "event": res["event"], "guard": res["guard"], "event_seq": res["seq"]}
+            if res.get("chain"):  # chain-on-transition §1.3 ⑤:dry-run 摘要透出
+                obj["chain"] = res["chain"]
+            emit(obj)
+        else:
+            print(f"{wi_id}: {res['from']} → {res['to']} (event={res['event']}, guard={res['guard']}, seq={res['seq']})")
+    return code
 
 
 def cmd_list(args, cfg):
@@ -1996,7 +2561,7 @@ def _cmd_design_check(wi_id, wi_dir, json_mode, cfg):
         return _do_transition(wi_dir, "created", "designed", "design", {}, meta, cfg)
 
     try:
-        res = with_workitem_lock(wi_dir, _do)
+        res = _with_transition_hooks(wi_dir, _do, cfg)
     except Locked as e:
         return fail(2, f"锁被他人持有: {e}", None, json_mode)
     if not res["ok"]:
@@ -2204,7 +2769,7 @@ def cmd_design(args, cfg):
         return _do_transition(wi_dir, "created", "designed", "design", {}, meta, cfg, force=force)
 
     try:
-        res = with_workitem_lock(wi_dir, _do)
+        res = _with_transition_hooks(wi_dir, _do, cfg)
     except Locked as e:
         return fail(2, f"锁被他人持有: {e}", None, json_mode)
     if not res["ok"]:
@@ -2222,7 +2787,7 @@ def cmd_design(args, cfg):
 
 
 def cmd_execute(args, cfg):
-    pos, opts = scan_args(args, {"executor", "timeout", "model"})
+    pos, opts = scan_args(args, {"executor", "timeout", "model", "force-reason", "size"})
     if not pos:
         raise UsageError("execute 缺少 <id>")
     wi_id = pos[0]
@@ -2230,6 +2795,7 @@ def cmd_execute(args, cfg):
         raise UsageError("execute 多余参数")
     json_mode = bool(opts.get("json"))
     force = bool(opts.get("force"))
+    force_reason = opts.get("force-reason")
     sync_mode = bool(opts.get("sync"))
     executor_name = opts.get("executor") or cfg["executor"].get("default", "reasonix")
     wi_dir = resolve_wi_dir(wi_id, cfg)
@@ -2245,23 +2811,22 @@ def cmd_execute(args, cfg):
         return fail(2, "需要 git", None, json_mode)
 
     try:
-        spec = load_executor_spec(executor_name)
+        load_executor_spec(executor_name)  # os/sandbox/binary 校验不变(W-S1 §6.1)
     except StoreError as e:
         return fail(2, str(e), None, json_mode)
 
-    if opts.get("timeout") is not None:
-        try:
-            timeout = int(opts["timeout"])
-        except ValueError:
-            return fail(2, f"非法 --timeout: {opts['timeout']}", None, json_mode)
-        if timeout <= 0:
-            return fail(2, f"--timeout 必须是正整数: {timeout}", None, json_mode)
-    else:
-        timeout = int(spec["invoke"].get("timeout_s", 1800))
-
-    model = opts.get("model")
-    if model is not None and not model:
-        return fail(2, "--model 不能为空", None, json_mode)
+    # W-S1 §6.1:模型/超时由 size 判定机器强制(spec.invoke.timeout_s 不再作 execute 默认)
+    try:
+        params = resolve_execute_params(wi_dir, cfg,
+                                        cli_model=opts.get("model"),
+                                        cli_timeout=opts.get("timeout"),
+                                        force=force, force_reason=force_reason,
+                                        cli_size=opts.get("size"))
+    except GateReject as e:
+        return fail(2, e.args[0], e.args[1], json_mode)
+    except UsageError as e:
+        return fail(2, str(e), None, json_mode)
+    model, timeout = params["model"], params["timeout_s"]
 
     out_dir = os.path.join(wi_dir, "executor")
     os.makedirs(out_dir, exist_ok=True)
@@ -2271,13 +2836,24 @@ def cmd_execute(args, cfg):
 
     if not sync_mode:
         # ── M2 默认 async-first:入队后台(命令串 = flow 绝对路径 + --sync 子命令) ──
-        # 外层 expected-seconds = timeout+115(≥ 内层执行器 timeout + wrapper 缓冲,防抢先杀)
+        # W-S1:已解析 model/timeout/force 固化进命令串(门禁幂等,重执行同值重解析)
+        # ocr7-M6:同时固化 --size——子进程重执行时跳过 resolve_size 重算,保证
+        # 与预解析一致(design.md 增长/改动清单变化不再使档位漂移触发误 gate)
+        force_args = ["--force"] if force else []
+        if force and force_reason:
+            force_args += ["--force-reason", force_reason]
+        # ocr7-M4:含空白的 force_reason 无法经 FLOW_WORKITEM_RE 白名单(每选项只
+        # 吃一个无空白 token),此前静默入队 → 任务 failed;显式拒绝并提示换 --sync
+        if force and force_reason and any(c.isspace() for c in str(force_reason)):
+            return fail(2, "--force-reason 含空白字符: async 入队命令串白名单"
+                          "(FLOW_WORKITEM_RE) 不支持多词值,会静默入队失败;"
+                          "请去掉空格或改用 --sync 同步执行", None, json_mode)
         return _enqueue_workitem_op(
             cfg, "execute", wi_id,
             ["workitem", "execute", wi_id, "--sync", "--executor", executor_name,
-             "--timeout", str(timeout)]
-            + (["--model", model] if model else [])
-            + (["--force"] if force else []) + ["--json"],
+             "--size", params["size"],
+             "--timeout", str(timeout), "--model", model]
+            + force_args + ["--json"],
             "execute", json_mode, status["state"], timeout=timeout)
 
     # 调 wrapper(执行器子进程运行期间不持 workitem 锁)
@@ -2303,7 +2879,14 @@ def cmd_execute(args, cfg):
     if st == "ok" and not os.path.isfile(os.path.join(out_dir, "diff.patch")):
         return fail(2, "executor/diff.patch 缺失", None, json_mode)
     if st == "ok":
-        meta = {"executor": executor_name, "duration_s": result.get("duration_s")}
+        # W-S1 §6.4:size/source/model/timeout_s 落账(审计,增量字段)
+        meta = {"executor": executor_name, "duration_s": result.get("duration_s"),
+                "size": params["size"], "source": params["source"],
+                "model": params["model"], "timeout_s": params["timeout_s"]}
+        # ocr7-M4:force_reason 持久化(size-gate 强制非空理由「供审计」,不能校验后
+        # 丢)——随 transition meta 落 events 事件,审计可追溯
+        if force_reason and str(force_reason).strip():
+            meta["force_reason"] = str(force_reason)
 
         def _do():
             s = load_status(wi_dir)
@@ -2313,7 +2896,7 @@ def cmd_execute(args, cfg):
             return _do_transition(wi_dir, "translated", "executed", "execute", {}, meta, cfg, force=force)
 
         try:
-            res = with_workitem_lock(wi_dir, _do)
+            res = _with_transition_hooks(wi_dir, _do, cfg)
         except Locked as e:
             return fail(2, f"锁被他人持有: {e}", None, json_mode)
         if not res["ok"]:
@@ -2357,73 +2940,18 @@ def _cmd_verify_auto(wi_id, wi_dir, opts, json_mode, cfg):
     status = load_status(wi_dir)
     if status["state"] != "executed":
         return fail(2, f"前置状态不符: verify --auto 需要 state=executed 实际 {status['state']}（先 flow workitem execute）", None, json_mode)
-    result_path = os.path.join(wi_dir, "executor", "result.json")
-    diff_path = os.path.join(wi_dir, "executor", "diff.patch")
-    if not os.path.isfile(result_path):
-        return fail(2, "executor/result.json 缺失", None, json_mode)
-    if not os.path.isfile(diff_path):
-        return fail(2, "executor/diff.patch 缺失", None, json_mode)
-    try:
-        result = json.loads(read_file(result_path))
-    except (ValueError, OSError) as e:
-        return fail(2, f"executor/result.json 损坏: {e}", None, json_mode)
-    if not isinstance(result, dict):
-        return fail(2, "executor/result.json 顶层必须是映射", None, json_mode)
 
-    wdir = workdir()
-
-    # 1) tests(§4.1)
-    tc = resolve_test_command(wi_dir, wdir, cli_command=opts.get("test-command"), result=result)
-    if tc["command"] is None:
-        tests_result = {"pass": False, "command": None, "exit_code": None,
-                        "output_tail": "", "reason": "command_unresolved", "source": None}
-    else:
-        run = _run_tests(wdir, tc["command"])
-        tests_result = {"pass": run["pass"], "command": tc["command"],
-                        "exit_code": run.get("exit_code"), "output_tail": run.get("output_tail", ""),
-                        "reason": run.get("reason"), "source": tc["source"]}
-    tests_pass = tests_result["pass"]
-
-    # 2) diff(§4.2)
-    try:
-        diff_result = check_diff_scope(wi_dir, result, cli_scope_file=opts.get("scope"))
-    except (UsageError, StoreError) as e:
-        return fail(2, str(e), None, json_mode)
-    diff_match = diff_result["match"]
-
-    # 3) errors(§4.3)
-    errors_result = check_error_table(wi_dir)
-    error_table_match = errors_result["match"]
-
-    gate_pass = tests_pass and diff_match and error_table_match
-
-    # 4) route 推导(§4.4)
-    route = route_override
-    if route is None and not gate_pass:
-        route = _derive_route(tests_result, diff_result, errors_result)
-
-    # 5) 写 verify.json + verify.md
-    verify = {"schema_version": 1, "tests_pass": tests_pass, "diff_match": diff_match,
-              "error_table_match": error_table_match, "route": route if not gate_pass else None,
-              "checked_at": now_iso(),
-              "details": {
-                  "tests": {"command": tests_result.get("command"), "exit_code": tests_result.get("exit_code"),
-                            "output_tail": tests_result.get("output_tail", ""),
-                            "reason": tests_result.get("reason"), "source": tests_result.get("source")},
-                  "diff": {"scope_verdict": diff_result["scope_verdict"],
-                           "out_of_scope": diff_result["out_of_scope"],
-                           "changed_files": diff_result["changed_files"],
-                           "allow": diff_result["allow"], "deny": diff_result["deny"],
-                           "reason": diff_result["reason"]},
-                  "error_table": {"total": errors_result["total"], "covered": errors_result["covered"],
-                                  "uncovered": errors_result["uncovered"],
-                                  "human_review": errors_result["human_review"],
-                                  "reason": errors_result["reason"]},
-              }}
-    os.makedirs(os.path.join(wi_dir, "executor"), exist_ok=True)
-    _atomic_write(os.path.join(wi_dir, "executor", "verify.json"),
-                  json.dumps(verify, ensure_ascii=False, separators=(",", ":")))
-    _write_verify_md(wi_dir, verify)
+    # CLI 与 on_executed 钩子共用核心(chain-on-transition §1.4.4 纯重构;钩子不 shell out,
+    # 避免子进程在 workitem 锁上 flock 死锁)
+    r = run_verify_auto_core(wi_id, wi_dir, opts, cfg)
+    if not r["ok"]:
+        return fail(2, r["error"], None, json_mode)
+    gate_pass = r["gate_pass"]
+    route = r["route"]
+    verify = r["verify"]
+    tests_pass = verify["tests_pass"]
+    diff_match = verify["diff_match"]
+    error_table_match = verify["error_table_match"]
 
     if no_transition:
         if json_mode:
@@ -2438,7 +2966,7 @@ def _cmd_verify_auto(wi_id, wi_dir, opts, json_mode, cfg):
         def _do():
             return _do_transition(wi_dir, "executed", "verified", "verify", {}, {}, cfg)
         try:
-            res = with_workitem_lock(wi_dir, _do)
+            res = _with_transition_hooks(wi_dir, _do, cfg)
         except Locked as e:
             return fail(2, f"锁被他人持有: {e}", None, json_mode)
         if not res["ok"]:
@@ -2461,7 +2989,7 @@ def _cmd_verify_auto(wi_id, wi_dir, opts, json_mode, cfg):
         return _do_transition(wi_dir, "executed", to, "verify_fail",
                               {"route": route}, {"route": route}, cfg)
     try:
-        res = with_workitem_lock(wi_dir, _do_fail)
+        res = _with_transition_hooks(wi_dir, _do_fail, cfg)
     except Locked as e:
         return fail(2, f"锁被他人持有: {e}", None, json_mode)
     if not res["ok"]:
@@ -2476,6 +3004,731 @@ def _cmd_verify_auto(wi_id, wi_dir, opts, json_mode, cfg):
     else:
         print(f"{wi_id}: 门未过 → {res['to']} (route={route})", file=sys.stderr)
     return 1
+
+
+# ---------------------------------------------------------------------------
+# chain-on-transition 钩子实现(§1.4):auto_review / auto_translate / auto_enqueue
+# / auto_verify / notify_accept + 辅助(§1.5 函数清单)
+# ---------------------------------------------------------------------------
+
+def _flow_bin():
+    """flow 可执行绝对路径(测试可注入 stub 捕获入队命令串)。"""
+    return os.path.join(_SCRIPT_DIR, "flow")
+
+
+def mechanical_design_check(wi_dir):
+    """auto_review 机械确定性判定(§1.4.1):四项全过 → pass。
+    ocr9b-L1:每项失败带 defect_type(reasons 同序),机械 reject 不再一律
+    untestable_acceptance——按实际失败项区分(空 design→missing_scenario、
+    缺测试策略→constraint_violation、错误表/缺验收→untestable_acceptance)。"""
+    checks, reasons, defect_types = [], [], []
+    path = os.path.join(wi_dir, "design.md")
+    if file_nonempty(path):
+        checks.append("file_nonempty")
+    else:
+        reasons.append("design.md 缺失或为空")
+        defect_types.append("missing_scenario")
+    text = read_file(path) if os.path.isfile(path) else ""
+    # ocr9b-L2:章节编号支持多级(如 `## 2.1 测试策略`、`### 3.2.1 验收标准`)
+    if re.search(r"^#+\s*(?:\d+[.、])*\d*\s*(测试策略|测试|测试方案)", text, re.M):  # noqa: FURB167
+        checks.append("test_strategy_section")
+    else:
+        reasons.append("缺少测试策略章节")
+        defect_types.append("constraint_violation")
+    et = check_error_table(wi_dir)
+    if et["match"]:
+        checks.append("error_table")
+    else:
+        reasons.append("错误处理表缺失或不完整")
+        defect_types.append("untestable_acceptance")
+    if re.search(r"^#+\s*(?:\d+[.、])*\d*\s*(验收|验收标准|验收对照)", text, re.M):  # noqa: FURB167
+        checks.append("acceptance_section")
+    else:
+        reasons.append("缺少验收对照章节")
+        defect_types.append("untestable_acceptance")
+    return {"pass": not reasons, "checks": checks, "reasons": reasons,
+            "defect_types": defect_types}
+
+
+def _rollback_write(path):
+    """ocr F1:转移失败时回滚刚写入的工件文件(taskbook.md / decision.yaml),
+    保证「文件已生成但状态未前移」不一致不残留;删除失败 best-effort 不抛。"""
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+
+
+def write_decision(wi_dir, verdict, defect_type=None, summary=None):
+    """复用 cmd_decision 落盘格式(§1.4.1);原子写。"""
+    d = {"schema_version": 1, "verdict": verdict, "primary_defect_type": defect_type,
+         "reviewer": None}
+    if summary is not None:
+        d["summary"] = summary
+    if verdict in ("reject", "takeover"):
+        d["defects"] = [{"type": defect_type, "detail": summary or "", "caught_by": "review"}]
+    _atomic_write(os.path.join(wi_dir, "decision.yaml"), dump_yaml(d))
+
+
+def _parse_llm_json(stdout):
+    """从整段 stdout 提取 LLM JSON 对象(ocr F3):先整体 loads(单行/紧凑输出);
+    失败 → raw_decode 逐位置找首个完整 JSON 对象(容忍多行缩进 JSON、首尾噪音、
+    末尾夹日志/空行——不再只认最后一行)。仅接受 dict;无 → None(fail-closed)。"""
+    text = (stdout or "").strip()
+    if not text:
+        return None
+    try:
+        obj = json.loads(text)
+        if isinstance(obj, dict):
+            return obj
+    except ValueError:
+        pass
+    decoder = json.JSONDecoder()
+    idx, n = 0, len(text)
+    while idx < n:
+        while idx < n and text[idx] not in ("{", "["):
+            idx += 1
+        if idx >= n:
+            break
+        try:
+            obj, end = decoder.raw_decode(text, idx)
+        except ValueError:
+            idx += 1
+            continue
+        if isinstance(obj, dict):
+            return obj
+        idx = end
+    return None
+
+
+def _llm_call(cfg, prompt, model=None):
+    """调用 reasonix -p <prompt> --output-format json [--model](§1.5)。
+
+    CHAIN_REASONIX_BIN 环境变量可注入测试 stub。返回 (ok, obj):ok=False 表示
+    不可调用/超时/非 JSON/非对象(fail-closed 降级,E4-E6);obj 为输出 JSON 对象
+    (review 场景取 verdict,translate 场景取 body)。
+    """
+    bin_path = os.environ.get("CHAIN_REASONIX_BIN") or "reasonix"
+    argv = [bin_path, "-p", prompt, "--output-format", "json"]
+    if model:
+        argv += ["--model", model]
+    try:
+        proc = subprocess.run(argv, capture_output=True, text=True, timeout=120)  # noqa: PLW1510
+    except (OSError, subprocess.TimeoutExpired):
+        return False, None
+    if proc.returncode != 0:
+        return False, None
+    out = _parse_llm_json(proc.stdout)
+    if out is None:
+        return False, None
+    return True, out
+
+
+def _review_prompt(wi_dir):
+    design = ""
+    p = os.path.join(wi_dir, "design.md")
+    if os.path.isfile(p):
+        design = read_file(p)[:4000]
+    return ("你是 collab-flow 设计审查员。请审查以下设计方案的语义完整性，"
+            "输出 JSON 对象: {\"verdict\": \"pass\" 或 \"reject\", \"reasons\": [\"...\"]}。\n\n" + design)
+
+
+def _translate_prompt(wi_dir):
+    design = ""
+    p = os.path.join(wi_dir, "design.md")
+    if os.path.isfile(p):
+        raw = read_file(p)
+        if len(raw) > 8000:
+            # ocr7-M5:大 design 的测试策略/验收标准/改动清单可能落在 8000 字符之后,
+            # 静默截断会丢关键段——截断必须告警 + prompt 内标注不完整,不静默丢弃
+            print(f"告警: design.md 共 {len(raw)} 字符,翻译提示截断至 8000 字符"
+                  "(测试策略/验收标准/改动清单等后段可能丢失)", file=sys.stderr)
+            design = (raw[:8000]
+                      + "\n\n[提示] 上述 design.md 超过 8000 字符,此处截断;"
+                        "后半段(测试策略/验收标准/改动清单)未被纳入本任务书。\n")
+        else:
+            design = raw
+    return ("你是 collab-flow 翻译员。把设计方案翻译成 executor 任务书正文"
+            "(【任务】一句话 + 【约束】要点)。输出 JSON 对象: {\"body\": \"markdown 正文\"}。\n\n" + design)
+
+
+def _extract_path_list(text, heading_re):
+    """从 markdown 提取标题下 `- path` 列表(路径 token 保守过滤)。
+
+    ocr F4:段内子标题(层级深于当前段,如 `## 改动文件清单` 下的 `### src 模块`)
+    不终止收集——遇子标题行跳过但继续收列表条目;遇同级或更高级 heading
+    (新段落)才停止,避免「改动文件/交付物」段在子标题处截断、fail-closed
+    _hook_auto_translate 误拒。"""
+    out = []
+    in_section = False
+    section_level = 0
+    for ln in text.splitlines():
+        if re.match(r"^#", ln):
+            level = len(ln) - len(ln.lstrip("#"))       # 前导 # 数量 = 标题层级
+            if in_section:
+                if level <= section_level:
+                    break                               # 同级/更高级 = 新段落
+                continue                                # 段内子标题:不终止,跳过该行
+            if re.search(heading_re, ln):
+                in_section = True
+                section_level = level
+            continue
+        if not in_section:
+            continue
+        m = re.match(r"^\s*[-*]\s+(\S.*)$", ln)
+        if not m:
+            continue
+        tok = m.group(1).strip().rstrip(",;。；、")
+        if not tok or tok.startswith(("#", "`", "**", "(")):
+            continue
+        if " " in tok or "\t" in tok:
+            continue
+        out.append(tok)
+    return out
+
+
+def extract_change_list(wi_dir):
+    """从 design.md 提取改动文件清单(§1.4.2):优先 ```diff_scope 块;否则
+    「改动文件/交付物清单」章节的 `- path` 列表;否则返回 [](→ fail-closed)。"""
+    path = os.path.join(wi_dir, "design.md")
+    if not os.path.isfile(path):
+        return []
+    text = read_file(path)
+    m = re.search(r"```diff_scope\s*\n(.*?)```", text, re.DOTALL)
+    if m:
+        try:
+            node = parse_yaml(m.group(1), f"{path}:```diff_scope")
+        except StoreError:
+            node = None
+        if isinstance(node, dict) and isinstance(node.get("allow"), list):
+            return [str(x) for x in node["allow"] if str(x).strip()]
+    return _extract_path_list(text, r"^#+\s*(?:\d+[.、])*\d*\s*(改动文件|交付物|文件清单|改动|交付)")
+
+
+def extract_frozen_list(wi_dir):
+    """从 design.md 提取冻结(不碰)文件清单(§1.4.2);找不到 → []。"""
+    path = os.path.join(wi_dir, "design.md")
+    if not os.path.isfile(path):
+        return []
+    return _extract_path_list(read_file(path), r"^#+\s*(?:\d+[.、])*\d*\s*(不改|不碰|冻结|红线|范围外)")
+
+
+_FLOW_TOKEN_DENY = ("*", "?", "|", ">", "{", "}", "[", "]", "$")
+
+
+def _validate_flow_token(s, field):
+    """taskbook 前置块红线(§1.4.2,对齐 templates/任务书.md):禁用 glob 与流式集合字符。"""
+    for ch in _FLOW_TOKEN_DENY:
+        if ch in s:
+            raise StoreError(f"taskbook {field} 含受限字符 '{ch}'(glob/流式集合), 拒绝生成")
+    if "&&" in s:
+        raise StoreError(f"taskbook {field} 含 '&&', 拒绝生成")
+
+
+def build_flow_block(test_command, allow, deny):
+    """构造 ```flow 前置块(严格受限 YAML,dump_yaml,禁用 glob/流式集合)。"""
+    _validate_flow_token(str(test_command), "test_command")
+    for x in list(allow) + list(deny):
+        _validate_flow_token(str(x), "diff_scope")
+    node = {"test_command": str(test_command),
+            "diff_scope": {"allow": [str(x) for x in allow],
+                           "deny": [str(x) for x in deny]}}
+    return dump_yaml(node)
+
+
+def render_taskbook(wi_id, design_text, flow_block, body):
+    """渲染 taskbook.md(§1.4.2):【任务】+ ```flow 前置块 + 【验收标准】。"""
+    design_head = (design_text or "").strip()
+    if len(design_head) > 600:
+        design_head = design_head[:600] + "\n...(截断)"
+    return (
+        f"# {wi_id} 任务书(chain auto_translate 生成)\n\n"
+        f"【任务】\n{body.strip()}\n\n"
+        f"【背景】\n本任务书由 post-transition 钩子链自动翻译生成,源设计见 design.md。\n\n"
+        f"```flow\n{flow_block}```\n\n"
+        f"【设计摘要】\n{design_head}\n\n"
+        f"【验收标准】\n1. 按 design.md 实现,不改设计决策。\n"
+        f"2. 执行器契约红线:结果文件由 wrapper 统一生成到 executor/ 目录。\n"
+    )
+
+
+def learn_execute_expected(design_duration_s, cfg):
+    """expected_seconds 学习(§1.4.3 纯函数):非法/缺失 → fallback(seed.execute 默认 1800);
+    否则 max(fallback, ceil(design_duration_s * 1.5))。
+    ocr6-F4:seed.execute 配置非数字(如 "abc") → fallback 1800,不抛 ValueError。"""
+    try:
+        fallback = int(((cfg.get("task") or {}).get("expected_seconds_seed") or {})
+                       .get("execute", 1800))
+    except (TypeError, ValueError):
+        fallback = 1800
+    try:
+        d = int(design_duration_s)
+    except (TypeError, ValueError):
+        return fallback
+    if d <= 0:
+        return fallback
+    return max(fallback, int(math.ceil(d * 1.5)))  # noqa: RUF046
+
+
+def _design_duration(wi_dir):
+    """design-result.json 实际时长(§1.4.3);缺失/损坏 → None(fallback)。"""
+    path = os.path.join(wi_dir, "design-result.json")
+    if not os.path.isfile(path):
+        return None
+    try:
+        data = json.loads(read_file(path))
+    except (ValueError, OSError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    try:
+        dur = data.get("duration_s")
+        return int(dur) if dur is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _read_task_registry():
+    """读任务注册表(flow-task-core store 格式,§1.4.3);缺失 → None;非法 → StoreError。"""
+    base = os.environ.get("FLOW_TASK_DIR") or os.path.expanduser("~/.collabflow")
+    path = os.path.join(base, "tasks.json")
+    if not os.path.isfile(path):
+        return None
+    data = json.loads(read_file(path))
+    if not isinstance(data, dict) or not isinstance(data.get("tasks"), dict):
+        raise StoreError("任务注册表格式非法")
+    return data
+
+
+def _scopes_overlap(allow_a, allow_b):
+    """两个 diff_scope.allow 是否可能命中同一文件(§1.4.3)。"""
+    for a in allow_a:
+        for b in allow_b:
+            if _matches_any(a, [b]) or _matches_any(b, [a]):
+                return True
+    return False
+
+
+def _allow_of_workitem(wi_id):
+    """读其他 workitem taskbook 前置块 diff_scope.allow;不可解析 → []。"""
+    if not ID_RE.fullmatch(str(wi_id)):
+        return []
+    wi_dir = os.path.join(workitems_dir(), str(wi_id))
+    if not os.path.isfile(os.path.join(wi_dir, "taskbook.md")):
+        return []
+    try:
+        allow, _deny, _declared = _resolve_scope(wi_dir)
+    except (UsageError, StoreError):
+        return []
+    return allow
+
+
+def _allow_of(wi_dir):
+    try:
+        allow, _deny, _declared = _resolve_scope(wi_dir)
+    except (UsageError, StoreError):
+        return []
+    return allow
+
+
+def find_overlap_offset(wi_dir, wdir, allow, cfg, dry_run=False):
+    """同仓 diff_scope 重叠错开(§1.4.3):同 workdir 的非终态 execute 任务
+    (不同 workitem)的 diff_scope.allow 与当前 allow 有交集 → 返回 overlap_minutes。
+    注册表缺失/不可读 → 0 + audit warn(fail-open,E11;入队由 duplicate_workitem 兜底)。
+    ocr 修复(2026-08-25):dry_run 透传——钩子 dry-run 模式零写入(§1.3 ⑤)。
+    (ocr5-L3:原 base 参数函数体从未引用——错开只返回分钟偏移,由调用方叠加
+    到 scheduled 时刻,已删。)"""
+    chain = cfg.get("chain") or {}
+    try:  # 配置非法值 fail-open 用默认 40
+        overlap = int(chain.get("overlap_minutes", 40))
+    except (TypeError, ValueError):
+        overlap = 40
+    overlap = max(overlap, 0)
+    try:
+        reg = _read_task_registry()
+    except (StoreError, ValueError, OSError) as e:
+        audit_chain(wi_dir, "overlap_registry_unreadable",
+                    error=f"任务注册表不可读: {e}", dry_run=dry_run)
+        return 0
+    if reg is None:
+        return 0
+    cur_id = None
+    try:  # best-effort:status 缺失不影响错开判定(fail-open)
+        cur_id = load_status(wi_dir).get("id")
+    except Exception:  # noqa: BLE001, S110
+        pass
+    for entry in (reg.get("tasks") or {}).values():
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("kind") != "execute":
+            continue
+        if entry.get("state") not in ("scheduled", "queued", "running"):
+            continue
+        if entry.get("workdir") != wdir:
+            continue
+        other_id = entry.get("workitem")
+        if not other_id or other_id == cur_id:
+            continue
+        if _scopes_overlap(allow, _allow_of_workitem(other_id)):
+            return overlap
+    return 0
+
+
+def build_execute_command(wi_dir, cfg, force=False, force_reason=None):
+    """白名单 execute 命令串(§1.4.3 + W-S1 §6.2):flow 绝对路径 + --sync + --executor
+    + 已解析 --timeout/--model(W-S1:size 判定固化进命令串,重执行门禁幂等),
+    shlex.quote 逐 token;命中 FLOW_WORKITEM_RE(不拼数据路径,env 继承透传)。"""
+    executor = (cfg.get("executor") or {}).get("default", "reasonix")
+    p = resolve_execute_params(wi_dir, cfg, force=force, force_reason=force_reason)
+    inner = ["workitem", "execute", os.path.basename(wi_dir), "--sync",
+             "--executor", executor, "--size", p["size"],
+             "--timeout", str(p["timeout_s"]), "--model", p["model"]]
+    if force:
+        inner.append("--force")
+        if force_reason:
+            inner += ["--force-reason", force_reason]
+    return " ".join(shlex.quote(a) for a in ([_flow_bin()] + inner))
+
+
+def _run_task_add(argv, wi_dir, cfg, action, scheduled, exp, dry_run):
+    """flow task add 子进程(§1.4.3):dry_run 零调用;不可调用/非零退出 → E10 降级
+    notify + audit(不阻塞钩子)。返回 audit 记录。"""
+    if dry_run:
+        return {"action": action, "scheduled_at": scheduled,
+                "expected_seconds": exp, "dry_run": True,
+                "would_write": ["task add execute"]}
+    try:
+        proc = subprocess.run(argv, capture_output=True, text=True, timeout=60)  # noqa: PLW1510
+    except OSError as e:
+        notify_chain(wi_dir, cfg, "enqueue_fail",
+                     f"无法调用 flow task add: {e}", {"action": action},
+                     dry_run=dry_run)
+        return audit_chain(wi_dir, action, result={"ok": False, "error": str(e)})
+    if proc.returncode != 0:
+        notify_chain(wi_dir, cfg, "enqueue_fail", "flow task add 失败",
+                     {"rc": proc.returncode, "stderr": (proc.stderr or "")[:200]},
+                     dry_run=dry_run)
+        return audit_chain(wi_dir, action, result={"ok": False, "rc": proc.returncode})
+    return audit_chain(wi_dir, action,
+                       output={"scheduled_at": scheduled, "expected_seconds": exp})
+
+
+def enqueue_execute_retry(wi_dir, cfg, dry_run):
+    """impl 路由重试入队(§1.4.4):flow workitem execute --sync --force(--force 越过
+    前置状态检查重跑执行器),入队到未来空闲窗口;W-B 的 execute done → verify 链
+    任务终态钩子接续「再 verify」(显式 W-A→W-B 交接点)。"""
+    st = load_status(wi_dir)
+    wi_id = st["id"]
+    # W-S1 §6.3:expected-seconds 地板 = max(learn, timeout+115),防队列先杀 large
+    params = resolve_execute_params(wi_dir, cfg, force=True)
+    exp = max(learn_execute_expected(_design_duration(wi_dir), cfg),
+              params["timeout_s"] + 115)
+    base = window.next_offpeak_start(now_dt())
+    scheduled = base.isoformat(timespec="seconds")
+    command = build_execute_command(wi_dir, cfg, force=True)
+    argv = [_flow_bin(), "task", "add", "--command", command, "--workitem", wi_id,
+            "--kind", "execute", "--priority", "P2",
+            "--expected-seconds", str(exp), "--why", f"chain verify retry {wi_id}",
+            "--workdir", workdir(), "--at", scheduled, "--json"]
+    return _run_task_add(argv, wi_dir, cfg, "enqueue_execute_retry", scheduled, exp, dry_run)
+
+
+def acceptance_summary(v):
+    """验收摘要(§1.4.5):测试命令/exit_code、scope_verdict、错误表 total/covered/uncovered。"""
+    d = v.get("details") or {}
+    t = d.get("tests") or {}
+    df = d.get("diff") or {}
+    et = d.get("error_table") or {}
+    return {"test_command": t.get("command"), "exit_code": t.get("exit_code"),
+            "scope_verdict": df.get("scope_verdict"),
+            "error_table_total": et.get("total"), "error_table_covered": et.get("covered"),
+            "error_table_uncovered": et.get("uncovered")}
+
+
+def _three_item_report(v):
+    """三项报告(§1.4.4):tests/diff/error_table 的 pass/match + reason + route。
+
+    ocr7-M3/L3:兼容两种输入形状——
+      形状 1:run_verify_auto_core 返回值(顶层 tests_result/diff_result/errors_result);
+      形状 2:verify.json 子字典(顶层 tests_pass/diff_match/error_table_match +
+             details.tests/diff/error_table 带 reason)。
+    flow-task-core 的 rescue_verify_fail 通知传的是形状 2(verify 子字典),
+    此前从顶层读 tests_result → 三项全空,展示数据错位。"""
+    details = v.get("details") or {}
+    tr = v.get("tests_result") or {}
+    df = v.get("diff_result") or {}
+    er = v.get("errors_result") or {}
+    dt = details.get("tests") or {}
+    dd = details.get("diff") or {}
+    de = details.get("error_table") or {}
+    return {"tests": {"pass": tr.get("pass", v.get("tests_pass")),
+                      "reason": tr.get("reason") or dt.get("reason")},
+            "diff": {"match": df.get("match", v.get("diff_match")),
+                     "reason": df.get("reason") or dd.get("reason")},
+            "error_table": {"match": er.get("match", v.get("error_table_match")),
+                            "reason": er.get("reason") or de.get("reason")},
+            "route": v.get("route")}
+
+
+def _hook_fallback(wi_dir, cfg, hook_name, exc, dry_run):
+    """钩子异常兜底(§1.6/E15):audit error + notify,不向 _do_transition 冒泡。"""
+    try:  # E17:audit 写失败 best-effort,钩子继续
+        audit_chain(wi_dir, f"{hook_name}_error",
+                    error=f"{type(exc).__name__}: {exc}", dry_run=dry_run)
+    except Exception:  # noqa: BLE001, S110
+        pass
+    try:  # E19:notify 失败 best-effort,钩子继续
+        notify_chain(wi_dir, cfg, "chain_hook_error",
+                     f"{hook_name} 执行异常: {exc}", None, dry_run=dry_run)
+    except Exception:  # noqa: BLE001, S110
+        pass
+
+
+def _hook_auto_review(wi_dir, cfg, dry_run):
+    """on_designed → auto_review(§1.4.1):机械四项判定;不过 → 自动 reject 不转移;
+    review_llm=true 时 LLM 双过;require_human_review → 仅提醒。"""
+    try:
+        st = load_status(wi_dir)
+        if st.get("require_human_review"):
+            notify_chain(wi_dir, cfg, "review_skipped",
+                         "require_human_review 标记，跳过自动审",
+                         {"reason": "require_human_review"}, dry_run=dry_run)
+            return audit_chain(wi_dir, "auto_review_skip",
+                               output={"reason": "require_human_review"}, dry_run=dry_run)
+        mech = mechanical_design_check(wi_dir)
+        if not mech["pass"]:
+            if not dry_run:
+                # ocr9b-L1:按实际失败项记录 defect 类型(首项优先),不再一律
+                # untestable_acceptance——same_defect 判定据此区分不同失败原因
+                write_decision(wi_dir, "reject",
+                               mech["defect_types"][0] if mech["defect_types"] else "untestable_acceptance",
+                               ";".join(mech["reasons"]))
+            notify_chain(wi_dir, cfg, "review_reject",
+                         "机械审查不通过: " + ";".join(mech["reasons"]), {"mech": mech},
+                         dry_run=dry_run)
+            return audit_chain(wi_dir, "auto_review_reject", result=mech, dry_run=dry_run)
+        llm_pass = True
+        if cfg["chain"].get("review_llm"):
+            ok, obj = _llm_call(cfg, _review_prompt(wi_dir),
+                                cfg["chain"].get("review_llm_model"))
+            llm_pass = ok and obj.get("verdict") == "pass"
+            if not llm_pass:
+                if not dry_run:
+                    write_decision(wi_dir, "reject", "missing_scenario", "LLM 语义审不通过")
+                notify_chain(wi_dir, cfg, "review_reject", "LLM 语义审不通过",
+                             {"verdict": obj.get("verdict") if ok else None},
+                             dry_run=dry_run)
+                return audit_chain(wi_dir, "auto_review_llm_reject",
+                                   result={"verdict": obj.get("verdict") if ok else None},
+                                   dry_run=dry_run)
+        if not dry_run:
+            write_decision(wi_dir, "pass", None,
+                           "机械" + ("与LLM" if cfg["chain"].get("review_llm") else "") + " 双过")
+            t = _transition_with_hooks(wi_dir, None, "reviewed", "review", {}, {}, cfg)  # 触发 on_reviewed
+            if not t.get("ok"):
+                # ocr F1:review 转移 guard 依赖 decision.yaml(design_required),
+                # 只能先写后转移;转移失败(ok=False)时回滚已写文件,避免
+                # 「文件已生成但状态未前移」不一致
+                _rollback_write(os.path.join(wi_dir, "decision.yaml"))
+                notify_chain(wi_dir, cfg, "review_reject",
+                             f"review 转移失败: {t.get('reason')}", None,
+                             dry_run=dry_run)
+                return audit_chain(wi_dir, "auto_review_error",
+                                   error=f"review 转移失败: {t.get('reason')}",
+                                   dry_run=dry_run)
+        return audit_chain(wi_dir, "auto_review_pass", result=mech, dry_run=dry_run)
+    except Exception as e:  # noqa: BLE001
+        return _hook_fallback(wi_dir, cfg, "auto_review", e, dry_run)
+
+
+def _hook_auto_translate(wi_dir, cfg, dry_run):
+    """on_reviewed → auto_translate(§1.4.2):test_command 与 diff_scope.allow 机械校验
+    fail-closed;LLM 提炼正文失败降级 audit+notify 不写盘不转移;dry_run 跳过写盘。"""
+    try:
+        st = load_status(wi_dir)
+        if st.get("require_human_review") or st.get("chain_frozen"):
+            reason = "require_human_review" if st.get("require_human_review") else "chain_frozen"
+            return audit_chain(wi_dir, "auto_translate_skip",
+                               output={"reason": reason}, dry_run=dry_run)
+        wdir = workdir()
+        tc = resolve_test_command(wi_dir, wdir, cli_command=None, result=None)
+        allow = extract_change_list(wi_dir)
+        deny = [".git/", ".flow/"] + extract_frozen_list(wi_dir)
+        if not tc["command"] or not allow:
+            notify_chain(wi_dir, cfg, "translate_fail",
+                         "test_command 或 diff_scope.allow 为空",
+                         {"test_command": tc["command"], "allow": allow},
+                         dry_run=dry_run)
+            return audit_chain(wi_dir, "auto_translate_fail",
+                               output={"test_command": tc["command"], "allow": allow},
+                               dry_run=dry_run)
+        try:
+            flow_block = build_flow_block(tc["command"], allow, deny)
+        except StoreError as e:
+            notify_chain(wi_dir, cfg, "translate_fail", str(e),
+                         {"test_command": tc["command"], "allow": allow},
+                         dry_run=dry_run)
+            return audit_chain(wi_dir, "auto_translate_fail", error=str(e), dry_run=dry_run)
+        if dry_run:
+            body = "(dry-run body)"
+        else:
+            ok, obj = _llm_call(cfg, _translate_prompt(wi_dir), None)
+            body = obj.get("body") if ok and isinstance(obj, dict) and isinstance(obj.get("body"), str) else ""
+            if not ok or not body.strip():
+                audit_chain(wi_dir, "auto_translate_fail",
+                            error="LLM 提炼任务书正文失败" if not ok else "LLM 输出正文为空")
+                notify_chain(wi_dir, cfg, "translate_fail",
+                             "LLM 提炼 taskbook 正文失败", None, dry_run=dry_run)
+                return None  # fail-closed:不写 taskbook、不转移
+        design_text = ""
+        p = os.path.join(wi_dir, "design.md")
+        if os.path.isfile(p):
+            design_text = read_file(p)
+        taskbook = render_taskbook(st["id"], design_text, flow_block, body)
+        if not dry_run:
+            # ocr F1:先写 taskbook.md 再转移——on_translated(auto_enqueue)依赖
+            # taskbook 前置块(diff_scope.allow),只能先写后转移;转移失败(ok=False)
+            # 时回滚已写文件,避免「文件已生成但状态未前移」不一致
+            _atomic_write(os.path.join(wi_dir, "taskbook.md"), taskbook)
+            t = _transition_with_hooks(wi_dir, None, "translated", "translate", {}, {}, cfg)  # 触发 on_translated
+            if not t.get("ok"):
+                _rollback_write(os.path.join(wi_dir, "taskbook.md"))
+                notify_chain(wi_dir, cfg, "translate_fail",
+                             f"translate 转移失败: {t.get('reason')}", None,
+                             dry_run=dry_run)
+                return audit_chain(wi_dir, "auto_translate_error",
+                                   error=f"translate 转移失败: {t.get('reason')}",
+                                   dry_run=dry_run)
+        return audit_chain(wi_dir, "auto_translate_ok",
+                           output={"test_command": tc["command"], "allow": allow},
+                           dry_run=dry_run)
+    except Exception as e:  # noqa: BLE001
+        return _hook_fallback(wi_dir, cfg, "auto_translate", e, dry_run)
+
+
+def _hook_auto_enqueue(wi_dir, cfg, dry_run):
+    """on_translated → auto_enqueue(§1.4.3):learn_execute_expected →
+    window.next_offpeak_start 判窗 → find_overlap_offset 错开 → flow task add
+    (白名单格式 + --workdir + --at)。"""
+    try:
+        st = load_status(wi_dir)
+        if st.get("require_human_review") or st.get("chain_frozen"):
+            reason = "require_human_review" if st.get("require_human_review") else "chain_frozen"
+            return audit_chain(wi_dir, "auto_enqueue_skip",
+                               output={"reason": reason}, dry_run=dry_run)
+        wi_id = st["id"]
+        # W-S1 §6.3:expected-seconds 地板 = max(learn, timeout+115),防队列先杀 large
+        params = resolve_execute_params(wi_dir, cfg)
+        exp = max(learn_execute_expected(_design_duration(wi_dir), cfg),
+                  params["timeout_s"] + 115)
+        now = now_dt()
+        base = window.next_offpeak_start(now)
+        scheduled = base.isoformat(timespec="seconds")
+        allow = _allow_of(wi_dir)
+        off = find_overlap_offset(wi_dir, workdir(), allow, cfg, dry_run)
+        if off:
+            scheduled = (base + timedelta(minutes=off)).isoformat(timespec="seconds")
+        command = build_execute_command(wi_dir, cfg)
+        argv = [_flow_bin(), "task", "add", "--command", command, "--workitem", wi_id,
+                "--kind", "execute", "--priority", "P2",
+                "--expected-seconds", str(exp), "--why", f"chain auto_enqueue {wi_id}",
+                "--workdir", workdir(), "--at", scheduled, "--json"]
+        return _run_task_add(argv, wi_dir, cfg, "auto_enqueue", scheduled, exp, dry_run)
+    except Exception as e:  # noqa: BLE001
+        return _hook_fallback(wi_dir, cfg, "auto_enqueue", e, dry_run)
+
+
+def _hook_auto_verify(wi_dir, cfg, dry_run):
+    """on_executed → auto_verify(§1.4.4):gate 全过 → verified;失败 → verify_fail 打回
+    (route=impl 落 executed / route=design 落 designed)、chain_fail_count+1、
+    impl 重入队 execute --sync --force;≥storm_threshold 冻结升级人工不再重入队。
+    result.json/diff.patch 缺失 → E13 降级 audit+notify 不转移。"""
+    try:
+        st = load_status(wi_dir)
+        wi_id = st["id"]
+        v = run_verify_auto_core(wi_id, wi_dir, {}, cfg, dry_run=dry_run)
+        if not v["ok"]:
+            notify_chain(wi_dir, cfg, "verify_fail", v["error"], {"route": None},
+                         dry_run=dry_run)
+            return audit_chain(wi_dir, "auto_verify_error", error=v["error"], dry_run=dry_run)
+        if v["gate_pass"]:
+            if not dry_run:
+                t = _transition_with_hooks(wi_dir, None, "verified", "verify", {}, {}, cfg)  # 触发 on_verified
+                if not t.get("ok"):
+                    notify_chain(wi_dir, cfg, "verify_fail",
+                                 f"verify 转移失败: {t.get('reason')}", None,
+                                 dry_run=dry_run)
+                    return audit_chain(wi_dir, "auto_verify_error",
+                                       error=f"verify 转移失败: {t.get('reason')}",
+                                       dry_run=dry_run)
+                # ocr F2:转移成功后才重置 chain_fail_count 并落盘——转移失败
+                # (ok=False)时状态停 executed,fail_count 保持原值,与「未通过
+                # verify」一致(先重置会在失败时出现状态/fail_count 不一致)。
+                # ocr F4:重置经 _update_chain_fail_count 在锁内读-改-写;
+                # ocr9b-M1:连同清除 chain_frozen(verify 通过 = 解冻,链恢复)
+                _update_chain_fail_count(wi_dir, 0, reset_frozen=True)
+            return audit_chain(wi_dir, "auto_verify_pass", dry_run=dry_run)
+        route = v["route"]
+        fails = int(st.get("chain_fail_count", 0)) + 1
+        try:  # 配置非法值 fail-safe 用默认 3
+            threshold = int(cfg["chain"].get("storm_threshold", 3))
+        except (TypeError, ValueError):
+            threshold = 3
+        frozen = fails >= threshold
+        if not dry_run:
+            t = _transition_with_hooks(wi_dir, None, "designed" if route == "design" else "executed",
+                               "verify_fail", {"route": route}, {"route": route}, cfg)
+            if not t.get("ok"):
+                notify_chain(wi_dir, cfg, "verify_fail",
+                             f"verify_fail 转移失败: {t.get('reason')}", None,
+                             dry_run=dry_run)
+                return audit_chain(wi_dir, "auto_verify_error",
+                                   error=f"verify_fail 转移失败: {t.get('reason')}",
+                                   dry_run=dry_run)
+            # ocr F4:fail_count/frozen 落盘与转移分开取锁(读-改-写原子),
+            # 避免并发推进时旧快照覆盖 event_seq
+            _update_chain_fail_count(wi_dir, fails, frozen)
+        # ocr5-L4:dry-run 分支无持久化——原 latest=st 就地改 chain_fail_count/
+        # chain_frozen 既不写盘也不参与后续逻辑(纯死赋值),已删除;
+        # dry-run 语义保持「零写入契约」(audit/notify 均带 dry_run 不落盘)。
+        if frozen:
+            notify_chain(wi_dir, cfg, "storm_frozen",
+                         "连续失败 ≥N 冻结，升级人工", _three_item_report(v),
+                         dry_run=dry_run)
+            return audit_chain(wi_dir, "auto_verify_frozen",
+                               result={"fails": fails}, dry_run=dry_run)
+        notify_chain(wi_dir, cfg, "verify_fail", "验证失败，重新入队",
+                     _three_item_report(v), dry_run=dry_run)
+        if route == "impl":
+            enqueue_execute_retry(wi_dir, cfg, dry_run)
+        # route == "design":不自动入队(design 缺陷需人修),仅 notify
+        return audit_chain(wi_dir, "auto_verify_retry",
+                           result={"route": route, "fails": fails}, dry_run=dry_run)
+    except Exception as e:  # noqa: BLE001
+        return _hook_fallback(wi_dir, cfg, "auto_verify", e, dry_run)
+
+
+def _hook_notify_accept(wi_dir, cfg, dry_run):
+    """on_verified → notify_accept(§1.4.5):读 verify.json 组验收摘要,notify
+    「accept_pending」;不转移(accept 永远人工)。"""
+    try:
+        v = read_verify(wi_dir)
+        summary = acceptance_summary(v)
+        notify_chain(wi_dir, cfg, "accept_pending", "验收摘要，待 accept", summary,
+                     dry_run=dry_run)
+        return audit_chain(wi_dir, "notify_accept", output=summary, dry_run=dry_run)
+    except Exception as e:  # noqa: BLE001
+        return _hook_fallback(wi_dir, cfg, "notify_accept", e, dry_run)
+
+
+# 事件 → 钩子实现映射(§1.3 ①;定义于钩子之后)
+HOOK_IMPL = {
+    "on_designed": _hook_auto_review,
+    "on_reviewed": _hook_auto_translate,
+    "on_translated": _hook_auto_enqueue,
+    "on_executed": _hook_auto_verify,
+    "on_verified": _hook_notify_accept,
+}
 
 
 # ---------------------------------------------------------------------------
@@ -2495,7 +3748,7 @@ USAGE = """flow workitem <sub> ...
   show     <id> <artifact>
   guard    <id> --gate quality|test [--json]
   design   <id> [--async [--expected N]] [--check] [--sync] [--force] [--json]
-  execute  <id> [--sync] [--executor NAME] [--timeout N] [--model NAME] [--force] [--json]
+  execute  <id> [--sync] [--executor NAME] [--timeout N] [--model NAME] [--force [--force-reason R]] [--json]
   verify   <id> [--auto] [--tests b] [--diff b] [--errors b] [--route design|impl] [--test-command CMD] [--scope FILE] [--no-transition] [--json]
   decision <id> --verdict pass|reject|takeover [--defect-type T] [--summary S] [--json]
 """

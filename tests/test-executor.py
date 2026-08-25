@@ -156,6 +156,24 @@ class ExecutorContractTests(_Base):
         self.assertGreater(os.path.getsize(os.path.join(wi_dir, "executor", "diff.patch")), 0)
         self.assertEqual(fc.load_status(wi_dir)["state"], "executed")
 
+    def test_E01b_force_reason_persisted(self):
+        """ocr7-M4:size-gate 强制非空 --force-reason「供审计」→ 校验后必须落盘:
+        execute 事件 meta 携带 force_reason(此前校验通过即丢,审计理由丢失)。"""
+        self._git_init()
+        wi_dir = self._mk_wi("translated")
+        self._write_taskbook(wi_dir)
+        os.environ["STUB_EXECUTOR_EXIT"] = "0"
+        code = fc.cmd_execute(["w1", "--sync", "--executor", "stub", "--force",
+                               "--force-reason", "人工确认小改动降级"], _cfg())
+        self.assertEqual(code, 0)
+        with open(os.path.join(wi_dir, "events.jsonl"), encoding="utf-8") as f:
+            recs = [json.loads(ln) for ln in f.read().splitlines() if ln.strip()]
+        execute_recs = [r for r in recs if r["event"] == "execute"]
+        self.assertTrue(execute_recs)
+        self.assertEqual(execute_recs[-1]["meta"].get("force_reason"),
+                         "人工确认小改动降级")
+        self.assertIs(execute_recs[-1]["meta"].get("forced"), True)
+
     def test_E02_stub_failed(self):
         self._git_init()
         wi_dir = self._mk_wi("translated")

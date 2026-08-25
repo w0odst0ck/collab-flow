@@ -23,7 +23,7 @@ invoke:
   #   RX_WRAPPER_GRACE_S    外层 guard 秒数,默认 30,clamp [1,50](N+GRACE 只防 rx 包装挂起)
   #   RX_MODEL_DEFAULT      默认模型,deepseek-v4-flash
   #   RX_MODEL_PRO          pro 模型,deepseek-v4-pro(rx 经 --pro 标志命中)
-  #   RX_MODEL_PRO_THRESHOLD_BYTES  任务书字节阈值(>= 切 pro),默认 8000
+  #   RX_MODEL_PRO_THRESHOLD_BYTES  任务书字节阈值 fallback(>= 切 pro),默认 16000;显式声明优先:taskbook ```flow 前置块或正文首部 model: pro|flash 覆盖阈值
   #   RX_BIN                执行面 rx 路径/可注入 stub(测试零 API,同 DSH_BIN 模式)
 input:
   taskbook: file
@@ -41,4 +41,4 @@ exit_codes:
 model:
   default: deepseek-v4-flash
   pro: deepseek-v4-pro
-  pro_threshold_bytes: 8000
+  pro_threshold_bytes: 16000

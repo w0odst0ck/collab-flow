@@ -18,6 +18,7 @@
       幂等拒绝不设 --force 绕过;超时→timeout 终态判定不削弱;纯函数零 I/O。
 """
 
+import glob
 import importlib.util
 import json
 import math
@@ -29,12 +30,18 @@ import shutil
 import subprocess
 import sys
 import threading
+import time
 from datetime import datetime, timedelta, timezone
 
 try:
     import fcntl
 except ImportError:  # 非 POSIX 降级(§1.6.6)
     fcntl = None
+
+try:
+    import select
+except ImportError:  # 非 POSIX 降级:无 select → 退回阻塞读(接受无读超时)
+    select = None
 
 try:
     from zoneinfo import ZoneInfo
@@ -87,17 +94,59 @@ SCRIPT_RE = re.compile(r"^(?:bash|python|python3)\s+(?:\./|/)?[^\s]*/scripts/[^\
 _PROJ_PATH_RE = re.compile(r"(?:^|\s)FLOW_WORKDIR=[^\s]*/projects/[^/\s]+|/projects/[^/\s]+")
 _HHMM_RE = re.compile(r"^\d{1,2}:\d{2}(?::\d{2})?$")
 
+# ---------------------------------------------------------------------------
+# W-B:任务终态钩子 + 超时收口(stale gate)常量(design task-terminal-hooks §1.4)
+# ---------------------------------------------------------------------------
+
+STALE_STATES = ("designed", "reviewed", "translated", "executed", "verified")
+# created/accepted/retrospected 不参与 stale gate(§1.4.1)
+STALE_REMIND_HOURS = 2    # remind_hours 键缺失 → 硬编码默认(§1.7)
+STALE_WARN_HOURS = 24     # warn_hours 键缺失 → 硬编码默认
+STALE_FORCE_HOURS = 48    # force_hours 键缺失 → 硬编码默认
+STALE_DEDUP_COOLDOWN_S = 86400  # remind/escalate 去重 ≤1/天(§1.4.6)
+STALE_TAIL_SCAN_BYTES = 65536  # audit.jsonl 尾部反查字节上限(有界扫描)
+STALE_TERMINAL_AUDIT_STREAM = "stale"   # events/audit.jsonl stream 标识
+TERMINAL_AUDIT_STREAM = "terminal"      # 终态钩子 audit stream 标识
+
+# ---------------------------------------------------------------------------
+# W-S2:execute timeout/failed 自动抢救 + token 预警常量(design executor-timeout-recovery §2.7)
+# 硬编码兜底(与 STALE_* 同模式);env FLOW_TASK_RESCUE_MAX_RETRIES /
+# FLOW_TASK_TOKEN_WARN_THRESHOLD 或 user config task.* 可覆盖,defaults.yaml 不新增键
+# ---------------------------------------------------------------------------
+
+RESCUE_MAX_RETRIES = 2            # 自动重跑限次(超限 rescue_frozen 冻结 + 升级人工)
+TOKEN_WARN_THRESHOLD = 300000     # reasonix 日志 token 峰值告警阈值
+RESCUE_AUDIT_STREAM = "rescue"    # events/audit.jsonl stream 标识
+RESCUE_STATES = ("timeout", "failed")   # 抢救触发终态(execute)
+TOKEN_PEAK_RE = re.compile(r"·\s*([0-9][0-9_,]*)\s*tok\s*·")  # usage 峰值行(容忍千分位逗号)
+TOKEN_PEAK_SCAN_BYTES = 1 << 20  # ocr F4:reasonix run-log 峰值扫描字节上限(超限跳过,防 runaway 全量读吃内存)
+# ocr7-M1:git diff HEAD 输出字节上限(workitem 锁内跑;超限截断 + 告警,防大 patch
+# 全量进内存拖慢并发写;截断 → diff.patch 不完整,verify diff gate fail-closed 收口)
+RESCUE_DIFF_MAX_BYTES = 1 << 20
+# ocr F6:run_rescue_hook 返回这些动作时已发过 rescue 通知(单通知原则:终态失败
+# 通知不再重复发,失败上下文由 rescue 通知 terminal_failure 字段承载)
+RESCUE_NOTIFY_ACTIONS = frozenset(
+    {"rescued", "verify_fail", "verify_error", "write_fail", "frozen"})
+
+# ---------------------------------------------------------------------------
+# W-V1:execute 基线快照常量(design verify-baseline-snapshot §2.4)
+# ---------------------------------------------------------------------------
+
+SNAPSHOT_SCHEMA_VERSION = 1       # tasks/<id>.snapshot.json schema 版本
+SNAPSHOT_GIT_TIMEOUT_S = 5        # flock 内 git 只读短超时:失败即降级,不拖慢并发写
+
 USAGE = """用法: flow task <sub> ...
   flow task add       --command CMD --kind design|execute
                       [--workitem W] --priority P0|P1|P2 --expected-seconds N
                       --why REASON [--at ISO|HH:MM] [--kill-on-timeout]
-                      [--workdir DIR] [--force --force-reason R] [--json]
+                      [--workdir DIR] [--model M] [--force --force-reason R] [--json]
   flow task status    <id> [--json]
   flow task list      [--state S] [--workitem W] [--json]
   flow task log       <id> [--tail N] [--json]
   flow task run       [<id>] [--max-parallel N] [--json]
   flow task pump      [--json]
   flow task reschedule <id> --at ISO|HH:MM [--json]
+  flow task snapshot  <id> [--json]
   flow task reconcile [--json]
   flow task wake-text <id> [--json]
   flow task prune     [--state done|failed|timeout|killed] [--older-than N]
@@ -156,19 +205,146 @@ def sort_queue(tasks):
     return q
 
 
-def plan_dispatch(reg, max_parallel):
+# ---------------------------------------------------------------------------
+# cost-opt-cache-dispatch:调度亲和门控纯函数(design §1.4,全部零 I/O)
+# 同仓串行(保 prefix cache 命中 ×30 省钱)+ pro 全局串行(压成本峰值);
+# _select_gated 为唯一门控入口;双开关全关 → ordered[:free] 快路径(逐字节等价旧切片)。
+# ---------------------------------------------------------------------------
+
+def _serial_enabled(cfg, key):
+    """串行开关读取:cfg=None → False(旧两参切片兼容);键缺失 → 默认 1(开);
+    值损坏 → 默认 1(成本保守)。"""
+    if cfg is None:
+        return False
+    v = (cfg.get("task") or {}).get(key, 1)
+    try:
+        return int(v) != 0
+    except (TypeError, ValueError):
+        return True
+
+
+def _pro_models(cfg):
+    """pro 模型名集合(从 config 读,不硬编码):designer.model.pro +
+    executor.size.large.model 去重;块缺失 → 空集(fail-open)。"""
+    pro = set()
+    d = ((cfg or {}).get("roles") or {}).get("designer") or {}
+    m = (d.get("model") or {}).get("pro")
+    if m:
+        pro.add(m)
+    ex = ((cfg or {}).get("executor") or {}).get("size") or {}
+    m2 = (ex.get("large") or {}).get("model")
+    if m2:
+        pro.add(m2)
+    return pro
+
+
+def _is_pro(t, cfg):
+    """任务 model 字段 ∈ pro 模型集合 → pro;老条目缺 model → False(fail-open)。"""
+    m = (t or {}).get("model")
+    return bool(m) and m in _pro_models(cfg)
+
+
+def _exempt(t):
+    """P0 或 --force(audit 非空,force=True 时 add_task 才写 audit)→ 豁免串行等待。
+    只跳过串行亲和门,不越 max_parallel 硬上限。"""
+    return (t or {}).get("priority") == "P0" or bool((t or {}).get("audit"))
+
+
+def _wd_key(t):
+    """workdir 归一键(normpath+abspath 纯字符串运算,不触磁盘);缺 workdir → None。"""
+    wd = (t or {}).get("workdir")
+    return os.path.normpath(os.path.abspath(wd)) if wd else None
+
+
+def _model_from_command(command):
+    """命令串 shlex 解析 --model 后一 token(flow-core 已把 size→model 固化为
+    `flow workitem execute … --model <X>`);无 --model / 解析失败 → None。"""
+    try:
+        toks = shlex.split(command or "")
+    except ValueError:
+        return None
+    for i, tok in enumerate(toks):
+        if tok == "--model" and i + 1 < len(toks) \
+                and toks[i + 1] and not toks[i + 1].startswith("--"):
+            return toks[i + 1]
+    return None
+
+
+def _default_model_for(command, kind, cfg):
+    """kind 缺省 model 推导(§1.3):design → designer.model.pro;execute → 命令串
+    --model 优先,否则 executor.size.medium.model(flash);其它 → None(fail-open)。"""
+    if kind == "design":
+        d = ((cfg or {}).get("roles") or {}).get("designer") or {}
+        return (d.get("model") or {}).get("pro")
+    if kind == "execute":
+        m = _model_from_command(command)
+        if m:
+            return m
+        ex = ((cfg or {}).get("executor") or {}).get("size") or {}
+        return (ex.get("medium") or {}).get("model")
+    return None
+
+
+def _in_flight_wd(running):
+    """running 中任务的 workdir 归一集合(缺 workdir 剔除,不参与同仓判定)。"""
+    return {wd for wd in (_wd_key(t) for t in running) if wd is not None}
+
+
+def _pro_running(running, cfg):
+    """running 中是否有 pro 任务(pro 全局串行的门控源)。"""
+    return any(_is_pro(t, cfg) for t in running)
+
+
+def _select_gated(ordered, running, free, cfg):
+    """单遍贪心:按既有排序取最多 free 个;同仓串行 + pro 串行 + P0/force 豁免。
+    阻塞者 continue(留在队列),绝不 head-of-line 阻塞后续跨仓/flash 任务;
+    被选(含豁免)者仍占用资源,供后续候选判定。双开关全关 → 旧切片快路径。"""
+    if free <= 0:
+        return []
+    same_on = _serial_enabled(cfg, "same_workdir_serial")
+    pro_on = _serial_enabled(cfg, "pro_serial")
+    if not same_on and not pro_on:
+        return ordered[:free]          # 双开关全关 → 与旧切片逐字节等价
+    in_flight_wd = _in_flight_wd(running)
+    pro_running_flag = _pro_running(running, cfg)
+    selected = []
+    for t in ordered:
+        if len(selected) >= free:
+            break
+        wd = _wd_key(t)
+        if _exempt(t):
+            selected.append(t)
+        elif same_on and wd is not None and wd in in_flight_wd:
+            continue                     # 同仓:留在 queued/scheduled 等同类完成
+        elif pro_on and pro_running_flag and _is_pro(t, cfg):
+            continue                     # pro 全局串行:后续 pro 排队
+        else:
+            selected.append(t)
+        if wd is not None:
+            in_flight_wd.add(wd)
+        if _is_pro(t, cfg):
+            pro_running_flag = True
+    return selected
+
+
+def plan_dispatch(reg, max_parallel, cfg=None):
     """纯函数:空闲槽数 = max_parallel − running;返回应提升的任务列表(不改 reg)。
-    只取 queued(绝不碰 scheduled;与 plan_pump 源分离)。"""
-    running = sum(1 for t in reg["tasks"].values() if t.get("state") == "running")
-    free = max(int(max_parallel) - running, 0)
-    return sort_queue(reg["tasks"].values())[:free]
+    只取 queued(绝不碰 scheduled;与 plan_pump 源分离)。
+    cfg=None(两参调用)→ 旧切片行为;cfg 非空 → 走 _select_gated 亲和门控。"""
+    running = [t for t in reg["tasks"].values() if t.get("state") == "running"]
+    free = max(int(max_parallel) - len(running), 0)
+    ordered = sort_queue(reg["tasks"].values())
+    if cfg is None:
+        return ordered[:free]            # 完全现状(两参调用 = 旧行为)
+    return _select_gated(ordered, running, free, cfg)
 
 
-def plan_pump(reg, max_parallel, now):
+def plan_pump(reg, max_parallel, now, cfg=None):
     """纯函数(pump,flow-cost-ledger §1.5(2)):到期 scheduled 排序 P0<P1<P2 +
     scheduled_at 升序 + id 字典序;只取 scheduled(绝不碰 queued)。P0 无窗口判断,仅靠排序置前。
 
     空槽 = max_parallel − running;无窗口硬门控(D4):到点即升,槽满留 scheduled 下轮再试。
+    cfg=None(三参调用)→ 旧切片行为;cfg 非空 → 走 _select_gated 亲和门控。
     """
     def _due(t):
         sa = t.get("scheduled_at")
@@ -183,8 +359,11 @@ def plan_pump(reg, max_parallel, now):
            if t.get("state") == "scheduled" and _due(t)]
     due.sort(key=lambda t: (PRIO_ORDER.get(t.get("priority"), 99),
                             t.get("scheduled_at", ""), t.get("id", "")))
-    running = sum(1 for t in reg["tasks"].values() if t.get("state") == "running")
-    return due[: max(int(max_parallel) - running, 0)]
+    running = [t for t in reg["tasks"].values() if t.get("state") == "running"]
+    free = max(int(max_parallel) - len(running), 0)
+    if cfg is None:
+        return due[:free]
+    return _select_gated(due, running, free, cfg)
 
 
 # ---------------------------------------------------------------------------
@@ -393,12 +572,18 @@ def load_task_config():
     defaults = _fc.parse_yaml(_fc.read_file(defaults_path), defaults_path)
     task = dict(defaults.get("task") or {})
     host = dict(defaults.get("host") or {})
+    chain = dict(defaults.get("chain") or {})  # W-B §1.7:追加 chain 块(键缺失由调用方硬编码兜底)
+    roles = dict(defaults.get("roles") or {})     # cost-opt-cache-dispatch §1.2:透传 roles/executor
+    executor = dict(defaults.get("executor") or {})  # 供 pro 判定与 model 缺省解析(旧消费方只取 task/host/chain)
     user_path = os.environ.get("COLLABFLOW_CONFIG") or os.path.expanduser(
         "~/.config/collabflow/config.yaml")
     if os.path.isfile(user_path):
         user = _fc.parse_yaml(_fc.read_file(user_path), user_path)
         task = _merge(task, dict(user.get("task") or {}))
         host = _merge(host, dict(user.get("host") or {}))
+        chain = _merge(chain, dict(user.get("chain") or {}))
+        roles = _merge(roles, dict(user.get("roles") or {}))
+        executor = _merge(executor, dict(user.get("executor") or {}))
     mp = _env_int("FLOW_TASK_MAX_PARALLEL")
     if mp is not None:
         task["max_parallel"] = mp
@@ -415,7 +600,37 @@ def load_task_config():
         v = _env_int(env_key)
         if v is not None:
             task[cfg_key] = v
-    return {"task": task, "host": host}
+    # W-B §1.7:stale 分级阈值环境覆盖(键缺失 → classify_stale_age 内硬编码默认 2/24/48)
+    for env_key, cfg_key in (
+        ("FLOW_STALE_REMIND_HOURS", "remind_hours"),
+        ("FLOW_STALE_WARN_HOURS", "warn_hours"),
+        ("FLOW_STALE_FORCE_HOURS", "force_hours"),
+    ):
+        v = _env_int(env_key)
+        if v is not None:
+            chain[cfg_key] = v
+    # W-S2 §2.7:rescue/token 阈值环境覆盖(键缺失 → _rescue_max_retries/_token_warn_threshold
+    # 内硬编码默认 2/300000;user config task 块同名键亦可覆盖,defaults.yaml 不新增键)
+    for env_key, cfg_key in (
+        ("FLOW_TASK_RESCUE_MAX_RETRIES", "rescue_max_retries"),
+        ("FLOW_TASK_TOKEN_WARN_THRESHOLD", "token_warn_threshold"),
+    ):
+        v = _env_int(env_key)
+        if v is not None:
+            task[cfg_key] = v
+    # cost-opt-cache-dispatch §1.2:串行亲和开关(默认 1=开;置 0 恢复现状;非整数 → 默认 1;
+    # env 优先覆盖,user config 显式值保留,仅键缺失时硬编码兜底 1)
+    for env_key, cfg_key, default in (
+        ("FLOW_TASK_SAME_WORKDIR_SERIAL", "same_workdir_serial", 1),
+        ("FLOW_TASK_PRO_SERIAL", "pro_serial", 1),
+    ):
+        v = _env_int(env_key)
+        if v is not None:
+            task[cfg_key] = v
+        elif cfg_key not in task:
+            task[cfg_key] = default
+    return {"task": task, "host": host, "chain": chain,
+            "roles": roles, "executor": executor}
 
 
 # ---------------------------------------------------------------------------
@@ -441,6 +656,187 @@ def logs_dir():
 
 def log_path(tid):
     return os.path.join(logs_dir(), f"{tid}.log")
+
+
+# ---------------------------------------------------------------------------
+# W-V1:execute 基线快照层(design verify-baseline-snapshot §2.3–§2.5)
+# 快照 = 任务启动瞬间的 git 状态(时间锚点),供 W-V2 verify 差分消费;
+# 独立文件 <task_dir>/tasks/<id>.snapshot.json,不挤 registry 并发写热点。
+# ---------------------------------------------------------------------------
+
+def snapshots_dir():
+    """快照目录(design D1:与 registry/logs 同根,prune 同生命周期)。"""
+    return os.path.join(task_dir(), "tasks")
+
+
+def snapshot_path(tid):
+    """快照文件路径(单点封装,路径细节改动只改此处)。"""
+    return os.path.join(snapshots_dir(), f"{tid}.snapshot.json")
+
+
+def _git_run(workdir, *args, _git="git"):
+    """git 只读子命令执行(短超时);OSError/超时 → None(零抛,降级由调用方处理)。
+    -c core.quotePath=false:diff/ls-files 输出原始 UTF-8 路径而非八进制转义,
+    hash-object 才能按真实文件名取 hash;errors="replace":非 UTF-8 文件名不抛。"""
+    try:
+        return subprocess.run([_git, "-c", "core.quotePath=false", "-C", workdir, *args],  # noqa: PLW1510
+                              capture_output=True, text=True, errors="replace",
+                              timeout=SNAPSHOT_GIT_TIMEOUT_S)
+    except (OSError, subprocess.TimeoutExpired, UnicodeDecodeError):
+        return None
+
+
+def _git_hash_batch(workdir, paths, _git="git"):
+    """批量 content-hash(ocr7-M2):一次 `git hash-object --stdin-paths` 拿全部
+    M 文件 hash,替代逐文件 spawn(输出按输入路径顺序每行一个 40-hex)。
+
+    批量失败(含已删文件 E4 / 非 UTF-8 文件名)→ 逐文件回退,保持原语义
+    (已删 → None;非 UTF-8 经 argv 字节透传仍可取 hash);空路径 → []。"""
+    if not paths:
+        return []
+    try:
+        proc = subprocess.run(  # noqa: PLW1510
+            [_git, "-c", "core.quotePath=false", "-C", workdir, "hash-object",
+             "--stdin-paths"],
+            input="\n".join(paths) + "\n", capture_output=True, text=True,
+            errors="replace", timeout=SNAPSHOT_GIT_TIMEOUT_S)
+    except (OSError, subprocess.TimeoutExpired, UnicodeDecodeError):
+        proc = None
+    if proc is None or proc.returncode != 0:
+        return [_git_file_hash(workdir, p, _git=_git) for p in paths]
+    lines = (proc.stdout or "").splitlines()
+    if len(lines) != len(paths):
+        # 理论情况:输出行数与输入路径数不一致(防 hash 错位)→ 逐文件回退
+        return [_git_file_hash(workdir, p, _git=_git) for p in paths]
+    out = []
+    for i in range(len(paths)):
+        ln = lines[i].strip() if i < len(lines) else ""
+        out.append(ln or None)                        # 缺失行 → None(E4)
+    return out
+
+
+def _git_file_hash(workdir, path, _git="git"):
+    """单文件 content-hash(逐文件回退路径;文件已删 → None)。"""
+    h = _git_run(workdir, "hash-object", "--", path, _git=_git)
+    return h.stdout.strip() if (h is not None and h.returncode == 0) else None
+
+
+def capture_git_snapshot(workdir, _git="git"):
+    """拍 git 基线快照(design §2.4):head + M 文件 content-hash + untracked 清单。
+    零抛异常:任何 git 异常 → {git:false, error:...} 降级(不阻断任务启动);
+    _git 为测试 seam(可注入缺失二进制/失败命令)。"""
+    workdir = workdir or os.getcwd()  # E10 老任务 workdir 缺失回退
+    if shutil.which(_git) is None:    # E2 git 二进制缺失
+        return {"schema_version": SNAPSHOT_SCHEMA_VERSION, "git": False,
+                "error": "git_missing"}
+    inside = _git_run(workdir, "rev-parse", "--is-inside-work-tree", _git=_git)
+    if inside is None or inside.returncode != 0:  # E1 非 git 工作树
+        return {"schema_version": SNAPSHOT_SCHEMA_VERSION, "git": False,
+                "error": "not_a_git_repo"}
+    head = _git_run(workdir, "rev-parse", "HEAD", _git=_git)  # E3 空仓无 commit → 降级
+    if head is None or head.returncode != 0:
+        return {"schema_version": SNAPSHOT_SCHEMA_VERSION, "git": False,
+                "error": "rev_parse_failed"}
+    tracked = {}
+    names = _git_run(workdir, "diff", "--name-only", _git=_git)  # 与 executor .diff.names 同源(D2)
+    if names is not None and names.returncode == 0:
+        paths = [p.strip() for p in names.stdout.splitlines() if p.strip()]
+        # ocr7-M2:批量一次 git hash-object --stdin-paths 拿全部 M 文件 hash
+        # (替代逐文件 spawn N 个子进程;execute dispatch 的 registry flock 内
+        # 少起 N-1 次进程);含已删/非 UTF-8 文件名 → 批量失败 → 逐文件回退
+        for p, h in zip(paths, _git_hash_batch(workdir, paths, _git=_git)):
+            tracked[p] = h
+    untracked = []
+    ls = _git_run(workdir, "ls-files", "-o", "--exclude-standard", _git=_git)  # 文件级,排除 ignored(D3)
+    if ls is not None and ls.returncode == 0:
+        untracked = [l.strip() for l in ls.stdout.splitlines() if l.strip()]
+    return {"schema_version": SNAPSHOT_SCHEMA_VERSION, "git": True,
+            "head": head.stdout.strip(), "tracked_modified": tracked,
+            "untracked": untracked}
+
+
+def write_snapshot(tid, snap):
+    """原子写快照(temp + fsync + os.replace,同 save_registry_atomic);
+    失败 → 返回 False + warning,不抛(E8);命中 DENY_RE → 拒写(E9)。"""
+    path = snapshot_path(tid)
+    try:
+        text = json.dumps(snap, ensure_ascii=False, indent=2) + "\n"
+        if DENY_RE.search(text):
+            print(f"告警: 快照含疑似 secret, 拒写 {tid}", file=sys.stderr)
+            return False
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = f"{path}.tmp.{os.getpid()}.{secrets.token_hex(4)}"
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+        return True
+    except OSError as e:
+        print(f"告警: 快照写入失败 {tid}: {e}", file=sys.stderr)
+        return False
+    finally:
+        if 'tmp' in locals() and os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+
+
+def load_snapshot(tid):
+    """读取接口(W-V2 唯一消费入口):缺失/损坏/形状非法 → None(降级,不抛)。
+
+    契约(design §2.1,W-V2 消费):
+      - git:false → 非 git 仓/异常快照,含 error 字段(not_a_git_repo/git_missing/...)
+      - git:true → 含 head/tracked_modified/untracked;tracked_modified 值为
+        `git hash-object <path>` 的 40-hex blob sha,None 表示基线时该文件已被删除;
+        untracked 为文件级 repo-root-relative 清单(已排除 .gitignore)。
+    """
+    path = snapshot_path(tid)
+    if not os.path.isfile(path):
+        return None  # E5
+    try:
+        data = json.loads(_fc.read_file(path))
+    except (ValueError, OSError):
+        return None  # E6
+    if not isinstance(data, dict) or data.get("schema_version") != SNAPSHOT_SCHEMA_VERSION:
+        return None  # E7
+    git = data.get("git")
+    if git is True:
+        ok = (isinstance(data.get("head"), str) and data["head"]
+              and isinstance(data.get("tracked_modified"), dict)
+              and isinstance(data.get("untracked"), list))
+        if not ok:
+            return None  # E7
+    elif git is not False:
+        return None  # E7
+    return data
+
+
+def capture_and_write_snapshot(t):
+    """提升路径统一挂钩(W-V1):仅 execute 拍快照并原子落盘;绝不抛,失败仅告警。
+    三入口(dispatch/run/pump)在 save_registry_atomic 前调用,保证
+    「registry 落盘 running ⇒ 快照已落盘」不变式(E12)。"""
+    if not isinstance(t, dict) or t.get("kind") != "execute":  # D5 仅 execute
+        return
+    tid = t.get("id")
+    if not tid:
+        return
+    snap = capture_git_snapshot(t.get("workdir"))
+    snap["task_id"] = tid
+    snap["captured_at"] = _now_ms()
+    snap["workdir"] = t.get("workdir") or os.getcwd()
+    ok = write_snapshot(tid, snap)
+    if not ok:
+        print(f"告警: 快照未落盘 {tid}, 任务降级启动(verify 无法差分)", file=sys.stderr)
+
+
+def _remove_snapshot_best_effort(tid):
+    """删快照文件;不存在/失败静默(同 _remove_log_best_effort 语义,幂等,E13)。"""
+    try:
+        os.remove(snapshot_path(tid))
+    except OSError:
+        pass
 
 
 def empty_registry():
@@ -853,9 +1249,10 @@ def dispatch(cfg, max_parallel=None):
     def _do():
         reg = load_registry()
         reconcile_running(reg)
-        promoted = plan_dispatch(reg, m)
+        promoted = plan_dispatch(reg, m, cfg)
         now = _now_ms()
         for t in promoted:
+            capture_and_write_snapshot(t)  # W-V1:先拍快照(execute),后写 registry running(E12)
             t["state"] = "running"
             t["started_at"] = now
             t["pid"] = None  # runner 启动后自填(§1.4(2))
@@ -878,7 +1275,7 @@ def dispatch(cfg, max_parallel=None):
 
 def add_task(cfg, command, workitem=None, priority="P2",
              expected_seconds=None, kill_on_timeout=False, kind=None, workdir=None,
-             why=None, scheduled_at=None, force=False, force_reason=None):
+             why=None, scheduled_at=None, force=False, force_reason=None, model=None):
     """幂等入队(§1.4(1)):flock 内去重(同 workitem 非终态 → DuplicateWorkitem) + 追加 + 自动 dispatch。
 
     kind 非空时:缺省 expected_seconds → 种子回退(config 默认);注册表条目带 kind 字段。
@@ -903,6 +1300,8 @@ def add_task(cfg, command, workitem=None, priority="P2",
         raise UsageError("--why 必填(审计理由:这是否真是一个任务?)")
     if DENY_RE.search(command):
         raise StoreError("command 含疑似 secret, 拒绝写入")
+    # cost-opt-cache-dispatch §1.3:model 缺省推导(显式 --model 优先;老条目/推导失败 → None,非 pro)
+    model = model or _default_model_for(command, kind, cfg)
 
     def _do():
         reg = load_registry()
@@ -931,7 +1330,7 @@ def add_task(cfg, command, workitem=None, priority="P2",
         reg["tasks"][tid] = {
             "id": tid, "workitem": workitem, "command": command,
             "priority": priority, "state": "scheduled" if scheduled_at else "queued",
-            "kind": kind,
+            "kind": kind, "model": model,
             "workdir": workdir or os.getcwd(), "expected_seconds": exp,
             "kill_on_timeout": bool(kill_on_timeout),
             "scheduled_at": scheduled_at, "why": why, "cost_usd": None,
@@ -1094,7 +1493,8 @@ def _runner(task_id, cfg, heartbeat_interval=30):
 
         with_registry_flock(_settle)
         print(f"=== {task_id} end state={state} exit={rc} ===", flush=True)
-        # ── M2:注册表终态提交后,锁外 best-effort(事件/种子/notify,注册表是唯一权威) ──
+        event_record = None  # 终态事件记录(构造失败时通知一并跳过,保持原 fail-safe 语义)
+        # ── M2:注册表终态提交后,锁外 best-effort(事件/种子,注册表是唯一权威) ──
         try:
             partial = _is_partial_complete(t, rc)
             event_state = classify_event_state(rc, timed_out, partial)
@@ -1111,11 +1511,43 @@ def _runner(task_id, cfg, heartbeat_interval=30):
             _record_duration_best_effort(
                 t.get("kind"), dur, int(cfg["task"].get("seed_history_len", 8)))
             _emit_task_event_best_effort(task_id, event_record)
-            _notify_if_configured(cfg, event_record)
         except (StoreError, OSError) as e:
             print(f"告警: 终态事件/种子处理失败 {task_id}: {e}", file=sys.stderr)
         # flow-cost-ledger §1.5(4):终态提交后锁外 best-effort 成本落账(失败留 null,不阻断流转)
         _settle_cost(task_id, t, finished_at)
+        # ── W-B §1.3:任务终态钩子(best-effort,不改任务终态;异常仅告警不阻断 dispatch) ──
+        try:
+            run_terminal_hooks(t, cfg, state)
+        except Exception as e:  # noqa: BLE001
+            print(f"告警: 终态钩子失败 {task_id}: {e}", file=sys.stderr)
+        # ── W-S2:execute timeout/failed 自动抢救 + token 峰值预警(best-effort,同 W-B 纪律) ──
+        rescue_action = "skipped"
+        terminal = None
+        try:
+            if event_record is not None and t.get("kind") == "execute" \
+                    and event_record.get("state") in ("failed", "timeout", "partial-complete"):
+                # ocr F6:失败上下文随 rescue 通知携带(单通知原则下不再重复发 execute_failure)
+                terminal = {"state": event_record.get("state"),
+                            "exit_code": event_record.get("exit_code"),
+                            "failure_tail": event_record.get("diagnostic")}
+            rescue_action = run_rescue_hook(t, cfg, state, rc, terminal=terminal)
+        except Exception as e:  # noqa: BLE001
+            print(f"告警: 抢救钩子失败 {task_id}: {e}", file=sys.stderr)
+        try:
+            run_token_warning(t, cfg, finished_at)
+        except Exception as e:  # noqa: BLE001
+            print(f"告警: token 预警失败 {task_id}: {e}", file=sys.stderr)
+        # ── M2 §1.3 终态通知(ocr F6 单通知):execute 失败/超时终态且 rescue 已发通知
+        # (rescued/verify_fail/verify_error/write_fail/frozen)→ 失败上下文已并入 rescue
+        # 通知 terminal_failure,不再重复发 execute_failure;其余终态照旧 ──
+        try:
+            if event_record is not None and not (
+                    t.get("kind") == "execute"
+                    and event_record.get("state") in ("failed", "timeout", "partial-complete")
+                    and rescue_action in RESCUE_NOTIFY_ACTIONS):
+                _notify_terminal(cfg, t, event_record)
+        except Exception as e:  # noqa: BLE001
+            print(f"告警: 终态通知失败 {task_id}: {e}", file=sys.stderr)
     try:
         dispatch(cfg)  # 释放槽位 → 触发下一批(自续队列)
     except (StoreError, OSError):
@@ -1272,7 +1704,7 @@ def runner_main(argv):
 def cmd_add(args, cfg):
     pos, opts = scan_args(
         args, {"command", "workitem", "priority", "expected-seconds", "kind", "workdir",
-               "at", "why", "force-reason"})
+               "at", "why", "force-reason", "model"})
     json_mode = bool(opts.get("json"))
     if pos:
         return fail(2, "add 不接受位置参数", None, json_mode)
@@ -1283,6 +1715,8 @@ def cmd_add(args, cfg):
     workdir = opts.get("workdir")  # 可选;默认 os.getcwd()(add_task 内),不校验目录存在(§3 错误表 #2)
     priority = opts.get("priority")
     kind = opts.get("kind")
+    # cost-opt-cache-dispatch §1.3:显式 --model 优先;缺省由 add_task 内推导(此处预计算供 JSON emit)
+    model = opts.get("model") or _default_model_for(command, kind, cfg)
     # ── 门禁校验链(fail-closed,先于一切写盘;任一不过 → 拒绝:<文案>,exit 2) ──
     try:
         gate_validate(opts, cfg)
@@ -1305,7 +1739,7 @@ def cmd_add(args, cfg):
             return fail(2, "invalid scheduled-at", f"拒绝：{e}", json_mode)
     try:
         tid = add_task(cfg, command, workitem=workitem, priority=priority,
-                       expected_seconds=expected, kind=kind,
+                       expected_seconds=expected, kind=kind, model=model,
                        kill_on_timeout=bool(opts.get("kill-on-timeout")),
                        workdir=workdir, why=opts.get("why"),
                        scheduled_at=scheduled, force=bool(opts.get("force")),
@@ -1329,7 +1763,7 @@ def cmd_add(args, cfg):
     if json_mode:
         emit({"status": "ok", "id": tid, "state": state,  # 入队确认(§1.5 契约)
               "workitem": workitem, "priority": priority, "kind": kind,
-              "workdir": workdir or os.getcwd(),
+              "model": model, "workdir": workdir or os.getcwd(),
               "expected_seconds": expected, "scheduled_at": scheduled,
               "why": opts.get("why"), "suggest_wake": sug})
     else:
@@ -1444,6 +1878,7 @@ def cmd_run(args, cfg):
                 raise TaskError(tid)
             if t["state"] not in ("queued", "scheduled"):
                 raise UsageError(f"仅 queued/scheduled 可强制触发,当前 state={t['state']}")
+            capture_and_write_snapshot(t)  # W-V1:先拍快照(execute),后写 registry running(E12)
             t["state"] = "running"
             t["started_at"] = _now_ms()
             t["pid"] = None  # runner 启动后自填(§1.4(2))
@@ -1572,9 +2007,10 @@ def cmd_pump(args, cfg):
             def _do():
                 reg = load_registry()
                 reconcile_running(reg)
-                chosen = plan_pump(reg, m, datetime.now(timezone.utc))
+                chosen = plan_pump(reg, m, datetime.now(timezone.utc), cfg)
                 now = _now_ms()
                 for t in chosen:
+                    capture_and_write_snapshot(t)  # W-V1:先拍快照(execute),后写 registry running(E12)
                     t["state"] = "running"
                     t["started_at"] = now
                     t["pid"] = None
@@ -1602,6 +2038,11 @@ def cmd_pump(args, cfg):
         return fail(1, f"写盘失败: {e}", None, json_mode)
     finally:
         _pump_lock_release(lock_fd)
+    # ── W-B §1.4:超时收口 stale gate(锁已释放;自包含 best-effort,不影响 pump 退出码) ──
+    try:
+        run_stale_gate(cfg)
+    except Exception as e:  # noqa: BLE001
+        print(f"告警: stale gate 失败: {e}", file=sys.stderr)
     if json_mode:
         emit({"status": "ok", "promoted": [tid for tid, _ in promoted]})
     else:
@@ -1708,11 +2149,12 @@ def _prune_match(reg, states=None, older_than_days=None, now=None):
 
 
 def prune_tasks(reg, states=None, older_than_days=None, now=None):
-    """删除终态任务;返回被删 id 列表(§1.3)。连带删 logs/<tid>.log(§5.3,幂等)。"""
+    """删除终态任务;返回被删 id 列表(§1.3)。连带删 logs/<tid>.log 与快照(§5.3/§2.8,幂等)。"""
     removed = _prune_match(reg, states, older_than_days, now)
     for tid in removed:
         del reg["tasks"][tid]
         _remove_log_best_effort(tid)
+        _remove_snapshot_best_effort(tid)  # W-V1 §2.8:快照随任务记录清理
     return removed
 
 
@@ -1727,7 +2169,7 @@ def _remove_log_best_effort(tid):
 def auto_prune(reg, cfg, now=None):
     """写时自动清理(§5.1):done 保留 prune_done_days,failed/timeout/killed 保留 prune_failed_days;
     仍超 task_cap → 按 finished_at 升序删最老终态;running/queued 永不删。
-    有副作用:删 registry 条目 + best-effort 连带删 logs/<id>.log;返回被删 id 列表。
+    有副作用:删 registry 条目 + best-effort 连带删 logs/<id>.log 与快照;返回被删 id 列表。
     """
     task_cfg = (cfg or {}).get("task") or {}
     done_days = int(task_cfg.get("prune_done_days") or 3)
@@ -1744,6 +2186,7 @@ def auto_prune(reg, cfg, now=None):
     for tid in set(removed):
         del reg["tasks"][tid]
         _remove_log_best_effort(tid)
+        _remove_snapshot_best_effort(tid)  # W-V1 §2.8:快照随任务记录清理
     removed = list(dict.fromkeys(removed))
     # 容量上限:仍超 → 删最老终态(finished_at 升序),双保险保 running/queued
     terminal = [(t.get("finished_at") or "", tid) for tid, t in reg["tasks"].items()
@@ -1756,6 +2199,7 @@ def auto_prune(reg, cfg, now=None):
                 removed.append(tid)
             del reg["tasks"][tid]
             _remove_log_best_effort(tid)
+            _remove_snapshot_best_effort(tid)  # W-V1 §2.8:快照随任务记录清理
     return removed
 
 
@@ -1863,6 +2307,36 @@ def cmd_prune(args, cfg):
     return 0
 
 
+def cmd_snapshot(args, cfg):
+    """读取 execute 基线快照(W-V1 §2.7):`flow task snapshot <id> [--json]`。
+    文件缺失 → exit2 snapshot_missing;存在但 load_snapshot 返回 None(损坏/形状非法)
+    → exit2 snapshot_corrupt;否则输出快照(JSON 全量 / 文本摘要)。"""
+    pos, opts = scan_args(args, set())
+    json_mode = bool(opts.get("json"))
+    if len(pos) != 1:
+        return fail(2, "snapshot 需要 <id>", None, json_mode)
+    tid = pos[0]
+    if not TASK_ID_RE.fullmatch(tid):
+        return fail(2, "invalid task id", tid, json_mode)
+    snap = load_snapshot(tid)
+    if snap is None:
+        if not os.path.isfile(snapshot_path(tid)):
+            return fail(2, "snapshot_missing", tid, json_mode)   # E5
+        return fail(2, "snapshot_corrupt", tid, json_mode)       # E6/E7
+    if json_mode:
+        emit({"status": "ok", "id": tid, "snapshot": snap})
+    else:
+        if snap.get("git"):
+            print(f"{tid} git=true head={snap['head']} "
+                  f"tracked_modified={len(snap['tracked_modified'])} "
+                  f"untracked={len(snap['untracked'])} "
+                  f"captured_at={snap.get('captured_at') or '-'}")
+        else:
+            print(f"{tid} git=false error={snap.get('error') or '-'} "
+                  f"captured_at={snap.get('captured_at') or '-'}")
+    return 0
+
+
 # ---------------------------------------------------------------------------
 # 宿主集成(§1.5:wake 自包含文本 + notify 命令钩子;均 best-effort)
 # ---------------------------------------------------------------------------
@@ -1941,8 +2415,110 @@ def cmd_wake_text(args, cfg):
 
 
 def _notify_if_configured(cfg, event_record):
-    """终态通知钩子(§1.5):host.notify 非空才调;事件 JSON 走 stdin(不落 argv);
+    """终态通知钩子(§1.5):委托 _pipe_notify(复用管道逻辑)。"""
+    _pipe_notify(cfg, event_record)
+
+
+# ---------------------------------------------------------------------------
+# W-B:任务终态钩子 + 超时收口(stale gate)
+# (design .flow/workitems/task-terminal-hooks/design.md §1.3-§1.7;
+#  只读调用 _fc.*,不重复实现 flow-core.py 既有逻辑)
+# ---------------------------------------------------------------------------
+
+def _hours_to_s(hours, default):
+    """小时 → 秒;None/非法/负数 → 回退 default(硬编码)。纯函数。"""
+    try:
+        v = int(hours)
+    except (TypeError, ValueError):
+        v = int(default)
+    if v < 0:
+        v = int(default)
+    return v * 3600
+
+
+def _chain_enabled(cfg):
+    """chain.enabled 总闸(§1.4.1 E5);缺省 → True(与 defaults.yaml 一致)。"""
+    return bool((cfg.get("chain") or {}).get("enabled", True))
+
+
+def stale_action_for_state(state, chain_enabled):
+    """状态 → 强制收口动作映射(§1.4.1,纯函数零 I/O)。"""
+    if not chain_enabled:
+        return "notify_only"          # chain 关闭 → 只提醒, 不做任何强制动作(E5)
+    return {
+        "designed": "auto_review",     # R1
+        "reviewed": "auto_translate",  # R2
+        "translated": "auto_enqueue",  # R3
+        "executed": "archive",         # R4
+        "verified": "archive",         # R5
+    }.get(state)                        # None → created/accepted/retrospected 不参与
+
+
+def classify_stale_age(age_s, cfg):
+    """时间分级(§1.4.2,纯函数):<remind 静默 / <warn 提醒 / <force 升级 / ≥force 强制。"""
+    c = cfg.get("chain") or {}
+    remind = _hours_to_s(c.get("remind_hours"), STALE_REMIND_HOURS)
+    warn = _hours_to_s(c.get("warn_hours"), STALE_WARN_HOURS)
+    force = _hours_to_s(c.get("force_hours"), STALE_FORCE_HOURS)
+    if age_s < remind:
+        return "silent"
+    if age_s < warn:
+        return "remind"
+    if age_s < force:
+        return "escalate"
+    return "force"
+
+
+def learn_expected_seconds(reg, workdir, kind, fallback=1500):
+    """registry(tasks.json) 同仓同类任务历史实际时长 → 预估(§1.5 纯函数)。
+    样本 = tasks 中 state∈TERMINAL 且 workdir==workdir 且 kind==kind 的
+    finished_at−started_at 正整数秒;EMA(α=0.5) × 1.5,floor fallback;无样本 → fallback。"""
+    if not workdir or not kind:
+        return int(fallback)                                   # E16
+    tasks = reg.get("tasks") if isinstance(reg, dict) else {}
+    if not isinstance(tasks, dict):
+        return int(fallback)
+    samples = []
+    for t in tasks.values():
+        if not isinstance(t, dict):
+            continue
+        if t.get("state") not in TERMINAL_STATES:
+            continue
+        if t.get("workdir") != workdir or t.get("kind") != kind:
+            continue
+        d = _wallclock_seconds(t.get("started_at"), t.get("finished_at"))  # 非法 → None(E15)
+        if d and d > 0:
+            samples.append(d)
+    if not samples:
+        return int(fallback)                                   # E14
+    ema = float(samples[0])
+    for d in samples[1:]:
+        ema = 0.5 * d + 0.5 * ema
+    return max(int(fallback), int(math.ceil(ema * 1.5)))  # noqa: RUF046
+
+
+def _atomic_write_local(path, text):
+    """本地原子写(temp + fsync + os.replace),与 flow-core._atomic_write 同款。"""
+    tmp = f"{path}.tmp.{os.getpid()}.{secrets.token_hex(4)}"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+
+
+def _pipe_notify(cfg, record):
+    """管道通知核心(§1.3/§1.5):host.notify 非空才调;JSON 走 stdin(不落 argv);
     模板含控制字符 → 拒绝执行(fail-closed);失败仅告警不影响终态。"""
+    if not isinstance(cfg, dict):
+        return
     host = cfg.get("host") or {}
     template = host.get("notify")
     if not template or not isinstance(template, str):
@@ -1952,12 +2528,1004 @@ def _notify_if_configured(cfg, event_record):
         return
     try:
         proc = subprocess.run(["sh", "-c", template],
-                              input=json.dumps(event_record, ensure_ascii=False),
+                              input=json.dumps(record, ensure_ascii=False),
                               capture_output=True, text=True)
         if proc.returncode != 0:
             print(f"告警: notify 命令 exit={proc.returncode}", file=sys.stderr)
     except OSError as e:
         print(f"告警: notify 调用失败: {e}", file=sys.stderr)
+
+
+def _notify_terminal(cfg, t, event_record):
+    """L1114 原 _notify_if_configured 改由此路由(§1.3):execute 失败态 → 失败报告;
+    其他(design 终态等)→ 泛化通知(既有行为不变)。"""
+    if t.get("kind") == "execute" and event_record.get("state") in (
+            "failed", "timeout", "partial-complete"):
+        _notify_failure(cfg, t, event_record)
+    else:
+        _notify_if_configured(cfg, event_record)
+
+
+def _notify_failure(cfg, t, event_record):
+    """execute 失败报告(§1.3):含 failure_tail + 指引(源自复盘 §3.3/§3.5)。
+    ocr 修复(2026-08-25):exit_code/failure_tail 改从 event_record 取——
+    t 是 runner 启动时快照(running 态)不含终态字段;event_record 在 _settle
+    落账后构造(diagnostic=tail/redacted_logs 路径,exit_code=rc),字段齐全。"""
+    rec = {
+        "kind": "execute_failure", "task_id": t.get("id"),
+        "workitem": t.get("workitem"), "state": event_record.get("state"),
+        "exit_code": event_record.get("exit_code"),
+        "failure_tail": event_record.get("diagnostic"),
+        "guidance": [
+            "看 failure_tail 定位根因; exit 2 且 started≈finished = 前置校验失败"
+            + "(command_not_whitelisted / duplicate_workitem / 前置状态不符)",
+            "flow workitem status <id> 确认 state=translated 且 taskbook.md 非空(execute 门禁)",
+            "修复后 flow workitem execute <id> 重跑; partial-complete 可 rx --continue 续收尾",
+        ],
+    }
+    _pipe_notify(cfg, rec)
+
+
+def _fc_call(name, *args):
+    """getattr 探测 + 调用 _fc.<name>;缺失 → 抛 AttributeError(调用方 try/except 兜底)。"""
+    fn = getattr(_fc, name, None)
+    if fn is None:
+        raise AttributeError(f"_fc.{name} 缺失")
+    return fn(*args)
+
+
+def _fc_hook_cfg(cfg):
+    """获取 flow-core 完整配置(含 workitem/gates/executor/task/chain)供 _fc.* 钩子使用。
+    W-B 的 load_task_config 只读 task/host/chain;W-A 钩子需要 workitem/gates/executor。
+    getattr 探测 _fc.load_config;缺失/失败 → 回退传入 cfg(钩子内部 try/except 兜底)。"""
+    try:
+        loader = getattr(_fc, "load_config", None)
+        if loader is not None:
+            full = loader()
+            if isinstance(full, dict):
+                return full
+    except Exception:  # noqa: BLE001, S110
+        pass
+    return cfg
+
+
+def _read_wi_state_safe(wi_id, cfg):
+    """读 workitem status.yaml.state(§1.3);缺失/非法/目录不存在 → None(E4/E17)。"""
+    try:
+        wi_dir = _fc_call("resolve_wi_dir", wi_id, cfg)
+        st = _fc_call("load_status", wi_dir)
+    except Exception:  # noqa: BLE001
+        return None
+    return st.get("state") if isinstance(st, dict) else None
+
+
+def _trigger_chain(wi_id, cfg, event, to):
+    """触发 W-A post-transition 钩子链(契约适配 §1):
+    优先 _fc._run_post_transition_hooks(wi_dir, {"event","to"}, full_cfg);
+    退化直接调 _fc._hook_auto_review(design)/_hook_auto_verify(execute)。
+    getattr 探测 + try/except 兜底;缺失/异常 → {"result":"error"} 不阻断。"""
+    try:
+        wi_dir = _fc_call("resolve_wi_dir", wi_id, cfg)
+    except Exception as e:  # noqa: BLE001
+        return {"result": "error", "detail": f"resolve_wi_dir: {type(e).__name__}: {e}"}
+    full_cfg = _fc_hook_cfg(cfg)
+    dispatcher = getattr(_fc, "_run_post_transition_hooks", None)
+    if dispatcher is not None:
+        try:
+            dispatcher(wi_dir, {"event": event, "to": to}, full_cfg)
+            return {"result": "executed", "detail": f"post_transition:{event}"}
+        except Exception:  # noqa: BLE001, S110
+            pass  # 分发入口失败 → 退化到具体钩子(E19)
+    hook = "_hook_auto_review" if event == "design" else "_hook_auto_verify"
+    fn = getattr(_fc, hook, None)
+    if fn is None:
+        return {"result": "error", "detail": f"_fc.{hook} 缺失"}
+    try:
+        fn(wi_dir, full_cfg, False)
+        return {"result": "executed", "detail": hook}
+    except Exception as e:  # noqa: BLE001
+        return {"result": "error", "detail": f"{hook}: {type(e).__name__}: {e}"}
+
+
+def run_terminal_hooks(t, cfg, state):
+    """W-B: 任务终态 → workitem 链式推进(§1.3)。best-effort, 不改任务终态。
+    返回 {"action", "detail", "result"};非 skipped 动作写 events/audit.jsonl。"""
+    res = _terminal_hooks_action(t, cfg, state)
+    if res.get("action") != "skipped":      # ocr5-M3:skipped 不审计(与 docstring 一致)
+        _append_terminal_audit_best_effort(t, res, state)
+    return res
+
+
+def _terminal_hooks_action(t, cfg, state):
+    kind, wi = t.get("kind"), t.get("workitem")
+    if not kind or not wi:
+        return {"action": "skipped", "detail": "no kind/workitem"}          # E16
+    chain = cfg.get("chain") or {}
+    if chain.get("enabled") is False:
+        return {"action": "skipped", "detail": "chain disabled"}           # E5
+    if kind == "design" and state == "done":
+        cur = _read_wi_state_safe(wi, cfg)          # 读 status.yaml.state; 缺失 → None
+        if cur == "designed":
+            r = _trigger_chain(wi, cfg, "design", "designed")  # W-A 幂等, 二次触发 no-op
+            return {"action": "design_done", "detail": "on_designed", "result": r}
+        return {"action": "design_done_no_transition", "detail": cur}      # E17
+    if kind == "execute" and state == "done":
+        r = _trigger_chain(wi, cfg, "execute", "executed")  # W-A 幂等
+        return {"action": "execute_done", "detail": "on_executed", "result": r}
+    if kind == "execute" and state in ("failed", "timeout", "partial-complete"):
+        # 失败报告由 _notify_terminal 统一触发(避免与泛化通知双发, design §1.3 末注)
+        return {"action": "execute_failed", "detail": state}
+    return {"action": "skipped", "detail": f"{kind}/{state}"}
+
+
+def _append_terminal_audit_best_effort(t, res, state):
+    """终态钩子结果写 events/audit.jsonl(§1.6, best-effort;失败仅告警不阻断)。
+
+    task_state 用真实终态 state 参数:runner 启动快照 t 的 state=="running",
+    会污染审计链(ocr F1)。"""
+    try:
+        _append_jsonl_locked(
+            os.path.join(events_dir(), "audit.jsonl"),
+            os.path.join(events_dir(), "audit.jsonl.lock"),
+            {"schema_version": EVENT_SCHEMA_VERSION, "ts": now_iso(),
+             "stream": TERMINAL_AUDIT_STREAM, "task_id": t.get("id"),
+             "workitem": t.get("workitem"), "kind": t.get("kind"),
+             "task_state": state, "action": res.get("action"),
+             "detail": res.get("detail"), "result": res.get("result")})
+    except (StoreError, OSError) as e:
+        print(f"告警: 终态审计写入失败: {e}", file=sys.stderr)
+
+
+# ---------------------------------------------------------------------------
+# W-S2:execute timeout/failed 终态自动抢救 + token 峰值预警
+# (design .flow/workitems/executor-timeout-recovery/design.md §2-§3;
+#  只读调用 _fc.* / window.*,不重复实现既有逻辑;全部 best-effort,不改任务终态)
+# ---------------------------------------------------------------------------
+
+def rescue_decision(result_status, tests_pass):
+    """纯函数:execute timeout/failed 终态的抢救分流(§2.2 决策表,零 I/O)。
+
+    result_status:executor/result.json 顶层 status(缺失/损坏已归一 None);
+    tests_pass:预检测试是否通过(result 已存在时忽略)。返回
+    "skip_ok" / "skip_partial" / "rescue" / "requeue"。
+    """
+    if result_status == "ok":
+        return "skip_ok"          # 执行器已产完整产物 → 异常终态不补写不重跑
+    if result_status == "partial-complete":
+        return "skip_partial"     # 已有 partial 产出 → 交 rx --continue,不重跑(不丢半成品)
+    return "rescue" if tests_pass else "requeue"   # 缺失/损坏 → 以测试结果机械判定
+
+
+def _read_executor_result(wi_dir):
+    """读 executor/result.json → (status|None, raw|None);缺失/损坏/非 dict/status
+    非法 → status None(归一缺失,fail-closed,E2)。"""
+    p = os.path.join(wi_dir, "executor", "result.json")
+    if not os.path.isfile(p):
+        return None, None
+    try:
+        r = json.loads(_fc.read_file(p))
+    except (ValueError, OSError):
+        return None, None
+    if not isinstance(r, dict):
+        return None, r
+    st = r.get("status")
+    if st not in ("ok", "partial-complete"):
+        return None, r
+    return st, r
+
+
+def assess_execute_completion(wi_dir, full_cfg):
+    """完成度机械判定(§2.2,I/O 包装):result.json 存在 → 直接分流;
+    缺失/损坏 → resolve_test_command + _run_tests 预检分流(双跑为机械判定优先,
+    verify 仍为权威门)。返回 (decision, result, tests)。"""
+    status, raw = _read_executor_result(wi_dir)
+    if status is not None:
+        return rescue_decision(status, None), raw, None
+    tc = _fc.resolve_test_command(wi_dir, _fc.workdir(), None, None)
+    if tc["command"] is None:      # 无测试命令 → 无法确认「绿」→ 不达标(E1)
+        return "requeue", None, {"pass": False, "reason": "command_unresolved"}
+    tests = _fc._run_tests(_fc.workdir(), tc["command"])
+    return rescue_decision(None, tests["pass"]), None, tests
+
+
+def build_rescue_result(test_command, changed_files, original_state, original_exit):
+    """构造抢救版 result.json(与 executor wrapper 产出结构同形,§2.3 ①),
+    确保 verify 的 resolve_test_command / check_diff_scope / _collect_changed_files
+    正常消费;executor="rescue" + rescued=true + note 标注来源(绝不伪装真实 executor)。"""
+    return {
+        "schema_version": 1,
+        "executor": "rescue",                       # 区分真实 executor 产出
+        "status": "ok",
+        "exit_code": 0,
+        "test_command": test_command,
+        "rescued": True,
+        "note": f"自动抢救，原始 {original_state}",
+        "original_state": original_state,           # timeout / failed
+        "original_exit_code": original_exit,        # 124 等
+        "duration_s": None,
+        "diff": {"files_changed": len(changed_files), "insertions": 0, "deletions": 0,
+                 "changed_files": changed_files, "untracked_files": [],
+                 "patch": "executor/diff.patch"},
+        "cost": None, "redacted_logs": None,
+        "started_at": None, "finished_at": None,
+    }
+
+
+def _git_rescue_diff(workdir):
+    """git diff 未提交改动(§2.3 ②,Python 侧等价 wrapper 的 git 段)。
+
+    返回 {"patch", "changed_files", "untracked_files"};非 git 仓 / git 不可用 /
+    无改动 → 空 patch + 空列表(不 crash,E3,verify 侧 fail-closed)。"""
+    def _run(args):
+        # ocr F4:与 _git_run 对齐加 -c core.quotePath=false——含非 ASCII 文件名
+        # (如中文翻译 workitem)的仓库,diff --name-only/status 路径若被八进制转义
+        # ("\344\270\255..."),下游 changed_files/untracked 解析错;errors="replace"
+        # 同 _git_run:非 UTF-8 文件名不抛(UnicodeDecodeError 归零抛)
+        try:
+            return subprocess.run(  # noqa: PLW1510
+                ["git", "-c", "core.quotePath=false", "-C", workdir] + args,
+                capture_output=True, text=True, errors="replace", timeout=30)
+        except (OSError, subprocess.TimeoutExpired, UnicodeDecodeError):
+            return None
+    head = _run(["rev-parse", "--verify", "HEAD"])
+    if head is None or head.returncode != 0:
+        return {"patch": "", "changed_files": [], "untracked_files": []}
+    # ocr7-M1:diff HEAD 走有界流式读(上限 RESCUE_DIFF_MAX_BYTES),超限截断 +
+    # 告警;--name-only/status 为路径清单(量级小),维持 capture_output 全量读
+    patch, truncated = _git_diff_bounded(workdir, RESCUE_DIFF_MAX_BYTES)
+    names = _run(["diff", "--name-only"])
+    st = _run(["status", "--porcelain"])
+    changed = [ln for ln in (names.stdout or "").splitlines() if ln.strip()] \
+        if names is not None else []
+    untracked = []
+    if st is not None:
+        for ln in st.stdout.splitlines():
+            if ln.startswith("??"):
+                untracked.append(ln[3:].strip())
+    if truncated:
+        print(f"告警: git diff HEAD 输出超过 {RESCUE_DIFF_MAX_BYTES} 字节上限,"
+              "diff.patch 已截断(verify diff gate 将 fail-closed)",
+              file=sys.stderr)
+    return {"patch": patch, "changed_files": changed, "untracked_files": untracked}
+
+
+def _git_diff_bounded(workdir, max_bytes):
+    """流式读 git diff HEAD 输出至多 max_bytes(防大 patch 全量进内存)。
+
+    返回 (patch_text, truncated):超限时提前关管道(读侧停止,git 写侧 EPIPE 退出),
+    patch 尾部追加截断标记;git 缺失/失败 → ("", False)(零抛,同 _run 降级)。"""
+    _TRUNC_MARK = "\n[...git diff 输出超上限截断...]\n"
+    try:
+        proc = subprocess.Popen(
+            ["git", "-c", "core.quotePath=false", "-C", workdir, "diff", "HEAD"],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    except OSError:
+        return "", False
+    chunks, total = [], 0
+    truncated = False
+    # ocr7-M1:读循环整体 30s deadline(对齐旧 _run 的 timeout=30)——git 挂起
+    # 不产出(如 NFS 卡住)时 select 超时截断退出,不无限阻塞 rescue
+    deadline = time.monotonic() + 30
+    try:
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                truncated = True
+                break
+            # ocr9-F1:select 在 Windows 也能 import 成功,但 select.select 只支持
+            # WinSock socket,对管道 fd 抛 OSError(WinError 10038);须以 os.name 门禁
+            # POSIX,非 POSIX 直接退回阻塞读(接受无读超时),不把误判 OSError 传给
+            # rescue 侧错标 rescue_write_fail。
+            if select is not None and os.name == "posix":
+                r, _, _ = select.select([proc.stdout], [], [], remaining)
+                if not r:
+                    truncated = True
+                    break
+            chunk = proc.stdout.read(min(65536, max_bytes - total))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+            if total >= max_bytes:
+                truncated = True
+                break
+    finally:
+        proc.stdout.close()
+        try:
+            proc.wait(timeout=30)
+        except (subprocess.TimeoutExpired, OSError):
+            proc.kill()
+            proc.wait()
+    text = b"".join(chunks).decode("utf-8", errors="replace")
+    if truncated:
+        return text + _TRUNC_MARK, True
+    return text, False
+
+
+def _rescue_max_retries(cfg):
+    """自动重跑限次(§2.7):config task.rescue_max_retries;缺失/非法/非正 → 2。"""
+    try:
+        v = int((cfg.get("task") or {}).get("rescue_max_retries") or RESCUE_MAX_RETRIES)
+    except (TypeError, ValueError):
+        v = RESCUE_MAX_RETRIES
+    return v if v > 0 else RESCUE_MAX_RETRIES
+
+
+def _token_warn_threshold(cfg):
+    """token 峰值告警阈值(§2.7):config task.token_warn_threshold;缺失/非法/非正 → 300000。"""
+    try:
+        v = int((cfg.get("task") or {}).get("token_warn_threshold") or TOKEN_WARN_THRESHOLD)
+    except (TypeError, ValueError):
+        v = TOKEN_WARN_THRESHOLD
+    return v if v > 0 else TOKEN_WARN_THRESHOLD
+
+
+def _append_rescue_audit_best_effort(t, decision, action, result, note=None,
+                                     original_state=None, original_exit_code=None):
+    """抢救审计写 events/audit.jsonl(§2.5,stream=rescue,actor=flow:rescue;
+    best-effort:失败仅告警,不影响任务终态与 dispatch)。"""
+    try:
+        _append_jsonl_locked(
+            os.path.join(events_dir(), "audit.jsonl"),
+            os.path.join(events_dir(), "audit.jsonl.lock"),
+            {"schema_version": EVENT_SCHEMA_VERSION, "ts": now_iso(),
+             "stream": RESCUE_AUDIT_STREAM, "actor": "flow:rescue",  # 零个人标识
+             "task_id": t.get("id"), "workitem": t.get("workitem"), "kind": t.get("kind"),
+             "original_state": original_state, "original_exit_code": original_exit_code,
+             "decision": decision, "action": action, "result": result, "note": note})
+    except (StoreError, OSError) as e:
+        print(f"告警: rescue 审计写入失败: {e}", file=sys.stderr)
+
+
+def _notify_rescue(cfg, kind, t, wi_id, terminal=None, **extra):
+    """rescue 通知(§2.3/§2.4,host.notify 通道;未配置 → _pipe_notify no-op)。
+    可 accept 报告摘要取自 _fc.acceptance_summary(v["verify"]);绝不调用任何 accept。
+    ocr F6:terminal 为 execute 终态失败上下文({"state","exit_code","failure_tail"}),
+    rescue 发通知时随通知携带——单通知原则下终态失败通知不再重复发,信息不丢。"""
+    rec = {"kind": kind, "task_id": t.get("id"), "workitem": wi_id}
+    rec.update(extra)
+    if terminal is not None:
+        rec["terminal_failure"] = terminal
+    if kind == "rescue_accept_pending" and extra.get("verify"):
+        rec["summary"] = _fc.acceptance_summary(extra["verify"])
+        rec["guidance"] = [
+            "execute 终态自动抢救完成:已补 executor/result.json + diff.patch 并通过质量门,"
+            + "可人工 accept(accept 永远人工)",
+        ]
+    elif kind == "rescue_verify_fail":
+        try:
+            rec["gate"] = _fc._three_item_report(extra["verify"])
+        except Exception:  # noqa: BLE001, S110
+            pass
+        rec["guidance"] = [
+            "verify 未通过(fail-closed,不 accept):检查 taskbook diff_scope / design.md "
+            + "错误表后人工处理",
+        ]
+    elif kind == "rescue_verify_error":
+        rec["guidance"] = ["verify 前置失败(产物缺失/损坏):请人工检查 workitem 后处理"]
+    elif kind == "rescue_frozen":
+        rec["guidance"] = [
+            "execute 自动重跑已达上限已冻结:请人工介入(修复根因后手动 execute 或解除 "
+            + "rescue_frozen)",
+        ]
+    elif kind == "rescue_write_fail":
+        rec["guidance"] = ["抢救写 executor 产物失败:请人工补 result.json + diff.patch"]
+    _pipe_notify(cfg, rec)
+
+
+def do_rescue(t, wi_id, wi_dir, cfg, full_cfg, original_state, original_exit,
+              terminal=None):
+    """decision=="rescue":补 result.json + diff.patch → verify → 可 accept 报告(§2.3)。
+
+    只读复用 _fc.run_verify_auto_core(与正常 execute 同一质量门,绝不旁路);
+    写失败 → audit rescue_write_fail + notify(E8);verify 前置缺失 → rescue_verify_error(E9);
+    gate 不过 → rescue_verify_fail(不 accept,fail-closed);通过 → 可 accept 报告
+    (rescue_fail_count 归零由调用方在锁外执行,避免嵌套 flock)。
+    (ocr5-L2:原 result_raw/tests 死参数已删——函数体自行 resolve_test_command/
+    _git_rescue_diff 重建产物,不依赖调用方预读值。)
+    """
+    try:
+        tc = _fc.resolve_test_command(wi_dir, _fc.workdir(), None, None)
+        d = _git_rescue_diff(_fc.workdir())
+        changed = list(d["changed_files"]) + list(d["untracked_files"])
+        result = build_rescue_result(tc["command"], changed, original_state, original_exit)
+        executor_dir = os.path.join(wi_dir, "executor")
+        os.makedirs(executor_dir, exist_ok=True)
+        _atomic_write_local(os.path.join(executor_dir, "result.json"),
+                            json.dumps(result, ensure_ascii=False, separators=(",", ":")))
+        _atomic_write_local(os.path.join(executor_dir, "diff.patch"), d["patch"])
+    except OSError as e:
+        _append_rescue_audit_best_effort(
+            t, "rescue", "rescue_write_fail", {"error": str(e)},
+            original_state=original_state, original_exit_code=original_exit)
+        _notify_rescue(cfg, "rescue_write_fail", t, wi_id, terminal=terminal, error=str(e))
+        return "write_fail"
+    v = _fc.run_verify_auto_core(wi_id, wi_dir, {}, full_cfg)
+    if not v["ok"]:
+        _append_rescue_audit_best_effort(
+            t, "rescue", "rescue_verify_error", {"error": v.get("error")},
+            original_state=original_state, original_exit_code=original_exit)
+        _notify_rescue(cfg, "rescue_verify_error", t, wi_id, terminal=terminal, error=v.get("error"))
+        return "verify_error"
+    if v["gate_pass"]:
+        _append_rescue_audit_best_effort(
+            t, "rescue", "rescue_success", {"gate_pass": True},
+            original_state=original_state, original_exit_code=original_exit)
+        _notify_rescue(cfg, "rescue_accept_pending", t, wi_id, terminal=terminal, verify=v["verify"])
+        return "rescued"
+    _append_rescue_audit_best_effort(
+        t, "rescue", "rescue_verify_fail", {"gate_pass": False},
+        original_state=original_state, original_exit_code=original_exit)
+    _notify_rescue(cfg, "rescue_verify_fail", t, wi_id, terminal=terminal, verify=v["verify"])
+    return "verify_fail"
+
+
+def _reset_rescue_fail_count(wi_dir):
+    """成功抢救后计数归零(§2.3 ⑤);rescue_frozen 保持粘性不清。锁内读-改-写。"""
+    def _do():
+        st = _fc.load_status(wi_dir)
+        st["rescue_fail_count"] = 0
+        _fc.save_status_atomic(wi_dir, st)
+    try:
+        _fc.with_workitem_lock(wi_dir, _do)
+    except (StoreError, OSError):
+        pass
+
+
+def do_requeue(t, wi_id, wi_dir, cfg, full_cfg, original_state, original_exit, terminal=None):
+    """decision=="requeue":风暴计数 → 未冻结则重入队 execute 下一空闲窗口(§2.4)。
+
+    复用 chain-on-transition frozen 机制但独立键 rescue_fail_count/rescue_frozen
+    (不触碰 verify 链 chain_fail_count 语义);已冻结 → 仅 audit rescue_skip_frozen(E6);
+    超限 → notify rescue_frozen + audit 升级人工;重入队遇并发非终态冲突 → 回滚计数 +
+    audit rescue_requeue_conflict(E7,非任务本身失败不递增);QueueFull 同处理。
+    """
+    def _bump():
+        st = _fc.load_status(wi_dir)
+        before = {k: v for k, v in st.items()
+                  if k in ("rescue_fail_count", "rescue_frozen")}
+        if st.get("rescue_frozen"):
+            return before, st, "frozen_skip"          # 已冻结 → 不再重入队(E6)
+        try:
+            cnt = int(st.get("rescue_fail_count", 0)) + 1
+        except (TypeError, ValueError):
+            cnt = 1                                   # 计数损坏 → 归一 1(不 crash,不提前冻结)
+        st["rescue_fail_count"] = cnt
+        if cnt >= _rescue_max_retries(cfg):
+            st["rescue_frozen"] = True
+        _fc.save_status_atomic(wi_dir, st)
+        return before, st, ("frozen" if st.get("rescue_frozen") else "requeue")
+    before, st, action = _fc.with_workitem_lock(wi_dir, _bump)
+    if action == "frozen_skip":
+        _append_rescue_audit_best_effort(
+            t, "requeue", "rescue_skip_frozen", None,
+            original_state=original_state, original_exit_code=original_exit)
+        return "frozen_skip"                            # 不重复 notify(仅入冻临界通知一次)
+    if action == "frozen":
+        _append_rescue_audit_best_effort(
+            t, "requeue", "rescue_frozen",
+            {"rescue_fail_count": st.get("rescue_fail_count")},
+            original_state=original_state, original_exit_code=original_exit)
+        _notify_rescue(cfg, "rescue_frozen", t, wi_id, terminal=terminal,
+                       rescue_fail_count=st.get("rescue_fail_count"))
+        return "frozen"                                 # 超限冻结 + 升级人工
+    try:
+        scheduled = window.next_offpeak_start(
+            datetime.now(timezone.utc)).isoformat(timespec="seconds")
+        # W-S1 §6.2/§6.3:build_execute_command 首参为 wi_dir(size 判定需完整目录);
+        # expected-seconds 地板 = max(原 expected, timeout+115),防队列先杀 large rescue。
+        _p = _fc.resolve_execute_params(wi_dir, full_cfg, force=True)
+        command = _fc.build_execute_command(wi_dir, full_cfg, force=True)  # --force 仅越过前置状态检查
+        exp = t.get("expected_seconds")
+        exp = max(int(exp) if exp else 0, _p["timeout_s"] + 115)
+        add_task(cfg, command, workitem=wi_id, priority="P2", kind="execute",
+                 expected_seconds=exp,
+                 workdir=t.get("workdir"),
+                 scheduled_at=scheduled, why=f"rescue requeue {wi_id}")
+    except Exception as e:  # 入队失败全兜底:回滚计数,绝不泄漏(E7/QueueFull/其他)  # noqa: BLE001
+        def _rollback():
+            s2 = _fc.load_status(wi_dir)
+            # ocr F1:条件式回滚——仅当相关键仍等于 _bump 保存值(st,即未被并发
+            # rescue 流修改)才恢复;任一不符则跳过,避免 stale before 覆盖
+            # 并发 bump/冻结(TOCTOU:before 于 _bump 锁内快照,本函数重新持锁)。
+            for k in ("rescue_fail_count", "rescue_frozen"):
+                if k in st:
+                    if s2.get(k) != st[k]:
+                        return
+                elif k in s2:
+                    return
+            for k in ("rescue_fail_count", "rescue_frozen"):
+                if k in before:
+                    s2[k] = before[k]
+                else:
+                    s2.pop(k, None)
+            _fc.save_status_atomic(wi_dir, s2)
+        try:
+            _fc.with_workitem_lock(wi_dir, _rollback)
+        except Exception:  # 回滚本身失败仅告警,不影响任务终态  # noqa: BLE001, S110
+            pass
+        if isinstance(e, DuplicateWorkitem):
+            action = "rescue_requeue_conflict"
+        elif isinstance(e, QueueFull):
+            action = "rescue_requeue_queue_full"
+        else:
+            action = "rescue_requeue_error"
+        _append_rescue_audit_best_effort(
+            t, "requeue", action, {"error": str(e)},
+            original_state=original_state, original_exit_code=original_exit)
+        return "conflict"
+    _append_rescue_audit_best_effort(
+        t, "requeue", "rescue_requeue", {"scheduled_at": scheduled},
+        original_state=original_state, original_exit_code=original_exit)
+    return "requeued"
+
+
+def run_rescue_hook(t, cfg, state, rc=None, terminal=None):
+    """W-S2:execute timeout/failed 终态自动抢救入口(§2.1 数据流,§3 错误表)。
+
+    best-effort,不改任务终态;触发条件:chain.enabled + kind=execute +
+    state∈RESCUE_STATES + workitem 非空;不满足首行返回 "skipped"(E12/E13)。
+    resolve_wi_dir 失败 → audit rescue_error(E4)。rescue 分支的读判定与写产物/
+    verify 各占一次 with_workitem_lock 临界区(均与 verify/execute 同一把 .lock
+    防竞争写;两次临界区之间锁已释放,不连续持锁);计数归零在锁外执行
+    (避免嵌套 flock)。返回动作串供测试断言。
+    ocr F6:terminal 为 execute 终态失败上下文,透传进 rescue 通知(单通知)。
+    """
+    if not _chain_enabled(cfg):
+        return "skipped"                              # E12:零动作、零 audit
+    if t.get("kind") != "execute" or state not in RESCUE_STATES or not t.get("workitem"):
+        return "skipped"                              # E13:非 execute 不触发
+    wi_id = t["workitem"]
+    full_cfg = _fc_hook_cfg(cfg)
+    try:
+        wi_dir = _fc.resolve_wi_dir(wi_id, dict(full_cfg, workitem={
+            "id_max_len": 64, "plane_id": "control"}))
+    except Exception as e:  # noqa: BLE001
+        _append_rescue_audit_best_effort(
+            t, None, "rescue_error", {"error": f"{type(e).__name__}: {e}"},
+            original_state=state, original_exit_code=rc)
+        return "error"                                # E4:跳过抢救,不改任务终态
+    decision, result, _tests = _fc.with_workitem_lock(
+        wi_dir, lambda: assess_execute_completion(wi_dir, full_cfg))
+    if decision == "rescue":
+        # 写产物 + verify 另行持锁(design §5:与 verify/execute 同一把 .lock
+        # 防竞争写;与读判定为两次独立临界区,中间锁已释放)
+        def _rescue_locked():
+            return do_rescue(t, wi_id, wi_dir, cfg, full_cfg, state, rc,
+                             terminal=terminal)
+        action = _fc.with_workitem_lock(wi_dir, _rescue_locked)
+        if action == "rescued":                       # gate_pass → 锁外归零计数(避免嵌套 flock)
+            _reset_rescue_fail_count(wi_dir)
+        return action
+    if decision == "requeue":
+        return do_requeue(t, wi_id, wi_dir, cfg, full_cfg, state, rc, terminal=terminal)
+    # skip_ok / skip_partial:已有产物/半成品 → 仅 audit,不补写不重跑
+    _append_rescue_audit_best_effort(
+        t, decision, decision,
+        {"status": result.get("status") if isinstance(result, dict) else None},
+        original_state=state, original_exit_code=rc)
+    return decision
+
+
+def extract_reasonix_token_peak(started_at, finished_at):
+    """reasonix 日志 token 峰值(§2.6):按任务窗口 [started_at-120s, finished_at]
+    匹配 runs/*.log(下界保留 ±120s 就近容差,与 extract_reasonix_cost 同口径;
+    finished_at 约束上界,排除任务结束后启动的 run;finished_at 缺失/非法 →
+    上界回退 started_at+120s,维持原 ±120s 行为),对匹配日志全文 finditer
+    TOKEN_PEAK_RE → 全局 max(容忍千分位)。无匹配/目录缺失/时间非法 → None(E10,
+    静默跳过)。"""
+    if not started_at:
+        return None
+    try:
+        st = datetime.fromisoformat(started_at).astimezone(TZ_CN)
+    except (TypeError, ValueError):
+        return None
+    lo = st - timedelta(seconds=120)
+    hi = st + timedelta(seconds=120)          # finished_at 缺失/非法时维持原 ±120s 口径
+    if finished_at:
+        try:
+            ft = datetime.fromisoformat(finished_at).astimezone(TZ_CN)
+        except (TypeError, ValueError):
+            pass
+        else:
+            hi = ft
+    runs_dir = _reasonix_runs_dir()
+    if not os.path.isdir(runs_dir):
+        return None
+    try:
+        names = os.listdir(runs_dir)
+    except OSError:
+        return None
+    peak = None
+    for name in names:
+        m = re.match(r"^(\d{4})(\d{2})(\d{2})-(\d{2})(\d{2})(\d{2})", name)
+        if not m:
+            continue
+        p = os.path.join(runs_dir, name)
+        if not os.path.isfile(p):                     # 同名目录(非日志)不参与匹配
+            continue
+        y, mo, d, h, mi, s = (int(x) for x in m.groups())
+        try:
+            dt = datetime(y, mo, d, h, mi, s, tzinfo=TZ_CN)
+        except ValueError:
+            continue
+        if dt < lo or dt > hi:
+            continue
+        try:
+            # ocr F4:runaway 大日志超上限跳过(仿 STALE_TAIL_SCAN_BYTES 有界扫描,
+            # 不全量读入内存;不超限仍全文 finditer 保峰值口径)
+            if os.path.getsize(p) > TOKEN_PEAK_SCAN_BYTES:
+                continue
+            text = _fc.read_file(p)
+        except OSError:
+            continue
+        for mt in TOKEN_PEAK_RE.finditer(text):
+            try:
+                v = int(str(mt.group(1)).replace(",", "").replace("_", ""))
+            except ValueError:
+                continue
+            if peak is None or v > peak:
+                peak = v
+    return peak
+
+
+def run_token_warning(t, cfg, finished_at):
+    """execute 终态 token 峰值预警(§2.6):峰值 > 阈值 → 通知 + audit;无匹配/未超
+    → 跳过。仅通知 + audit,不改任何状态;host.notify 未配置 → _pipe_notify no-op。"""
+    if t.get("kind") != "execute":
+        return "skipped"
+    peak = extract_reasonix_token_peak(t.get("started_at"), finished_at)
+    if peak is None:
+        return "skipped"                              # E10:不 crash
+    threshold = _token_warn_threshold(cfg)
+    if peak <= threshold:
+        return "below_threshold"
+    _pipe_notify(cfg, {"kind": "token_warning", "task_id": t.get("id"),
+                       "workitem": t.get("workitem"), "peak_tokens": peak,
+                       "threshold": threshold,
+                       "guidance": ["上下文过大，下次建议拆分任务"]})
+    _append_rescue_audit_best_effort(
+        t, None, "token_warning", {"peak_tokens": peak, "threshold": threshold})
+    return "alerted"
+
+
+def resolve_scan_roots(cfg):
+    """扫描根解析(§1.4.7,可注入):FLOW_STALE_SCAN_ROOT 优先;否则 chain.scan_projects
+    或 glob 全项目;恒含当前仓 data_dir/workitems。
+    ocr6-F3:fallback 项目根由 _data_dir() 派生(其父目录的父目录,即
+    dirname(dirname(data_dir)) 下的兄弟项目),不再硬编码
+    ~/.openclaw/workspace/projects——非默认 FLOW_DATA_DIR 部署时扫对根。"""
+    ov = os.environ.get("FLOW_STALE_SCAN_ROOT")
+    if ov:
+        return [ov]
+    c = cfg.get("chain") or {}
+    sp = c.get("scan_projects")
+    roots = []
+    if sp:
+        roots += [os.path.join(p, ".flow", "workitems") for p in sp]
+    else:
+        base = os.path.dirname(os.path.dirname(os.path.abspath(_data_dir())))
+        roots += glob.glob(os.path.join(base, "*", ".flow", "workitems"))
+    roots.append(os.path.join(_data_dir(), "workitems"))
+    return list(dict.fromkeys(roots))
+
+
+def _peek_state(wi_dir):
+    """浅读 workitem status.yaml 的 state;缺失/非法 → None。"""
+    sp = os.path.join(wi_dir, "status.yaml")
+    if not os.path.isfile(sp):
+        return None
+    try:
+        status = _fc.parse_yaml(_fc.read_file(sp), sp)
+    except Exception:  # noqa: BLE001
+        return None
+    if not isinstance(status, dict):
+        return None
+    st = status.get("state")
+    return st if isinstance(st, str) else None
+
+
+def iter_stuck_workitems(scan_roots):
+    """扫描 roots 下 workitem 目录, 产出 (wi_dir, wi_id, state), 仅 STALE_STATES。
+    状态浅读失败 → 跳过(权威校验在 run_stale_gate 内 load_status 复核)。"""
+    for root in scan_roots:
+        if not root or not os.path.isdir(root):
+            continue
+        try:
+            names = sorted(os.listdir(root))
+        except OSError:
+            continue
+        for name in names:
+            wi_dir = os.path.join(root, name)
+            if not os.path.isdir(wi_dir):
+                continue
+            state = _peek_state(wi_dir)
+            if state in STALE_STATES:
+                yield wi_dir, name, state
+
+
+def last_event_ts(wi_dir):
+    """workitem events.jsonl 最后一行 ts → aware datetime;缺失/非法/naive → None(E1/E2)。
+
+    ocr L2:有界尾部读取(仿 last_notify_ts,seek 到文件末 ≤STALE_TAIL_SCAN_BYTES),
+    避免 events.jsonl 无限增长时每个 pump 周期对每个候选 workitem 逐行全量顺序 I/O。
+    """
+    path = os.path.join(wi_dir, "events.jsonl")
+    if not os.path.isfile(path):
+        return None                                              # E1
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, 2)
+            size = f.tell()
+            f.seek(max(0, size - STALE_TAIL_SCAN_BYTES))
+            raw = f.read(STALE_TAIL_SCAN_BYTES)
+    except OSError:
+        return None
+    lines = [ln for ln in raw.decode("utf-8", errors="replace").split("\n") if ln.strip()]
+    if not lines:
+        return None
+    last = lines[-1]
+    try:
+        rec = json.loads(last)
+    except ValueError:
+        return None
+    ts = rec.get("ts")
+    if not ts:
+        return None
+    try:
+        dt = datetime.fromisoformat(ts)
+    except (TypeError, ValueError):
+        return None
+    if dt.tzinfo is None:
+        return None                                              # E2 naive
+    return dt
+
+
+def last_notify_ts(wi_id, level):
+    """events/audit.jsonl 有界尾部扫描, 找最近一条 workitem==wi_id and level==level 的 ts。
+    缺失/非法/naive → None。"""
+    path = os.path.join(events_dir(), "audit.jsonl")
+    if not os.path.isfile(path):
+        return None
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, 2)
+            size = f.tell()
+            f.seek(max(0, size - STALE_TAIL_SCAN_BYTES))
+            raw = f.read(STALE_TAIL_SCAN_BYTES)
+    except OSError:
+        return None
+    lines = [ln for ln in raw.decode("utf-8", errors="replace").split("\n") if ln.strip()]
+    for line in reversed(lines):
+        try:
+            rec = json.loads(line)
+        except ValueError:
+            continue
+        if rec.get("workitem") != wi_id or rec.get("level") != level:
+            continue
+        ts = rec.get("ts")
+        if not ts:
+            continue
+        try:
+            dt = datetime.fromisoformat(ts)
+        except (TypeError, ValueError):
+            continue
+        if dt.tzinfo is None:
+            continue
+        return dt
+    return None
+
+
+def dedup_ok(wi_id, level, now, cooldown_s=STALE_DEDUP_COOLDOWN_S):
+    """remind/escalate/force 去重 ≤1/天(§1.4.6,audit 尾部反查)。
+
+    ocr8-M2:force 原无条件放行,假设「force 动作成功即离开 stuck 集」。但
+    notify_only(chain 关闭)与 R1 reject 不转移状态,workitem 停留 stuck 集 →
+    每个 pump 周期重复通知/audit(甚至重复 LLM 调用)。故 force 也走冷却;
+    成功转移的 workitem 会写新 event 重置计时,不会立即再次触发,不受冷却影响。"""
+    last = last_notify_ts(wi_id, level)
+    return last is None or (now - last).total_seconds() >= cooldown_s
+
+
+def _notify_stale(cfg, wi_id, state, level):
+    """stale 提醒/升级推送(§1.4.4):复用 host.notify;remind 温和 / escalate 明示收口。"""
+    rec = {
+        "kind": "stale_workitem", "workitem": wi_id, "state": state, "level": level,
+        "guidance": (
+            [f"workitem {wi_id} 卡在 {state} 已超时, 请及时处理: flow workitem status {wi_id}"]
+            if level == "remind" else
+            [f"workitem {wi_id} 卡在 {state} 即将自动收口, 请尽快干预: flow workitem status {wi_id}"]
+        ),
+    }
+    _pipe_notify(cfg, rec)
+    return {"result": "notified", "level": level, "detail": f"{state} stale"}
+
+
+def _notify_stale_archived(cfg, wi_id, state, target, error=None):
+    """归档推送(§1.4.5):复用 host.notify;move 失败时 error 非空。"""
+    _pipe_notify(cfg, {
+        "kind": "stale_archived", "workitem": wi_id, "state": state,
+        "target": target, "error": error,
+    })
+
+
+def _notify_stale_require_human(cfg, wi_id, state, detail=None):
+    """require_human_review 升级通知(§1.4.4,ocr10-M1):标记强制人工介入的
+    workitem 不被 stale gate 自动归档——保留原地,升级人工通知等人工处理。"""
+    _pipe_notify(cfg, {
+        "kind": "stale_require_human", "workitem": wi_id, "state": state,
+        "detail": detail,
+        "guidance": [
+            (f"workitem {wi_id} 标记 require_human_review, 需人工介入且不会自动归档: "
+             f"flow workitem status {wi_id}"),
+        ],
+    })
+
+
+def _review_outcome(r):
+    """从 W-A _hook_auto_review 返回的 audit 记录推断 outcome(契约适配 §2/§5)。
+    兼容 {"verdict": ...} / {"result": str} / {"action": "auto_review_*"} 三种形状。"""
+    if not isinstance(r, dict):
+        return {"result": "executed", "detail": None, "skipped": False}
+    if "verdict" in r:
+        v = r.get("verdict")
+        return {"result": v, "detail": r.get("reason"), "skipped": v == "skipped"}
+    if isinstance(r.get("result"), str):
+        v = r["result"]
+        return {"result": v, "detail": r.get("detail"), "skipped": v == "skipped"}
+    action = str(r.get("action") or "")
+    if "skip" in action:
+        return {"result": "skipped", "detail": r.get("output"), "skipped": True}
+    if "reject" in action:
+        return {"result": "reject", "detail": r.get("result"), "skipped": False}
+    if "pass" in action:
+        return {"result": "pass", "detail": r.get("result"), "skipped": False}
+    if "error" in action:
+        return {"result": "error", "detail": r.get("error"), "skipped": False}
+    return {"result": "executed", "detail": None, "skipped": False}
+
+
+def execute_stale_action(wi_id, wi_dir, state, action, level, cfg, now=None):
+    """force 动作执行(§1.4.4)。remind/escalate 只推送;force 按 action 分发 R1-R5。
+    所有 _fc.* 调用 getattr 探测 + try/except 兜底(E8/E19)。"""
+    if level != "force" or action == "notify_only":
+        return _notify_stale(cfg, wi_id, state, level)
+    full_cfg = _fc_hook_cfg(cfg)
+    if action == "auto_review":                     # R1
+        try:
+            r = _fc_call("_hook_auto_review", wi_dir, full_cfg, False)
+        except Exception as e:  # noqa: BLE001
+            return {"result": "error", "detail": f"auto_review: {type(e).__name__}: {e}"}
+        oc = _review_outcome(r)
+        if oc["skipped"]:                            # E6 require_human_review → 不自动归档,
+            _notify_stale_require_human(cfg, wi_id, state, oc["detail"])  # 升级人工通知保留
+            return {"result": "notified_skipped", "detail": oc["detail"]}
+        return {"result": oc["result"], "detail": oc["detail"]}
+    if action == "auto_translate":                  # R2
+        try:
+            return _fc_call("_hook_auto_translate", wi_dir, full_cfg, False)
+        except Exception as e:  # noqa: BLE001
+            return {"result": "error", "detail": f"auto_translate: {type(e).__name__}: {e}"}
+    if action == "auto_enqueue":                    # R3
+        # ocr7-L2:原 learn_expected_seconds → _inject_expected_seconds 写
+        # design-result.json 的 expected_seconds 为死字段(下游 _hook_auto_enqueue
+        # 自算 max(learn, timeout+115),从不读该字段)→ 删除注入,learn 函数保留
+        try:
+            return _fc_call("_hook_auto_enqueue", wi_dir, full_cfg, False)
+        except Exception as e:  # noqa: BLE001
+            return {"result": "error", "detail": f"auto_enqueue: {type(e).__name__}: {e}"}
+    if action == "archive":                         # R4/R5
+        return archive_stale_workitem(wi_id, wi_dir, state, "stale_>48h", cfg=cfg)
+    return {"result": "error", "detail": f"unknown action {action}"}
+
+
+def archive_stale_workitem(wi_id, wi_dir, state, reason, cfg=None):
+    """归档(§1.4.5,不删除、可恢复):shutil.move 到 <project>/.flow/stale/<id>/ +
+    stale.json marker(original_path/state/reason/archived_at);
+    目标已存在 → 时间戳后缀(E10);move 失败 → 保留原地 + audit failed + 通知(E11)。
+    ocr6-F1:move 成功后 marker 写失败(磁盘满等) → 尽力移回原处恢复;恢复也失败
+    → workitem 留在 stale 目录,通知携带 target 供人工恢复——不留半归档状态,
+    可恢复信息不丢。"""
+    stale_root = os.path.abspath(os.path.join(os.path.dirname(wi_dir), "..", "stale"))
+    target = os.path.join(stale_root, wi_id)
+    if os.path.exists(target):                        # E10 目标已存在 → 后缀避免覆盖
+        target = os.path.join(stale_root, f"{wi_id}-{int(time.time())}")
+    os.makedirs(stale_root, exist_ok=True)
+    try:
+        shutil.move(wi_dir, target)
+    except OSError as e:
+        _notify_stale_archived(cfg, wi_id, state, None, error=str(e))
+        return {"result": "error", "detail": f"move failed: {e}"}    # E11
+    marker = {"schema_version": 1, "id": wi_id, "state": state, "reason": reason,
+              "archived_at": now_iso(), "original_path": wi_dir}
+    try:
+        _atomic_write_local(os.path.join(target, "stale.json"),
+                            json.dumps(marker, ensure_ascii=False))
+    except OSError as e:
+        try:
+            shutil.move(target, wi_dir)               # 尽力恢复:移回原处
+        except (OSError, shutil.Error) as e2:          # 恢复失败 → 标记可恢复位置
+            _notify_stale_archived(
+                cfg, wi_id, state, target,
+                error=f"marker write failed: {e}; restore failed: {e2}")
+            return {"result": "error",
+                    "detail": f"marker write failed: {e}; restore failed: {e2}; "
+                              f"recover at {target}"}
+        _notify_stale_archived(
+            cfg, wi_id, state, None,
+            error=f"marker write failed: {e}; restored to {wi_dir}")
+        return {"result": "error",
+                "detail": f"marker write failed: {e}; workitem restored to {wi_dir}"}
+    _notify_stale_archived(cfg, wi_id, state, target)
+    return {"result": "archived", "target": target}
+
+
+def append_stale_audit(wi_id, state, age_s, level, action, res, now=None):
+    """stale 收口动作写 events/audit.jsonl(§1.6,复用 _append_jsonl_locked)。
+
+    ocr5-M1:now 为注入时钟 seam——缺省 datetime.now(UTC) 与 now_iso() 同口径;
+    测试传入固定 now(与 run_stale_gate 的 now 参数同源),使 audit ts 与
+    dedup_ok 的 now 比较共用同一时钟,去重判定确定性。"""
+    if now is None:
+        now = datetime.now(timezone.utc)
+    elif now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)  # 防御:与 run_stale_gate 的 now 补全对称
+    return _append_jsonl_locked(
+        os.path.join(events_dir(), "audit.jsonl"),
+        os.path.join(events_dir(), "audit.jsonl.lock"),
+        {"schema_version": EVENT_SCHEMA_VERSION, "ts": now.isoformat(timespec="seconds"),
+         "stream": STALE_TERMINAL_AUDIT_STREAM, "workitem": wi_id, "state": state,
+         "age_s": int(age_s), "level": level, "action": action,
+         "result": res.get("result"), "detail": res.get("detail")})
+
+
+def run_stale_gate(cfg, now=None, scan_roots=None):
+    """超时收口编排(§1.4.3):扫描 roots → 计龄分级 → 去重 → 动作 → audit。
+    全程 fail-closed(E1/E2/E3/E4),单 workitem 异常不影响其余。"""
+    now = now or datetime.now(timezone.utc)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    results = []
+    try:
+        roots = scan_roots or resolve_scan_roots(cfg)
+    except Exception:  # noqa: BLE001
+        roots = []
+    for wi_dir, wi_id, state in iter_stuck_workitems(roots):
+        try:
+            st = _fc_call("load_status", wi_dir)     # status 缺失/非法 → 跳过(E4)
+        except Exception:  # noqa: BLE001, S112
+            continue
+        if not isinstance(st, dict):
+            continue
+        try:
+            if _fc_call("is_locked", st, now):       # 有人处理中 → 跳过(E3)
+                continue
+        except Exception:  # noqa: BLE001, S112
+            continue
+        last = last_event_ts(wi_dir)                 # events.jsonl 最后 ts;缺失/非法 → 跳过(E1/E2)
+        if last is None:
+            continue
+        age_s = (now - last).total_seconds()
+        if age_s < 0:
+            continue
+        level = classify_stale_age(age_s, cfg)
+        if level == "silent":
+            continue
+        action = stale_action_for_state(state, _chain_enabled(cfg))
+        if action is None:
+            continue
+        if not dedup_ok(wi_id, level, now):          # remind/escalate/force ≤1/天(E-dedup)
+            continue
+        try:
+            res = execute_stale_action(wi_id, wi_dir, state, action, level, cfg, now)
+        except Exception as e:  # noqa: BLE001
+            res = {"result": "error", "detail": f"{type(e).__name__}: {e}"}
+        try:
+            append_stale_audit(wi_id, state, age_s, level, action, res, now=now)
+        except (StoreError, OSError) as e:
+            print(f"告警: stale audit 写入失败: {e}", file=sys.stderr)  # E12
+        results.append(res)
+    return results
 
 
 # ---------------------------------------------------------------------------
@@ -1967,7 +3535,7 @@ def _notify_if_configured(cfg, event_record):
 SUBCOMMANDS = {
     "add": cmd_add, "status": cmd_status, "list": cmd_list,
     "log": cmd_log, "run": cmd_run, "reconcile": cmd_reconcile,
-    "pump": cmd_pump, "reschedule": cmd_reschedule,
+    "pump": cmd_pump, "reschedule": cmd_reschedule, "snapshot": cmd_snapshot,
     "wake-text": cmd_wake_text, "prune": cmd_prune,
 }
 

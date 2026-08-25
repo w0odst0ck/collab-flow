@@ -53,6 +53,19 @@ executor:                      # P3 新增;全标量(执行器默认策略)
   default: reasonix            # 默认执行器(flow workitem execute 未指定 --executor 时)
   timeout_s: 1800              # 默认超时兜底(实际以 spec.invoke.timeout_s 为主,--timeout 可覆盖)
   diff_scope: null             # 默认不设全局 scope;scope 来自 taskbook 前置块或 --scope,缺失即 fail-closed
+  size:                        # W-S1:size→模型/超时映射(可配;段缺失/损坏回退 flow-core 硬编码 SIZE_DEFAULTS)
+    small:                     # 小改:flash + 1200s(永不自动降档,仅显式声明)
+      model: deepseek-v4-flash
+      timeout_s: 1200
+    medium:                    # 中改(默认档,与旧默认 1800 等价):flash + 1800s
+      model: deepseek-v4-flash
+      timeout_s: 1800
+    large:                     # 大改:强制 pro + 2400s(显式降级需 --force --force-reason)
+      model: deepseek-v4-pro
+      timeout_s: 2400          # 同时是 --timeout 与 RX_TIMEOUT 单超时源(wrapper 内部 export RX_TIMEOUT=$TIMEOUT)
+  size_estimate:               # W-S1:size 缺失时的估算阈值(可配,键缺失用硬编码兜底)
+    design_bytes_large: 30720  # design.md 超过 30KB → large
+    changed_files_large: 5     # 改动文件数超过 5 → large
 task:                          # M1 新增;全标量,P1 解析器照常通过(task 核心模块读取)
   schema_version: 1
   max_parallel: 2              # 全局并发上限(running 任务数);run --max-parallel 可覆盖,env FLOW_TASK_MAX_PARALLEL
@@ -70,7 +83,34 @@ task:                          # M1 新增;全标量,P1 解析器照常通过(ta
   prune_failed_days: 7         # 写时自动清理:failed/timeout/killed 保留天数(§5.1),env FLOW_TASK_PRUNE_FAILED_DAYS
   task_cap: 100                # 注册表容量上限:超限删最老终态(§5.1),env FLOW_TASK_TASK_CAP
   stale_after_s: 300           # 僵尸任务判定:running 心跳静默秒数(§5.2),env FLOW_TASK_STALE_AFTER_S
+  # W-S2(executor-timeout-recovery §2.7 决策):rescue/token 阈值不新增 defaults 键,
+  # 由 env FLOW_TASK_RESCUE_MAX_RETRIES / FLOW_TASK_TOKEN_WARN_THRESHOLD 或
+  # user config task.rescue_max_retries / task.token_warn_threshold 覆盖;缺失时
+  # flow-task-core 硬编码兜底(自动重跑限次 2 / reasonix token 峰值告警阈值 300000)。
+  # ── cost-opt-cache-dispatch(省钱批次 1b) ─────────────────────────────
+  # 同仓串行开关(默认 1=开):同 workdir 任务串行派发 → 后任务命中 prefix cache。
+  #   env FLOW_TASK_SAME_WORKDIR_SERIAL=0 恢复现状(同仓照常并行)。
+  # pro 全局串行开关(默认 1=开):design(pro)+large execute(pro) 同时最多 1 个。
+  #   env FLOW_TASK_PRO_SERIAL=0 恢复现状(pro 可并行,成本峰值双倍)。
+  # 两开关均不新增活动键:缺失时 flow-task-core 硬编码兜底 1(开)。
 host:                          # M2 新增:宿主集成钩子(全标量,均 null=关闭)
   notify: null                 # 通知命令模板;非空时终态把事件 JSON 走 stdin 喂给该命令
   wake_template: null          # 唤醒文本模板;null=内置默认;占位符渲染(design M2 §1.5)
+chain:                         # chain-on-transition 新增:post-transition 钩子链(全标量,P1 解析器照常通过)
+  enabled: true                # 总开关;false = 完全退化(零钩子、零 audit、零新增文件)
+  on_designed: auto_review      # auto_review:design 终态自动机械检查+LLM审→decision→translate→enqueue(全链自动)
+  on_reviewed: true            # auto_translate:review 通过后渲染 taskbook 并链式转 translated
+  on_translated: true          # auto_enqueue:判下一空闲窗口后 flow task add execute
+  on_executed: true            # auto_verify:verify --auto 语义 → verified 或打回加重试环
+  on_verified: true            # notify_accept:推送验收摘要(accept 永远人工)
+  review_llm: false            # auto_review 是否追加 LLM 语义审(verdict 需机械与 LLM 双过)
+  review_llm_model: deepseek-v4-pro  # LLM 语义审模型
+  storm_threshold: 3           # 连续 verify 失败 N 次冻结(chain_frozen)升级人工
+  overlap_minutes: 40          # 同仓 diff_scope 重叠自动错开不少于 N 分钟
+  dry_run: false               # 全局 dry-run(只计算不写盘;env FLOW_CHAIN_DRY_RUN=1 可覆盖)
+  max_depth: 8                 # 链递归深度上限(防风暴/防意外环)
+  notify: null                 # 推送命令模板;非空时把通知 JSON 走 stdin 喂给该命令
+  warn_hours: 24               # 【W-B 消费】升级提醒阈值(本方案仅声明不消费)
+  force_hours: 48              # 【W-B 消费】强制收口阈值(本方案仅声明不消费)
+  scan_projects: null          # 【W-C 消费】扫描项目 glob(本方案仅声明不消费)
 

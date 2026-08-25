@@ -125,7 +125,7 @@ for line in sys.stdin:
     if not line: continue
     try: r = json.loads(line)
     except Exception: continue
-    print(f"{r.get(\"ts\",\"\")}  {str(r.get(\"status\",\"\")):8s}  {str(r.get(\"duration_s\",\"\")):>6s}s  {(r.get(\"model\") or \"-\"):16s}  {r.get(\"output\") or \"-\"}")
+    print("{}  {:8s}  {:>6s}s  {:16s}  {}".format(r.get("ts",""), str(r.get("status","")), str(r.get("duration_s","")), (r.get("model") or "-"), r.get("output") or "-"))
 '
 }
 cmd_last() {
@@ -241,6 +241,7 @@ PROMPT="$(cat <<EOF
 - 不要调用任何写文件/执行类工具——你只产出文本，由外部封装工具负责落盘；
 - 不要执行方案，不要改动项目代码/数据/配置；
 - 你的产出是「designer 设计 → critic 审查 → executor 执行」协作流的第一步，必须实现就绪、可被审查。
+- 输出篇幅硬约束：方案正文 ≤ 12000 tokens，结论先行（开头即给「决策摘要」，不铺陈）；禁止复述任务简报的背景/需求原文；正文只写「决策、接口、验收标准、风险」四部分；其中「验收标准」必须保留 E 编号错误处理表（每错误场景一行，verify --auto 依赖它自动解析，不可省略）；
 
 任务简报：
 -----

@@ -1,0 +1,47 @@
+Review complete: 4 finding(s) across 19 selected item(s).
+
+─── executors/reasonix/wrapper.sh:63-65 ───
+[maintainability · medium] Cross-file observation: this new taskbook `model:` declaration feature is
+effectively shadowed in the main invoke path. flow-core's W-S1 size-gating always resolves a size
+and injects a non-empty `--model` (`build_execute_command`/`execute` call chain passes `--model
+<size-model>`, all tiers default to non-empty). Since `--model` (CLI) has highest priority here
+(line 67-68), the `TB_MODEL_DECL` branches (pro/flash) are unreachable whenever the wrapper is
+launched through `flow workitem execute`. Consider confirming the declaration should override the
+size-mapped default, or document/adjust the precedence so the feature is actually exercised (e.g.
+only supply `--model` when the size tier model must be enforced).
+
+
+
+─── scripts/flow-task-core.py:3088-3089 ───
+[other · medium] assess_execute_completion is invoked while holding the workitem .lock, but when
+executor/result.json is missing/corrupt it falls through to `_fc._run_tests(...)`, which runs the
+configured test command via subprocess.run(shell=True) with NO timeout. The rescue path runs this
+potentially long-running/unbounded subprocess inside the flock, blocking all transitions and manual
+recovery on that workitem for the entire test duration. This contradicts the codebase's own
+discipline elsewhere (flow-core ocr F4 keeps LLM/task-add/execute subprocesses out of the workitem
+lock because they can hold the lock for minutes). Consider moving the decision/tests run outside the
+lock (e.g., do the read-only completion assessment on a snapshot/fresh lock, then re-lock only for
+write), or at least wrap _run_tests with a bounded timeout.
+
+
+
+─── scripts/flow-core.py:3423-3428 ───
+[performance · low] resolve_execute_params is called twice in the enqueue path: once directly here
+and once again inside build_execute_command (which calls resolve_execute_params internally). Each
+call performs file I/O (_design_bytes/_changed_files reads) plus config parsing. The same
+duplicate-I/O pattern exists in _hook_auto_enqueue. Since the command builder needs the size/params
+anyway, consider having build_execute_command accept the already-resolved params, or return them, to
+avoid re-reading design.md and re-parsing scope on every enqueue.
+
+
+
+─── scripts/flow-task-core.py:2652-2654 ───
+[bug · medium] execute 任务终态钩子缺少与上面 design 分支等价的状态守门。design 分支在触发链前先检查 `cur == "designed"`(E17
+no-op),而 execute 分支无条件 `_trigger_chain(wi, cfg, "execute", "executed")`。由于同步 execute 的 workitem →
+executed 转移本身已在 `_with_transition_hooks` 内触发过 `on_executed`→auto_verify(已把 workitem 移到
+verified/designed),此处任务终态钩子会再次无守卫地触发
+`_run_post_transition_hooks(event="execute")`→`_hook_auto_verify`——对已非 executed 的 workitem 重复跑
+verify(重复 LLM/测试),并在 gate 通过后对 `verified→verified` 的转移失败时记录 spurious 的 `auto_verify_error` audit 与
+verify_fail 通知。建议像 design 分支一样先读 workitem 当前 state,仅当 `cur == "executed"` 时触发。
+
+

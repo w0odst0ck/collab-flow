@@ -50,17 +50,26 @@ redact() {
   fi
 }
 
-# ---- 模型决策: --model(CLI,最优先) > 任务书字节数 >= 阈值 → pro > 默认 flash ----
+# ---- 模型决策: --model(CLI,最优先) > 任务书 model: 声明(pro/flash) > 字节阈值 fallback ----
 RX_MODEL_DEFAULT="${RX_MODEL_DEFAULT:-deepseek-v4-flash}"
 RX_MODEL_PRO="${RX_MODEL_PRO:-deepseek-v4-pro}"
-RX_MODEL_PRO_THRESHOLD_BYTES="${RX_MODEL_PRO_THRESHOLD_BYTES:-8000}"
-# 阈值 env 非法(非正整数)→ fail-closed 回退默认 8000
+RX_MODEL_PRO_THRESHOLD_BYTES="${RX_MODEL_PRO_THRESHOLD_BYTES:-16000}"
+# 阈值 env 非法(非正整数)→ fail-closed 回退默认 16000
 if ! [[ "$RX_MODEL_PRO_THRESHOLD_BYTES" =~ ^[0-9]+$ ]]; then
-  RX_MODEL_PRO_THRESHOLD_BYTES=8000
+  RX_MODEL_PRO_THRESHOLD_BYTES=16000
 fi
+# 显式声明: 行锚定只认 `model: pro`/`model: flash`(可带尾注释), 首个匹配生效(flow 前置块天然靠前);
+# 正文内联示例(`含 model: pro` 之类, 行首非 model:)不会误命中; 值非法/加引号 → 不匹配, 回退阈值(fail-closed)
+TB_MODEL_DECL="$(printf '%s\n' "$TASKBOOK_CONTENT" \
+  | sed -nE 's/^[[:space:]]*model:[[:space:]]*(pro|flash)[[:space:]]*(#.*)?$/\1/p' \
+  | head -1)"
 TASKBOOK_BYTES="$(wc -c < "$TASKBOOK")"
 if [[ -n "$MODEL" ]]; then
-  RX_MODEL="$MODEL"
+  RX_MODEL="$MODEL"                                   # CLI 最优先
+elif [[ "$TB_MODEL_DECL" == "pro" ]]; then
+  RX_MODEL="$RX_MODEL_PRO"
+elif [[ "$TB_MODEL_DECL" == "flash" ]]; then
+  RX_MODEL="$RX_MODEL_DEFAULT"
 elif (( TASKBOOK_BYTES >= RX_MODEL_PRO_THRESHOLD_BYTES )); then
   RX_MODEL="$RX_MODEL_PRO"
 else
