@@ -1,0 +1,8 @@
+name: script
+description: 确定性命令执行器（零 LLM，秒级，批处理首选）。任务书 command: 行指定 shell 命令；黑名单危险命令拒绝；仅 workdir 内执行。
+usage: "<wrapper> --taskbook <path> --workdir <dir> --out <dir> [--timeout N]"
+taskbook_format: |
+  command: <shell 命令>    # 必填
+  timeout: 60              # 可选（默认 300）
+safety: 黑名单（rm -rf/mkfs/dd of=/dev/sd*/sudo/su/chown -R //shutdown/reboot）→ exit 4 拒绝
+outputs: result.md（stdout）+ result.json（契约同 local/reasonix）

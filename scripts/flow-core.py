@@ -93,6 +93,8 @@ SIZE_EST_DEFAULTS = {"design_bytes_large": 30720, "changed_files_large": 5}
 # LOCAL_MODEL_DEFAULT 是注册表名(见 config/defaults.yaml models 段),由 resolve_model 校验;
 # LOCAL_TIMEOUT_DEFAULT 秒(config executor.local.timeout_s 可配,缺失/损坏回退本值)。
 LOCAL_MODEL_DEFAULT = "qwen35-9b"
+# script-executor(确定性命令批处理):超时默认 300s(config executor.script.timeout_s 可配)。
+SCRIPT_TIMEOUT_DEFAULT = 300
 LOCAL_TIMEOUT_DEFAULT = 1200
 
 
@@ -358,7 +360,7 @@ def parse_yaml(text, src):
         ls = ln.lstrip()
         if ls.startswith("%"):
             raise StoreError(f"{src}:{i + 1}: 不支持的文档指令 '%'")
-        if ls.startswith("---") or ls.startswith("..."):
+        if ls.startswith(("---", "...")):
             raise StoreError(f"{src}:{i + 1}: 不支持的文档分隔符")
     node, idx = _parse_block(lines, 0, 0, src)
     for j in range(idx, len(lines)):
@@ -401,13 +403,10 @@ def _dump_scalar(v):
 
 def _dump_map_entry(key, v, out, indent):
     pad = " " * indent
-    if isinstance(v, dict) and v:
+    if isinstance(v, dict) and v or isinstance(v, list) and v:
         out.append(f"{pad}{key}:\n")
         _dump_node(v, out, indent + 2)
-    elif isinstance(v, list) and v:
-        out.append(f"{pad}{key}:\n")
-        _dump_node(v, out, indent + 2)
-    elif isinstance(v, dict) or isinstance(v, list):
+    elif isinstance(v, (dict, list)):
         out.append(f"{pad}{key}: []\n")  # 空集合(P2 输出不产生,防御性)
     else:
         out.append(f"{pad}{key}: {_dump_scalar(v)}\n")
@@ -1377,7 +1376,17 @@ def _resolve_executor_decl(wi_dir, cfg):
             raise UsageError("taskbook executor 声明必须是非空字符串(fail-closed)")
         executor = tb_executor.strip()
     else:
-        executor = (cfg.get("executor") or {}).get("default", "reasonix")
+        # 默认路由（2026-08-26 script-executor）：任务书含 command: 行 → script（确定性任务，零 LLM）；
+        # 否则 → cfg default（默认 reasonix）。显式声明优先于自动路由。
+        tb_path = os.path.join(wi_dir, "taskbook.md")
+        has_cmd = False
+        if os.path.isfile(tb_path):
+            with open(tb_path, encoding="utf-8") as _f:
+                has_cmd = bool(re.search(r"^\s*command:\s*\S", _f.read(), re.MULTILINE))
+        if has_cmd:
+            executor = "script"
+        else:
+            executor = (cfg.get("executor") or {}).get("default", "reasonix")
     return executor, _taskbook_model_decl(wi_dir)
 
 
@@ -1409,7 +1418,18 @@ def resolve_execute_params(wi_dir, cfg, cli_model=None, cli_timeout=None,
     else:
         size_info = resolve_size(wi_dir, cfg)
     size = size_info["size"]
-    if executor == "local":
+    if executor == "script":
+        # script 专用默认:超时 executor.script.timeout_s(缺失/损坏/非正 → 300 兜底)
+        script_cfg = (cfg.get("executor") or {}).get("script") or {}
+        try:
+            script_to = int(script_cfg.get("timeout_s", SCRIPT_TIMEOUT_DEFAULT))
+        except (TypeError, ValueError):
+            script_to = SCRIPT_TIMEOUT_DEFAULT
+        if script_to <= 0:
+            script_to = SCRIPT_TIMEOUT_DEFAULT
+        base_timeout = script_to
+        base_model = None
+    elif executor == "local":
         # local 专用默认:超时 executor.local.timeout_s(缺失/损坏/非正 → 1200 兜底)
         local_cfg = (cfg.get("executor") or {}).get("local") or {}
         try:
@@ -1437,7 +1457,9 @@ def resolve_execute_params(wi_dir, cfg, cli_model=None, cli_timeout=None,
 
     if cli_model is not None and cli_model == "":
         raise UsageError("--model 不能为空")
-    if executor == "local":
+    if executor == "script":
+        model = None  # script 零 LLM，无模型
+    elif executor == "local":
         # local 模型链:CLI --model > 任务书 tb_model 声明 > 默认 qwen35-9b;
         # resolve_model fail-closed:注册表不存在 → UsageError 列出可用模型
         model = cli_model or tb_model or LOCAL_MODEL_DEFAULT
@@ -1446,7 +1468,13 @@ def resolve_execute_params(wi_dir, cfg, cli_model=None, cli_timeout=None,
         model = cli_model if cli_model else base_model
 
     # ── 门禁 ──
-    if executor == "local":
+    if executor == "script":
+        # script 只放行 small|medium;large 拒绝(fail-closed,大任务不该是脚本)
+        if size == "large":
+            raise GateReject(
+                "size_gate_script",
+                "executor=script 只放行 small|medium;size=large 拒绝(fail-closed)")
+    elif executor == "local":
         # local 只放行 small|medium;large 拒绝(fail-closed,本地模型不接大任务);
         # 不走云 size 降级门禁(local 的模型/超时与 size 映射无关)
         if size == "large":
@@ -1573,9 +1601,9 @@ def _probe_test_command(wdir):
     makefile = os.path.join(wdir, "Makefile")
     if os.path.isfile(makefile):
         text = read_file(makefile)
-        if re.search(r"^test\s*:", text, re.M):
+        if re.search(r"^test\s*:", text, re.MULTILINE):
             return "make test"
-        if re.search(r"^check\s*:", text, re.M):
+        if re.search(r"^check\s*:", text, re.MULTILINE):
             return "make check"
     pkg = os.path.join(wdir, "package.json")
     if os.path.isfile(pkg):
@@ -1654,7 +1682,7 @@ def _collect_changed_files(result):
     out = []
     for f in files:
         s = str(f).lstrip("/")
-        if s.startswith(".flow/") or s.startswith(".git/") or s == "":
+        if s.startswith((".flow/", ".git/")) or s == "":
             continue
         out.append(s)
     return out
@@ -2124,7 +2152,7 @@ def cmd_transition(args, cfg):
 
 
 def cmd_list(args, cfg):
-    pos, opts = scan_args(args, {"state"})
+    _pos, opts = scan_args(args, {"state"})
     json_mode = bool(opts.get("json"))
     state_filter = opts.get("state")
     wd = workitems_dir()
@@ -2237,7 +2265,7 @@ def cmd_unlock(args, cfg):
                               "meta": {"owner": owner, "forced": force, "prev": prev}})
         return s
     try:
-        s = with_workitem_lock(wi_dir, _do)
+        with_workitem_lock(wi_dir, _do)
     except Locked as e:
         return fail(2, f"锁持有者不匹配: {e}", None, json_mode)
     if json_mode:
@@ -2256,7 +2284,7 @@ ARTIFACTS = {
 
 
 def cmd_show(args, cfg):
-    pos, opts = scan_args(args, set())
+    pos, _opts = scan_args(args, set())
     if len(pos) < 2:
         raise UsageError("show 缺少 <id> <artifact>")
     wi_id, artifact = pos[0], pos[1]
