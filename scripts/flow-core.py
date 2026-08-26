@@ -89,6 +89,12 @@ SIZE_DEFAULTS = {
 SIZE_EST_DEFAULTS = {"design_bytes_large": 30720, "changed_files_large": 5}
 # 30KB = 30720 字节;>30720 或 >5 文件 → large(严格大于,边界见 W-S1 §7)
 
+# local-executor(local 模型批处理):executor=local 专用默认(可配 executor.local.*)。
+# LOCAL_MODEL_DEFAULT 是注册表名(见 config/defaults.yaml models 段),由 resolve_model 校验;
+# LOCAL_TIMEOUT_DEFAULT 秒(config executor.local.timeout_s 可配,缺失/损坏回退本值)。
+LOCAL_MODEL_DEFAULT = "qwen35-9b"
+LOCAL_TIMEOUT_DEFAULT = 1200
+
 
 class UsageError(Exception):
     """用法/前置错误(→ exit 2)。"""
@@ -827,6 +833,7 @@ def load_config():
     executor = dict(merged.get("executor") or {})
     task = dict(merged.get("task") or {})  # flow-task-ledger:入队侧补参读取 default_priority/seed
     chain = dict(merged.get("chain") or {})  # chain-on-transition:post-transition 钩子链
+    models = dict(merged.get("models") or {})  # local-executor:模型注册表(resolve_model 消费)
 
     # env 覆盖(§7.1):环境已设即覆盖
     ttl = _env_int("FLOW_LOCK_TTL_S")
@@ -855,7 +862,7 @@ def load_config():
         if not isinstance(chain.get(k, False), bool):
             raise StoreError(f"chain.{k} 必须是布尔")
     return {"workitem": workitem, "gates": gates, "executor": executor,
-            "task": task, "chain": chain}
+            "task": task, "chain": chain, "models": models}
 
 
 def data_dir():
@@ -1320,8 +1327,63 @@ def executor_params_for(size, cfg):
     return {"model": model, "timeout_s": timeout}
 
 
+def resolve_model(name, cfg):
+    """模型注册表解析(local-executor):注册表不存在 → UsageError fail-closed 列出可用模型。
+
+    返回注册表条目 dict(如 {"type": "llm", "endpoint": "local", "model": "qwen3.5:9b", ...});
+    name 非字符串/空白 → 同拒。注册表来自 config/defaults.yaml models 段(user config 可覆盖)。
+    """
+    if not isinstance(name, str) or not name.strip():
+        raise UsageError("模型名不能为空")
+    models = cfg.get("models") or {}
+    entry = models.get(name.strip())
+    if not isinstance(entry, dict):
+        available = ", ".join(sorted(models)) if models else "(空)"
+        raise UsageError(f"模型 {name!r} 不在注册表;可用: {available}")
+    return dict(entry)
+
+
+def _taskbook_model_decl(wi_dir):
+    """任务书 model: 声明(flow 块优先,正文行锚定回退)——支持注册表任意名。
+
+    reasonix wrapper 仍只认 pro|flash(内部自解析);local 任务经此解析任意注册表名,
+    resolve_execute_params 校验后传给 executor。无声明 → None(回退默认)。
+    """
+    fb = parse_flow_block(wi_dir)
+    if isinstance(fb, dict):
+        fb_model = fb.get("model")
+        if isinstance(fb_model, str) and fb_model.strip():
+            return fb_model.strip()
+    path = os.path.join(wi_dir, "taskbook.md")
+    if not os.path.isfile(path):
+        return None
+    m = re.search(r"(?m)^[ \t]*model:[ \t]*([A-Za-z0-9._-]+)[ \t]*(?:#.*)?$",
+                  read_file(path))
+    return m.group(1) if m else None
+
+
+def _resolve_executor_decl(wi_dir, cfg):
+    """executor 路由(local-executor):flow 块 executor 声明 > cfg default;同时返回
+    任务书 model 声明(tb_model,local 任务用;reasonix 不消费,仍只认 pro|flash)。
+
+    声明非字符串/空 → UsageError fail-closed(不静默回退)。CLI --executor 优先级
+    由调用方(cmd_execute)在返回值上叠加。返回 (executor_name, tb_model)。
+    """
+    fb = parse_flow_block(wi_dir)
+    if isinstance(fb, dict) and "executor" in fb:
+        tb_executor = fb["executor"]
+        # 声明存在但空/非字符串 → fail-closed 拒绝(不静默回退 default)
+        if not isinstance(tb_executor, str) or not tb_executor.strip():
+            raise UsageError("taskbook executor 声明必须是非空字符串(fail-closed)")
+        executor = tb_executor.strip()
+    else:
+        executor = (cfg.get("executor") or {}).get("default", "reasonix")
+    return executor, _taskbook_model_decl(wi_dir)
+
+
 def resolve_execute_params(wi_dir, cfg, cli_model=None, cli_timeout=None,
-                           force=False, force_reason=None, cli_size=None):
+                           force=False, force_reason=None, cli_size=None,
+                           executor=None, tb_model=None):
     """execute 参数合并 + 门禁(§3.4 核心,纯判定;仅 resolve_size 触 I/O)。
 
     模型/超时机器强制:size==large 且显式降级(--model ≠ pro / --timeout < 2400)
@@ -1330,7 +1392,13 @@ def resolve_execute_params(wi_dir, cfg, cli_model=None, cli_timeout=None,
     {size, source, model, timeout_s, design_bytes, changed_files}。
     ocr7-M6:cli_size 非 None(内部 --size,async 入队固化值)→ 跳过 resolve_size
     重算,保证与预解析一致(design.md 增长/改动清单变化不再使档位漂移);
-    source 视为显式声明。"""
+    source 视为显式声明。
+    local-executor:executor=local 时走本地默认链——模型 qwen35-9b(注册表名,
+    CLI --model > 任务书 tb_model 声明 > 默认,resolve_model fail-closed 校验),
+    超时 executor.local.timeout_s(默认 1200);size=large → GateReject("size_gate_local")
+    fail-closed(local 只放行 small|medium),不走云 size 降级门禁。
+    """
+    executor = executor or "reasonix"
     if cli_size is not None:
         if cli_size not in SIZE_TIERS:
             raise GateReject("invalid_size",
@@ -1341,7 +1409,21 @@ def resolve_execute_params(wi_dir, cfg, cli_model=None, cli_timeout=None,
     else:
         size_info = resolve_size(wi_dir, cfg)
     size = size_info["size"]
-    base = executor_params_for(size, cfg)
+    if executor == "local":
+        # local 专用默认:超时 executor.local.timeout_s(缺失/损坏/非正 → 1200 兜底)
+        local_cfg = (cfg.get("executor") or {}).get("local") or {}
+        try:
+            local_to = int(local_cfg.get("timeout_s", LOCAL_TIMEOUT_DEFAULT))
+        except (TypeError, ValueError):
+            local_to = LOCAL_TIMEOUT_DEFAULT
+        if local_to <= 0:
+            local_to = LOCAL_TIMEOUT_DEFAULT
+        base_timeout = local_to
+        base_model = None  # local 模型链在下方独立解析(resolve_model 校验注册表)
+    else:
+        base = executor_params_for(size, cfg)
+        base_timeout = base["timeout_s"]
+        base_model = base["model"]
 
     if cli_timeout is not None:
         try:
@@ -1351,23 +1433,38 @@ def resolve_execute_params(wi_dir, cfg, cli_model=None, cli_timeout=None,
         if timeout <= 0:
             raise UsageError(f"--timeout 必须是正整数: {timeout}")
     else:
-        timeout = base["timeout_s"]
+        timeout = base_timeout
 
     if cli_model is not None and cli_model == "":
         raise UsageError("--model 不能为空")
-    model = cli_model if cli_model else base["model"]
+    if executor == "local":
+        # local 模型链:CLI --model > 任务书 tb_model 声明 > 默认 qwen35-9b;
+        # resolve_model fail-closed:注册表不存在 → UsageError 列出可用模型
+        model = cli_model or tb_model or LOCAL_MODEL_DEFAULT
+        resolve_model(model, cfg)
+    else:
+        model = cli_model if cli_model else base_model
 
-    # ── 门禁(仅 large 且降级触发)──
-    downgrade = (size == "large" and (
-        (cli_model is not None and cli_model != base["model"]) or
-        (cli_timeout is not None and timeout < base["timeout_s"])))
-    if downgrade and not force:
-        raise GateReject("size_gate",
-                         f"size=large 强制 {base['model']} / ≥{base['timeout_s']}s;"
-                         "显式降级需 --force --force-reason")
-    if downgrade and force and not (force_reason and str(force_reason).strip()):
-        raise GateReject("force_reason_required",
-                         "size=large 降级需 --force 并附 --force-reason(审计理由)")
+    # ── 门禁 ──
+    if executor == "local":
+        # local 只放行 small|medium;large 拒绝(fail-closed,本地模型不接大任务);
+        # 不走云 size 降级门禁(local 的模型/超时与 size 映射无关)
+        if size == "large":
+            raise GateReject(
+                "size_gate_local",
+                "executor=local 只放行 small|medium;size=large 拒绝(fail-closed)")
+    else:
+        # 门禁(仅 large 且降级触发)
+        downgrade = (size == "large" and (
+            (cli_model is not None and cli_model != base_model) or
+            (cli_timeout is not None and timeout < base_timeout)))
+        if downgrade and not force:
+            raise GateReject("size_gate",
+                             f"size=large 强制 {base_model} / ≥{base_timeout}s;"
+                             "显式降级需 --force --force-reason")
+        if downgrade and force and not (force_reason and str(force_reason).strip()):
+            raise GateReject("force_reason_required",
+                             "size=large 降级需 --force 并附 --force-reason(审计理由)")
 
     return {"size": size, "source": size_info["source"],
             "model": model, "timeout_s": timeout,
@@ -2797,8 +2894,16 @@ def cmd_execute(args, cfg):
     force = bool(opts.get("force"))
     force_reason = opts.get("force-reason")
     sync_mode = bool(opts.get("sync"))
-    executor_name = opts.get("executor") or cfg["executor"].get("default", "reasonix")
     wi_dir = resolve_wi_dir(wi_id, cfg)
+
+    # local-executor:executor 路由 = CLI --executor > workitem 声明(flow 块) > cfg default;
+    # 同时取任务书 model 声明(local 用;reasonix 仍只认 pro|flash,由 wrapper 自解析)
+    try:
+        executor_name, tb_model = _resolve_executor_decl(wi_dir, cfg)
+    except UsageError as e:
+        return fail(2, str(e), None, json_mode)
+    if opts.get("executor"):
+        executor_name = opts["executor"]
 
     status = load_status(wi_dir)
     if not force and status["state"] != "translated":
@@ -2821,7 +2926,8 @@ def cmd_execute(args, cfg):
                                         cli_model=opts.get("model"),
                                         cli_timeout=opts.get("timeout"),
                                         force=force, force_reason=force_reason,
-                                        cli_size=opts.get("size"))
+                                        cli_size=opts.get("size"),
+                                        executor=executor_name, tb_model=tb_model)
     except GateReject as e:
         return fail(2, e.args[0], e.args[1], json_mode)
     except UsageError as e:
@@ -3377,9 +3483,12 @@ def find_overlap_offset(wi_dir, wdir, allow, cfg, dry_run=False):
 def build_execute_command(wi_dir, cfg, force=False, force_reason=None):
     """白名单 execute 命令串(§1.4.3 + W-S1 §6.2):flow 绝对路径 + --sync + --executor
     + 已解析 --timeout/--model(W-S1:size 判定固化进命令串,重执行门禁幂等),
-    shlex.quote 逐 token;命中 FLOW_WORKITEM_RE(不拼数据路径,env 继承透传)。"""
-    executor = (cfg.get("executor") or {}).get("default", "reasonix")
-    p = resolve_execute_params(wi_dir, cfg, force=force, force_reason=force_reason)
+    shlex.quote 逐 token;命中 FLOW_WORKITEM_RE(不拼数据路径,env 继承透传)。
+    local-executor:executor 取 workitem 声明 > cfg default(local 时模型/超时按
+    本地默认链解析,固化进命令串,子进程重执行 resolve_model 幂等)。"""
+    executor, tb_model = _resolve_executor_decl(wi_dir, cfg)
+    p = resolve_execute_params(wi_dir, cfg, force=force, force_reason=force_reason,
+                               executor=executor, tb_model=tb_model)
     inner = ["workitem", "execute", os.path.basename(wi_dir), "--sync",
              "--executor", executor, "--size", p["size"],
              "--timeout", str(p["timeout_s"]), "--model", p["model"]]
@@ -3420,7 +3529,9 @@ def enqueue_execute_retry(wi_dir, cfg, dry_run):
     st = load_status(wi_dir)
     wi_id = st["id"]
     # W-S1 §6.3:expected-seconds 地板 = max(learn, timeout+115),防队列先杀 large
-    params = resolve_execute_params(wi_dir, cfg, force=True)
+    executor, tb_model = _resolve_executor_decl(wi_dir, cfg)
+    params = resolve_execute_params(wi_dir, cfg, force=True,
+                                    executor=executor, tb_model=tb_model)
     exp = max(learn_execute_expected(_design_duration(wi_dir), cfg),
               params["timeout_s"] + 115)
     base = window.next_offpeak_start(now_dt())
@@ -3618,7 +3729,9 @@ def _hook_auto_enqueue(wi_dir, cfg, dry_run):
                                output={"reason": reason}, dry_run=dry_run)
         wi_id = st["id"]
         # W-S1 §6.3:expected-seconds 地板 = max(learn, timeout+115),防队列先杀 large
-        params = resolve_execute_params(wi_dir, cfg)
+        executor, tb_model = _resolve_executor_decl(wi_dir, cfg)
+        params = resolve_execute_params(wi_dir, cfg, executor=executor,
+                                        tb_model=tb_model)
         exp = max(learn_execute_expected(_design_duration(wi_dir), cfg),
                   params["timeout_s"] + 115)
         now = now_dt()

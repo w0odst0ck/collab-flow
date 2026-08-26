@@ -1,0 +1,37 @@
+# executors/local/spec.yaml —— 本地模型批处理执行器契约(受限 YAML,同 reasonix/stub 模式)
+#
+# 被 flow-core.py 的 parse_yaml 解析(§P3 §3.1);runtime.os 为能力声明(Linux-only)。
+# invoke.sandbox 对 executor 必须 workspace-write(read-only 非法)。
+# 与 reasonix 同契约: <wrapper> --taskbook --workdir --out [--timeout N] [--think true|false] [--model NAME]
+# 差异: 调 ollama /api/chat(不调 rx);退出码 1=用法错 / 2=ollama 不可达(可重试) / 3=生成空。
+id: local
+version: "1.0.0"
+runtime:
+  os: linux
+  shell: bash
+capabilities:
+  execute: true
+  plan: false
+  cost_report: false
+invoke:
+  binary: local
+  args_template: ""
+  timeout_s: 1200             # 默认超时;flow-core 以 executor.local.timeout_s(默认 1200)为准,--timeout 可覆盖
+  sandbox: workspace-write
+  # wrapper env 契约(wrapper.sh 内部读取,flow-core 只透传 --timeout/--model):
+  #   OLLAMA_URL        ollama API 基址,默认 http://127.0.0.1:11434
+  #   OLLAMA_MODEL      默认 ollama 模型名覆盖(qwen35-9b 的映射)
+  #   LOCAL_CURL_BIN    curl 可执行覆盖(测试注入假 curl,零真实调用)
+input:
+  taskbook: file
+  workdir: dir
+output:
+  result_manifest: result.json
+  diff: diff.patch            # local 不产出代码 diff;占位空文件满足 flow-core 契约(execute st==ok 检查)
+exit_codes:
+  ok: 0
+  failed: 1
+  usage: 1                   # 参数/前置错误(缺参、taskbook 不可读)
+  unreachable: 2             # ollama 不可达(curl 失败/超时),可重试
+  empty: 3                   # 模型回复为空
+  timeout: 124               # 外层 guard 超时(防 wrapper 挂起)

@@ -52,6 +52,8 @@ gates:
 executor:                      # P3 新增;全标量(执行器默认策略)
   default: reasonix            # 默认执行器(flow workitem execute 未指定 --executor 时)
   timeout_s: 1800              # 默认超时兜底(实际以 spec.invoke.timeout_s 为主,--timeout 可覆盖)
+  local:                       # executor=local(本地模型批处理)专用默认;env 无覆盖,user config 可配
+    timeout_s: 1200            # local 任务默认超时(秒);ollama 本地推理,1200s 足够批处理/小任务
   diff_scope: null             # 默认不设全局 scope;scope 来自 taskbook 前置块或 --scope,缺失即 fail-closed
   size:                        # W-S1:size→模型/超时映射(可配;段缺失/损坏回退 flow-core 硬编码 SIZE_DEFAULTS)
     small:                     # 小改:flash + 1200s(永不自动降档,仅显式声明)
@@ -113,4 +115,67 @@ chain:                         # chain-on-transition 新增:post-transition 钩�
   warn_hours: 24               # 【W-B 消费】升级提醒阈值(本方案仅声明不消费)
   force_hours: 48              # 【W-B 消费】强制收口阈值(本方案仅声明不消费)
   scan_projects: null          # 【W-C 消费】扫描项目 glob(本方案仅声明不消费)
+
+# models 段(local-executor 新增):模型注册表,只登记结构,不存真实路径/明文 key;
+# 键名 = 注册表名(resolve_model 解析);本地条目 url/path 均为本机约定占位
+# (127.0.0.1 / ~/.cache/...),真实地址由 user config 覆盖;红线:零个人标识。
+models:                        # 模型注册表
+  qwen35-9b:                   # 本地 LLM 主力(GPU,52 tok/s)
+    type: llm
+    endpoint: local
+    url: "http://127.0.0.1:11434"   # ollama API 基址
+    model: "qwen3.5:9b"             # ollama 模型名
+    think: true                      # 默认开思考;任务书 think: false 可关(翻译/机械任务)
+    speed: 52                        # 参考吞吐(tok/s,仅登记)
+    cost: 0                          # 本地零边际成本
+    note: "本地 LLM(GPU,52 tok/s),思考可关"
+  qwen3-8b:                    # 本地 LLM 备选
+    type: llm
+    endpoint: local
+    url: "http://127.0.0.1:11434"
+    model: "qwen3:8b"
+    think: true
+    cost: 0
+    note: "本地 LLM 备选"
+  deepseek-flash:              # 云 LLM(与 SIZE_DEFAULTS 的 deepseek-v4-flash 同源,注册表登记用)
+    type: llm
+    endpoint: api
+    provider: deepseek
+    model: "deepseek-v4-flash"
+    cost: low
+    note: "云 LLM"
+  deepseek-pro:                # 云 LLM(复杂任务)
+    type: llm
+    endpoint: api
+    provider: deepseek
+    model: "deepseek-v4-pro"
+    cost: high
+    note: "云 LLM(复杂任务)"
+  wan21-1.3b:                  # 视频生成(SceneCraft 管线)
+    type: video
+    endpoint: local
+    path: "~/.cache/models/wan21-t2v-1.3b"   # 占位路径;真实路径待 user config 覆盖
+    cost: 0
+    note: "视频生成(SceneCraft 管线);路径待 user config"
+  ltx-2b:                      # 视频生成备选
+    type: video
+    endpoint: local
+    path: "~/.cache/models/ltx-video"        # 占位路径;真实路径待 user config 覆盖
+    cost: 0
+    note: "视频生成备选;路径待 user config"
+  bge-m3:                      # 向量检索
+    type: embedding
+    endpoint: local
+    url: "http://127.0.0.1:9997"
+    model: "bge-m3"
+    cost: 0
+    note: "向量检索"
+  bge-reranker:                # 重排
+    type: rerank
+    endpoint: local
+    url: "http://127.0.0.1:9997"
+    model: "bge-reranker-v2-m3"
+    cost: 0
+    note: "重排"
+
 
