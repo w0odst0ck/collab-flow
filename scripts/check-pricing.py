@@ -30,7 +30,7 @@ _CFG_PATH = os.environ.get("PRICING_CONFIG") or os.path.join(
 _URL = "https://api-docs.deepseek.com/zh-cn/quick_start/pricing/"
 _UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36"
 # 官方脚注格式:「高峰时段为北京时间周一至周五 9:00 - 12:00、14:00 - 18:00(其余为空闲时段)」
-_RE_SPAN = re.compile(r"高峰时段为北京时间(?:周一至周五|周一 至 周五|周一至周日)?\s*([\d\s:：\-、]+)", re.S)
+_RE_SPAN = re.compile(r"高峰时段为北京时间(?:周一至周五|周一 至 周五|周一至周日)?\s*([\d\s:：\-、]+)", re.DOTALL)
 
 
 def _fetch_official():

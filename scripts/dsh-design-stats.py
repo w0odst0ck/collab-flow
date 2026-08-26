@@ -22,6 +22,7 @@ import os
 import subprocess
 import sys
 
+
 def project_key(cwd):
     """复刻 dsh projectKey()：/ \\ : → '-'（连续折叠）；安全字符 [A-Za-z0-9._-] 保留；其余 ~XXXX；外层包裹 --…--。"""
     readable = []
