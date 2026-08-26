@@ -457,7 +457,7 @@ def gate_validate(opts, cfg):
     #    注意:runner 实际经 sh -c 执行,门禁是「防脏」下限而非等价校验(风险表 §3);
     #    语法通过但 sh 语义不同 → 命令失败走 failed 终态 + failure_tail,安全侧不扩大。
     try:
-        proc = subprocess.run(["bash", "-n", "-c", command],
+        proc = subprocess.run(["bash", "-n", "-c", command], check=False,
                               stdin=subprocess.DEVNULL,
                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except OSError:
@@ -506,7 +506,6 @@ def gate_validate(opts, cfg):
                              "command 不在命令模板白名单(flow workitem …/rx …/bash|python …/scripts/…)。"
                              "确需自由命令请显式 --force 并附 --force-reason。")
     # audit.force_reason 由 add_task 统一维护(940 行),gate 不构造 patch(单一来源防分叉)
-    return None
 
 
 def _now_ms():
@@ -1080,7 +1079,7 @@ def seed_expected(history, fallback):
     ema = float(history[0])
     for d in history[1:]:
         ema = 0.5 * float(d) + 0.5 * ema
-    return max(int(fallback), int(math.ceil(ema * 1.5)))
+    return max(int(fallback), math.ceil(ema * 1.5))
 
 
 def update_seed(store, kind, duration_s, max_len=8):
@@ -1195,7 +1194,7 @@ def run_command(t, cfg):
             if t.get("kill_on_timeout"):
                 base += ["--kill-after", str(cfg["task"].get("kill_grace_s", 5))]
             base += [str(expected), "sh", "-c", t["command"]]
-            proc = subprocess.run(base, env=env)
+            proc = subprocess.run(base, env=env, check=False)
             rc = proc.returncode
             # kill-on-timeout 且 SIGTERM 被忽略 → --kill-after 触发 SIGKILL,timeout 报
             # 128+SIGKILL=137(而非 124);统一为超时语义,保证「超时→timeout」终态不削弱。
@@ -1203,14 +1202,14 @@ def run_command(t, cfg):
                 return 124
             return rc
         return _run_with_py_timeout(t)  # 降级:超时 SIGKILL(≈kill-on-timeout)
-    proc = subprocess.run(["sh", "-c", t["command"]], env=env)
+    proc = subprocess.run(["sh", "-c", t["command"]], env=env, check=False)
     return proc.returncode
 
 
 def _run_with_py_timeout(t):
     """无 timeout 二进制降级(§1.6.6):subprocess.run(timeout=...) → 超时抛 CommandTimeout。"""
     try:
-        proc = subprocess.run(["sh", "-c", t["command"]], timeout=t["expected_seconds"],
+        proc = subprocess.run(["sh", "-c", t["command"]], timeout=t["expected_seconds"], check=False,
                               env=_runner_env(t))
         return proc.returncode
     except subprocess.TimeoutExpired:
@@ -1222,8 +1221,7 @@ def spawn_runner(tid):
     子进程 env 注入任务 workdir 的 FLOW_DATA_DIR/FLOW_WORKDIR(任务书 §4:跨仓 workitem 解析);
     entry 读取失败/缺失 → 回退环境默认(不阻断 spawn)。"""
     os.makedirs(logs_dir(), exist_ok=True)
-    log_fd = open(log_path(tid), "ab")
-    try:
+    with open(log_path(tid), "ab") as log_fd:
         popen_kw = {}
         if os.name == "posix":
             popen_kw["start_new_session"] = True
@@ -1238,8 +1236,6 @@ def spawn_runner(tid):
             [sys.executable, os.path.abspath(__file__), "_runner", tid],
             stdin=subprocess.DEVNULL, stdout=log_fd, stderr=subprocess.STDOUT,
             env=env, close_fds=True, **popen_kw)
-    finally:
-        log_fd.close()
 
 
 def dispatch(cfg, max_parallel=None):
@@ -1349,7 +1345,7 @@ def add_task(cfg, command, workitem=None, priority="P2",
         })
         return tid, reg["tasks"][tid]
 
-    tid, entry = with_registry_flock(_do)
+    tid, _entry = with_registry_flock(_do)
     if not scheduled_at:  # 仅 queued 走既有 auto-dispatch;scheduled 交给 pump(§1.5(2))
         try:
             dispatch(cfg)  # best-effort 自动出队;失败不回溯,任务留在 queued,run 可补
@@ -2083,7 +2079,7 @@ def cmd_reschedule(args, cfg):
         return dict(t)
 
     try:
-        t = with_registry_flock(_do)
+        with_registry_flock(_do)
     except TaskError as e:
         return fail(2, "task not found", e.args[0], json_mode)
     except UsageError as e:
@@ -2533,7 +2529,7 @@ def _pipe_notify(cfg, record):
     try:
         proc = subprocess.run(["sh", "-c", template],
                               input=json.dumps(record, ensure_ascii=False),
-                              capture_output=True, text=True)
+                              capture_output=True, text=True, check=False)
         if proc.returncode != 0:
             print(f"告警: notify 命令 exit={proc.returncode}", file=sys.stderr)
     except OSError as e:
