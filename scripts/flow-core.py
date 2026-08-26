@@ -698,10 +698,7 @@ def load_status(wi_dir):
     path = os.path.join(wi_dir, "status.yaml")
     if not os.path.isfile(path):
         raise WorkitemError(f"work-item 缺失 status.yaml: {wi_dir}")
-    try:
-        status = parse_yaml(read_file(path), path)
-    except StoreError:
-        raise
+    status = parse_yaml(read_file(path), path)
     if not isinstance(status, dict):
         raise StoreError(f"{path}: 顶层必须是映射")
     if status.get("state") not in STATES:
@@ -713,10 +710,7 @@ def read_decision(wi_dir):
     path = os.path.join(wi_dir, "decision.yaml")
     if not os.path.isfile(path):
         return {}
-    try:
-        d = parse_yaml(read_file(path), path)
-    except StoreError:
-        raise
+    d = parse_yaml(read_file(path), path)
     return d if isinstance(d, dict) else {}
 
 
@@ -1529,10 +1523,7 @@ def load_executor_spec(name, exec_dir=None):
     spec_path = os.path.join(base, name, "spec.yaml")
     if not os.path.isfile(spec_path):
         raise StoreError(f"执行器 spec 不存在: {name}")
-    try:
-        spec = parse_yaml(read_file(spec_path), spec_path)
-    except StoreError:
-        raise
+    spec = parse_yaml(read_file(spec_path), spec_path)
     if not isinstance(spec, dict):
         raise StoreError(f"{spec_path}: 顶层必须是映射")
     sid = spec.get("id")
@@ -1568,7 +1559,7 @@ def run_executor(wrapper, taskbook_path, workdir_path, out_dir, timeout, model=N
         cmd += ["--model", model]
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True,
-                              timeout=timeout + 60)
+                              timeout=timeout + 60, check=False)
     except subprocess.TimeoutExpired:
         return 124
     except OSError as e:
@@ -1706,12 +1697,7 @@ def check_diff_scope(wi_dir, result, cli_scope_file=None):
           "allow", "deny"}。
     """
     changed = _collect_changed_files(result)
-    try:
-        allow, deny, declared = _resolve_scope(wi_dir, cli_scope_file)
-    except UsageError:
-        raise
-    except StoreError:
-        raise
+    allow, deny, declared = _resolve_scope(wi_dir, cli_scope_file)
     if not declared:
         return {"match": False, "scope_verdict": "undeclared", "reason": "scope_undeclared",
                 "out_of_scope": [], "changed_files": changed, "allow": allow, "deny": deny}
@@ -1790,7 +1776,7 @@ def _derive_route(tests_result, diff_result, errors_result):
 def _git_available(wdir):
     try:
         proc = subprocess.run(["git", "-C", wdir, "rev-parse", "HEAD"],
-                              capture_output=True, text=True, timeout=10)
+                              capture_output=True, text=True, timeout=10, check=False)
     except (OSError, subprocess.TimeoutExpired):
         return False
     return proc.returncode == 0
@@ -1800,7 +1786,7 @@ def _run_tests(wdir, command):
     """在 workdir 运行测试命令;返回 {"pass", "exit_code", "output_tail", "reason"}。"""
     try:
         proc = subprocess.run(command, shell=True, cwd=wdir,
-                              capture_output=True, text=True)
+                              capture_output=True, text=True, check=False)
     except OSError as e:
         return {"pass": False, "exit_code": None, "output_tail": str(e), "reason": "command_failed"}
     rc = proc.returncode
@@ -2408,7 +2394,7 @@ def _invoke_design(flow_config, wdir, brief_path, out_dir):
     """
     cmd = [flow_config, "-d", wdir, "-o", out_dir, "--json", brief_path]
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True)
+        proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
     except OSError as e:
         return {"rc": 2, "info": None, "error": f"无法调用 flow-config: {e}",
                 "detail": None, "stdout": "", "stderr": ""}
@@ -2521,8 +2507,7 @@ def spawn_worker(wi_dir, brief_path, wdir, flow_config, log_path, started_at, ex
     env = dict(os.environ)
     env["FLOW_ASYNC_STARTED_AT"] = started_at
     env["FLOW_ASYNC_EXPECTED_S"] = str(expected_s)
-    log_fd = open(log_path, "ab")
-    try:
+    with open(log_path, "ab") as log_fd:
         popen_kw = {}
         if os.name == "posix":
             popen_kw["start_new_session"] = True
@@ -2531,8 +2516,6 @@ def spawn_worker(wi_dir, brief_path, wdir, flow_config, log_path, started_at, ex
              wi_dir, brief_path, wdir, flow_config],
             stdin=subprocess.DEVNULL, stdout=log_fd, stderr=subprocess.STDOUT,
             env=env, **popen_kw)
-    finally:
-        log_fd.close()
     return proc
 
 
@@ -2755,7 +2738,7 @@ def _enqueue_workitem_op(cfg, sub, wi_id, inner_argv, kind, json_mode, state_bef
         cmd += ["--expected-seconds", str(seed if seed else _SEED_FALLBACK.get(kind, 480))]
     cmd += ["--json"]
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True)
+        proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
     except OSError as e:
         return fail(1, f"无法调用 flow task add: {e}", None, json_mode)
     if proc.returncode != 0:
