@@ -43,10 +43,12 @@ TMP_ARTIFACTS=()
 cleanup() { rm -f "${TMP_ARTIFACTS[@]}" 2>/dev/null; }
 trap cleanup EXIT
 
-# ── 解析任务书: command 行 + timeout 覆盖 ──
+# ── 解析任务书: command 行 + timeout/test_command 覆盖 ──
 TB_CONTENT="$(cat "$TASKBOOK")"
 TB_CMD="$(printf '%s\n' "$TB_CONTENT" | sed -nE 's/^[[:space:]]*command:[[:space:]]*(.+)$/\1/p' | head -1)"
 TB_TIMEOUT="$(printf '%s\n' "$TB_CONTENT" | sed -nE 's/^[[:space:]]*timeout:[[:space:]]*([0-9]+)[[:space:]]*(#.*)?$/\1/p' | head -1)"
+# 2026-08-27 ocr high：契约补 test_command（verify 分层解析消费，同 reasonix result.json）
+TB_TEST="$(printf '%s\n' "$TB_CONTENT" | sed -nE 's/^[[:space:]]*test_command:[[:space:]]*(.+)$/\1/p' | head -1)"
 [[ -n "$TB_CMD" ]] || { echo "错误: 任务书缺少 command: 行" >&2; exit 1; }
 
 TIMEOUT="${TIMEOUT:-${TB_TIMEOUT:-300}}"
@@ -54,8 +56,14 @@ if ! [[ "$TIMEOUT" =~ ^[0-9]+$ ]] || (( TIMEOUT < 1 )); then
   echo "错误: --timeout 必须是正整数: $TIMEOUT" >&2; exit 1
 fi
 
-# ── 黑名单检查（fail-closed）──
-if printf '%s' "$TB_CMD" | grep -qE 'rm[[:space:]]+-rf|mkfs\.|dd[[:space:]]+.*of=/dev/|sudo|su[[:space:]]+|chown[[:space:]]+-R[[:space:]]+/|:[[:space:]]*\(\)[[:space:]]*\{|shutdown|reboot|>[/ ]dev/sd|mkfs'; then
+# ── 黑名单检查（fail-closed；防误操作，非防恶意——脚本执行器信任任务书作者）──
+# 2026-08-27 ocr high 加固：绝对路径变体（/bin/rm）、cd 逃逸（cd /）、多模式独立检查（避免复杂正则转义）
+BLOCKED=0
+printf '%s' "$TB_CMD" | grep -qE '(^|[;&|[:space:]])rm([[:space:]]|$)' && BLOCKED=1   # rm 命令（含 rm\ 反斜杠变体由 [:space:] 覆盖）
+printf '%s' "$TB_CMD" | grep -qE '(/bin/|/usr/bin/|/sbin/)?(rm|dd|mkfs)([[:space:]]|$)' && BLOCKED=1  # 绝对路径变体
+printf '%s' "$TB_CMD" | grep -qE '(^|[;&|[:space:]])cd[[:space:]]+/([[:space:]]|[;&|]|$)' && BLOCKED=1  # cd 到根（逃逸）
+printf '%s' "$TB_CMD" | grep -qE 'mkfs\.|dd[[:space:]].*of=/dev/|sudo([[:space:]]|$)|su[[:space:]]|:[[:space:]]*\(\\)[[:space:]]*\{|shutdown|reboot|/dev/sd' && BLOCKED=1
+if [[ "$BLOCKED" -eq 1 ]]; then
   echo "错误: 命令命中危险黑名单，已拒绝（exit 4）: $TB_CMD" >&2
   exit 4
 fi
@@ -79,17 +87,20 @@ elif [[ $rc -ne 0 ]]; then
 fi
 
 # ── 产物 ──
+export TB_TEST="${TB_TEST:-}"  # 契约：test_command 传 python 写 result.json
 cp "$OUT/.run.out" "$OUT/result.md" 2>/dev/null || : > "$OUT/result.md"
 python3 - "$OUT" "$TB_CMD" "$STATUS" "$EXIT_CODE" "$DUR" "$STARTED_AT" "$FINISHED_AT" "$REDACTED_LOGS" <<'PY' > "$OUT/result.json"
 import json, os, sys
 out, cmd, status, code, dur, st, ft, err = sys.argv[1:9]
 out = os.path.basename(out.rstrip("/"))
+test_cmd = os.environ.get("TB_TEST", "")
 rec = {
     "schema_version": 1,
     "executor": "script",
     "status": status,
     "exit_code": int(code),
     "command": cmd[:500],          # 脱敏截断（命令可能含路径）
+    "test_command": test_cmd[:500] if test_cmd else None,  # 契约：verify 分层解析消费
     "duration_s": float(dur),
     "started_at": st,
     "finished_at": ft,

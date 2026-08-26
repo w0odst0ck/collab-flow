@@ -58,10 +58,10 @@ else
 fi
 OLLAMA_MODEL="$(local_model_name "$MODEL_NAME")"
 
-# ── think 决策: --think(CLI) > 任务书 think: true|false > 默认 true(可关:翻译/机械任务) ──
+# ── think 决策: --think(CLI) > 任务书 think: true|false(大小写不敏感) > 默认 true ──
 # CLI 值非法 → 用法错(fail-closed);任务书声明非法值 → 忽略回默认(与 wrapper 阈值回退同风格)
 TB_THINK="$(printf '%s\n' "$TASKBOOK_CONTENT" \
-  | sed -nE 's/^[[:space:]]*think:[[:space:]]*(true|false)[[:space:]]*(#.*)?$/\1/p' \
+  | sed -nE 's/^[[:space:]]*think:[[:space:]]*([Tt]rue|[Ff]alse)[[:space:]]*(#.*)?$/\L\1/p' \
   | head -1)"
 THINK_VALUE="true"
 if [[ -n "$THINK" ]]; then

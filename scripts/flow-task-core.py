@@ -1271,7 +1271,8 @@ def dispatch(cfg, max_parallel=None):
 
 def add_task(cfg, command, workitem=None, priority="P2",
              expected_seconds=None, kill_on_timeout=False, kind=None, workdir=None,
-             why=None, scheduled_at=None, force=False, force_reason=None, model=None):
+             why=None, scheduled_at=None, force=False, force_reason=None, model=None,
+             executor=None):
     """幂等入队(§1.4(1)):flock 内去重(同 workitem 非终态 → DuplicateWorkitem) + 追加 + 自动 dispatch。
 
     kind 非空时:缺省 expected_seconds → 种子回退(config 默认);注册表条目带 kind 字段。
@@ -1327,6 +1328,7 @@ def add_task(cfg, command, workitem=None, priority="P2",
             "id": tid, "workitem": workitem, "command": command,
             "priority": priority, "state": "scheduled" if scheduled_at else "queued",
             "kind": kind, "model": model,
+            "executor": executor,  # 2026-08-27 ocr medium：记录执行器（script/local 零成本落账消费）
             "workdir": workdir or os.getcwd(), "expected_seconds": exp,
             "kill_on_timeout": bool(kill_on_timeout),
             "scheduled_at": scheduled_at, "why": why, "cost_usd": None,

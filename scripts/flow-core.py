@@ -2969,7 +2969,8 @@ def cmd_execute(args, cfg):
             cfg, "execute", wi_id,
             ["workitem", "execute", wi_id, "--sync", "--executor", executor_name,
              "--size", params["size"],
-             "--timeout", str(timeout), "--model", model]
+             "--timeout", str(timeout)]
+            + (["--model", model] if model else [])  # 2026-08-27 ocr high：None 省略（script 零 LLM）
             + force_args + ["--json"],
             "execute", json_mode, status["state"], timeout=timeout)
 
@@ -3502,7 +3503,9 @@ def build_execute_command(wi_dir, cfg, force=False, force_reason=None):
                                executor=executor, tb_model=tb_model)
     inner = ["workitem", "execute", os.path.basename(wi_dir), "--sync",
              "--executor", executor, "--size", p["size"],
-             "--timeout", str(p["timeout_s"]), "--model", p["model"]]
+             "--timeout", str(p["timeout_s"])]
+    if p.get("model"):
+        inner += ["--model", p["model"]]  # 2026-08-27 ocr high：None 省略
     if force:
         inner.append("--force")
         if force_reason:
