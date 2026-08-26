@@ -1667,7 +1667,11 @@ def extract_cost_usd(t, started_at, finished_at):
 def _settle_cost(task_id, t, finished_at):
     """终态后锁外 best-effort 回写 cost_usd(§1.5(4)):摘不到 → 保持 null,写失败静默。"""
     try:
-        cost = extract_cost_usd(t, t.get("started_at"), finished_at)
+        # 2026-08-27：script/local 执行器零 LLM 成本 → 明确落账 0（flowq 显示 💰0）
+        if t.get("executor") in ("script", "local"):
+            cost = 0.0
+        else:
+            cost = extract_cost_usd(t, t.get("started_at"), finished_at)
     except (StoreError, OSError):
         return
     if cost is None:
