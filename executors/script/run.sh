@@ -82,7 +82,7 @@ fi
 cp "$OUT/.run.out" "$OUT/result.md" 2>/dev/null || : > "$OUT/result.md"
 python3 - "$OUT" "$TB_CMD" "$STATUS" "$EXIT_CODE" "$DUR" "$STARTED_AT" "$FINISHED_AT" "$REDACTED_LOGS" <<'PY' > "$OUT/result.json"
 import json, os, sys
-out, cmd, status, code, dur, st, ft, err = sys.argv[1:8]
+out, cmd, status, code, dur, st, ft, err = sys.argv[1:9]
 out = os.path.basename(out.rstrip("/"))
 rec = {
     "schema_version": 1,
