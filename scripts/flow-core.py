@@ -1782,11 +1782,28 @@ def _git_available(wdir):
     return proc.returncode == 0
 
 
-def _run_tests(wdir, command):
-    """在 workdir 运行测试命令;返回 {"pass", "exit_code", "output_tail", "reason"}。"""
+def _run_tests(wdir, command, timeout=None):
+    """在 workdir 运行测试命令;返回 {"pass", "exit_code", "output_tail", "reason"}。
+
+    timeout:可选有界超时(秒);None(默认)= 不设超时,保持 verify 路径既有行为。
+    ocr medium F1:传值时 subprocess 超时 → TimeoutExpired → 返回 reason="timeout"
+    (exit_code=None),不抛异常;调用方(如锁内 assess_execute_completion)据此
+    判定不达标且不无限阻塞。"""
     try:
         proc = subprocess.run(command, shell=True, cwd=wdir,
-                              capture_output=True, text=True, check=False)
+                              capture_output=True, text=True, check=False,
+                              timeout=timeout)
+    except subprocess.TimeoutExpired as e:
+        # CPython:communicate 在 decode 之前抛 TimeoutExpired,text=True 下
+        # e.stdout/e.stderr 仍是 bytes(或有部分输出 str);统一成 str 再拼尾部
+        def _dec(v):
+            if v is None:
+                return ""
+            if isinstance(v, bytes):
+                return v.decode(errors="replace")
+            return str(v)
+        tail = (_dec(e.stdout) + _dec(e.stderr))[-2000:]
+        return {"pass": False, "exit_code": None, "output_tail": tail, "reason": "timeout"}
     except OSError as e:
         return {"pass": False, "exit_code": None, "output_tail": str(e), "reason": "command_failed"}
     rc = proc.returncode
@@ -3492,20 +3509,25 @@ def find_overlap_offset(wi_dir, wdir, allow, cfg, dry_run=False):
     return 0
 
 
-def build_execute_command(wi_dir, cfg, force=False, force_reason=None):
+def build_execute_command(wi_dir, cfg, force=False, force_reason=None, params=None):
     """白名单 execute 命令串(§1.4.3 + W-S1 §6.2):flow 绝对路径 + --sync + --executor
     + 已解析 --timeout/--model(W-S1:size 判定固化进命令串,重执行门禁幂等),
     shlex.quote 逐 token;命中 FLOW_WORKITEM_RE(不拼数据路径,env 继承透传)。
     local-executor:executor 取 workitem 声明 > cfg default(local 时模型/超时按
-    本地默认链解析,固化进命令串,子进程重执行 resolve_model 幂等)。"""
+    本地默认链解析,固化进命令串,子进程重执行 resolve_model 幂等)。
+    ocr medium F3:params 可选——调用方(enqueue_execute_retry/_hook_auto_enqueue)
+    已先 resolve_execute_params 算 exp 用,传入复用可避免重复 design.md I/O +
+    config 解析;None(默认)时内部解析,保持向后兼容(verify/外部直调不变)。"""
     executor, tb_model = _resolve_executor_decl(wi_dir, cfg)
-    p = resolve_execute_params(wi_dir, cfg, force=force, force_reason=force_reason,
-                               executor=executor, tb_model=tb_model)
+    if params is None:
+        params = resolve_execute_params(wi_dir, cfg, force=force,
+                                        force_reason=force_reason,
+                                        executor=executor, tb_model=tb_model)
     inner = ["workitem", "execute", os.path.basename(wi_dir), "--sync",
-             "--executor", executor, "--size", p["size"],
-             "--timeout", str(p["timeout_s"])]
-    if p.get("model"):
-        inner += ["--model", p["model"]]  # 2026-08-27 ocr high：None 省略
+             "--executor", executor, "--size", params["size"],
+             "--timeout", str(params["timeout_s"])]
+    if params.get("model"):
+        inner += ["--model", params["model"]]  # 2026-08-27 ocr high：None 省略
     if force:
         inner.append("--force")
         if force_reason:
@@ -3550,7 +3572,7 @@ def enqueue_execute_retry(wi_dir, cfg, dry_run):
               params["timeout_s"] + 115)
     base = window.next_offpeak_start(now_dt())
     scheduled = base.isoformat(timespec="seconds")
-    command = build_execute_command(wi_dir, cfg, force=True)
+    command = build_execute_command(wi_dir, cfg, force=True, params=params)
     argv = [_flow_bin(), "task", "add", "--command", command, "--workitem", wi_id,
             "--kind", "execute", "--priority", "P2",
             "--expected-seconds", str(exp), "--why", f"chain verify retry {wi_id}",
@@ -3755,7 +3777,7 @@ def _hook_auto_enqueue(wi_dir, cfg, dry_run):
         off = find_overlap_offset(wi_dir, workdir(), allow, cfg, dry_run)
         if off:
             scheduled = (base + timedelta(minutes=off)).isoformat(timespec="seconds")
-        command = build_execute_command(wi_dir, cfg)
+        command = build_execute_command(wi_dir, cfg, params=params)
         argv = [_flow_bin(), "task", "add", "--command", command, "--workitem", wi_id,
                 "--kind", "execute", "--priority", "P2",
                 "--expected-seconds", str(exp), "--why", f"chain auto_enqueue {wi_id}",

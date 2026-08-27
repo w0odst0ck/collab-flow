@@ -367,6 +367,65 @@ class RescueHookTests(RescueIsoBase):
         self.assertIsNone(result)
 
 
+class AssessCompletionTimeoutTests(RescueIsoBase):
+    """ocr medium F1:锁内预检测试(_run_tests)传有界 timeout(常量 + config 覆盖)。"""
+
+    def _spy_run_tests(self, captured):
+        def _fn(wdir, command, timeout=None):
+            captured["timeout"] = timeout
+            return {"pass": True, "exit_code": 0, "output_tail": "", "reason": None}
+        return _fn
+
+    def test_config_test_timeout_s_used(self):
+        """full_cfg.rescue.test_timeout_s → 传给 _run_tests(锁内不无限阻塞)。"""
+        wi = "rescue-to1"
+        wi_dir = self._mk_wi(wi, test_command="true")
+        captured = {}
+        with mock.patch.object(tc._fc, "resolve_test_command",
+                               return_value={"command": "true", "source": "test"}), \
+             mock.patch.object(tc._fc, "_run_tests",
+                               side_effect=self._spy_run_tests(captured)):
+            decision, result, tests = tc.assess_execute_completion(
+                wi_dir, {"rescue": {"test_timeout_s": 42}})
+        self.assertEqual(captured["timeout"], 42)
+        self.assertEqual(decision, "rescue")
+        self.assertTrue(tests["pass"])
+        self.assertIsNone(result)
+
+    def test_default_timeout_constant_when_config_missing(self):
+        """config 无 rescue.test_timeout_s / full_cfg 为 None → RESCUE_TEST_TIMEOUT_S。"""
+        wi = "rescue-to2"
+        wi_dir = self._mk_wi(wi, test_command="true")
+        captured = {}
+        with mock.patch.object(tc._fc, "resolve_test_command",
+                               return_value={"command": "true", "source": "test"}), \
+             mock.patch.object(tc._fc, "_run_tests",
+                               side_effect=self._spy_run_tests(captured)):
+            tc.assess_execute_completion(wi_dir, None)   # full_cfg=None 走缺省
+        self.assertEqual(captured["timeout"], tc.RESCUE_TEST_TIMEOUT_S)
+
+    def test_invalid_config_timeout_falls_back(self):
+        """config 值非法/非正 → 回退 RESCUE_TEST_TIMEOUT_S(fail-closed)。"""
+        wi = "rescue-to3"
+        wi_dir = self._mk_wi(wi, test_command="true")
+        captured = {}
+        with mock.patch.object(tc._fc, "resolve_test_command",
+                               return_value={"command": "true", "source": "test"}), \
+             mock.patch.object(tc._fc, "_run_tests",
+                               side_effect=self._spy_run_tests(captured)):
+            tc.assess_execute_completion(
+                wi_dir, {"rescue": {"test_timeout_s": "bogus"}})
+        self.assertEqual(captured["timeout"], tc.RESCUE_TEST_TIMEOUT_S)
+        captured.clear()
+        with mock.patch.object(tc._fc, "resolve_test_command",
+                               return_value={"command": "true", "source": "test"}), \
+             mock.patch.object(tc._fc, "_run_tests",
+                               side_effect=self._spy_run_tests(captured)):
+            tc.assess_execute_completion(
+                wi_dir, {"rescue": {"test_timeout_s": -5}})
+        self.assertEqual(captured["timeout"], tc.RESCUE_TEST_TIMEOUT_S)
+
+
 # ---------------------------------------------------------------------------
 # §4.3 风暴防护(2)
 # ---------------------------------------------------------------------------

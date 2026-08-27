@@ -118,6 +118,10 @@ RESCUE_MAX_RETRIES = 2            # 自动重跑限次(超限 rescue_frozen 冻�
 TOKEN_WARN_THRESHOLD = 300000     # reasonix 日志 token 峰值告警阈值
 RESCUE_AUDIT_STREAM = "rescue"    # events/audit.jsonl stream 标识
 RESCUE_STATES = ("timeout", "failed")   # 抢救触发终态(execute)
+# ocr medium F1:锁内预检测试(_run_tests)有界超时秒——assess_execute_completion 在
+# with_workitem_lock 临界区内跑测试,无超时会阻塞该 workitem 全部转移;config
+# rescue.test_timeout_s 可覆盖(缺失/非法回退本常量 300)
+RESCUE_TEST_TIMEOUT_S = 300
 TOKEN_PEAK_RE = re.compile(r"·\s*([0-9][0-9_,]*)\s*tok\s*·")  # usage 峰值行(容忍千分位逗号)
 TOKEN_PEAK_SCAN_BYTES = 1 << 20  # ocr F4:reasonix run-log 峰值扫描字节上限(超限跳过,防 runaway 全量读吃内存)
 # ocr7-M1:git diff HEAD 输出字节上限(workitem 锁内跑;超限截断 + 告警,防大 patch
@@ -2652,8 +2656,14 @@ def _terminal_hooks_action(t, cfg, state):
             return {"action": "design_done", "detail": "on_designed", "result": r}
         return {"action": "design_done_no_transition", "detail": cur}      # E17
     if kind == "execute" and state == "done":
-        r = _trigger_chain(wi, cfg, "execute", "executed")  # W-A 幂等
-        return {"action": "execute_done", "detail": "on_executed", "result": r}
+        cur = _read_wi_state_safe(wi, cfg)          # 读 status.yaml.state; 缺失 → None
+        # ocr medium F2:与 design 分支对称的状态守门——workitem 已被转移
+        # (state != executed,如 verify 已推进到 verified)时不再触发 chain,
+        # 防重复 auto_verify(重复 LLM/测试)+ spurious audit
+        if cur == "executed":
+            r = _trigger_chain(wi, cfg, "execute", "executed")  # W-A 幂等, 二次触发 no-op
+            return {"action": "execute_done", "detail": "on_executed", "result": r}
+        return {"action": "execute_done_no_transition", "detail": cur}      # E17
     if kind == "execute" and state in ("failed", "timeout", "partial-complete"):
         # 失败报告由 _notify_terminal 统一触发(避免与泛化通知双发, design §1.3 末注)
         return {"action": "execute_failed", "detail": state}
@@ -2726,7 +2736,18 @@ def assess_execute_completion(wi_dir, full_cfg):
     tc = _fc.resolve_test_command(wi_dir, _fc.workdir(), None, None)
     if tc["command"] is None:      # 无测试命令 → 无法确认「绿」→ 不达标(E1)
         return "requeue", None, {"pass": False, "reason": "command_unresolved"}
-    tests = _fc._run_tests(_fc.workdir(), tc["command"])
+    # ocr medium F1:锁内测试必须有界——full_cfg.rescue.test_timeout_s 可覆盖,
+    # 缺失/非法/非 dict 回退 RESCUE_TEST_TIMEOUT_S(300),防测试挂起阻塞该 workitem 全部转移
+    timeout = RESCUE_TEST_TIMEOUT_S
+    rescue_cfg = (full_cfg or {}).get("rescue")
+    if isinstance(rescue_cfg, dict):
+        try:
+            timeout = int(rescue_cfg.get("test_timeout_s", RESCUE_TEST_TIMEOUT_S))
+        except (TypeError, ValueError):
+            pass
+    if timeout <= 0:
+        timeout = RESCUE_TEST_TIMEOUT_S
+    tests = _fc._run_tests(_fc.workdir(), tc["command"], timeout=timeout)
     return rescue_decision(None, tests["pass"]), None, tests
 
 
@@ -3016,8 +3037,13 @@ def do_requeue(t, wi_id, wi_dir, cfg, full_cfg, original_state, original_exit, t
             datetime.now(timezone.utc)).isoformat(timespec="seconds")
         # W-S1 §6.2/§6.3:build_execute_command 首参为 wi_dir(size 判定需完整目录);
         # expected-seconds 地板 = max(原 expected, timeout+115),防队列先杀 large rescue。
-        _p = _fc.resolve_execute_params(wi_dir, full_cfg, force=True)
-        command = _fc.build_execute_command(wi_dir, full_cfg, force=True)  # --force 仅越过前置状态检查
+        # ocr medium F3:复用 _p 避免二次 resolve;executor/tb_model 先按 workitem
+        # 声明解析(与 enqueue_execute_retry 同构),保证 _p 与命令串 executor 自洽
+        # (script/local 任务不会拿到 reasonix 链的模型/超时)。
+        _executor, _tb_model = _fc._resolve_executor_decl(wi_dir, full_cfg)
+        _p = _fc.resolve_execute_params(wi_dir, full_cfg, force=True,
+                                        executor=_executor, tb_model=_tb_model)
+        command = _fc.build_execute_command(wi_dir, full_cfg, force=True, params=_p)  # --force 仅越过前置状态检查
         exp = t.get("expected_seconds")
         exp = max(int(exp) if exp else 0, _p["timeout_s"] + 115)
         add_task(cfg, command, workitem=wi_id, priority="P2", kind="execute",

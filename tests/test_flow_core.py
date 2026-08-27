@@ -18,3 +18,4 @@ StoreTests = _impl.StoreTests
 AsyncDesignTests = _impl.AsyncDesignTests
 ChainHookTests = _impl.ChainHookTests
 ChainConfigTests = _impl.ChainConfigTests
+RunTestsTimeoutTests = _impl.RunTestsTimeoutTests

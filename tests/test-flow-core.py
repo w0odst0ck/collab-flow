@@ -1739,6 +1739,59 @@ class ChainConfigTests(unittest.TestCase):
         self.assertTrue(cfg["chain"]["enabled"])
 
 
+class RunTestsTimeoutTests(unittest.TestCase):
+    """ocr medium F1:_run_tests 有界超时(verify 路径共用函数;timeout 可选,默认 None)。"""
+
+    def _tmp(self):
+        d = tempfile.mkdtemp(prefix="flow-run-tests-")
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        return d
+
+    def test_no_timeout_behavior_unchanged(self):
+        """不传 timeout → 行为不变:正常命令 pass/exit_code=0,reason=None。"""
+        r = fc._run_tests(self._tmp(), "echo hi")
+        self.assertTrue(r["pass"])
+        self.assertEqual(r["exit_code"], 0)
+        self.assertIsNone(r["reason"])
+
+    def test_timeout_expired_returns_timeout_reason(self):
+        """传 timeout 且命令超时 → pass=False、exit_code=None、reason="timeout"(不抛)。"""
+        # exec 替换 shell:timeout kill 直接命中命令进程,不遗留孤儿 sleep
+        r = fc._run_tests(self._tmp(), "exec sleep 0.5", timeout=0.1)
+        self.assertFalse(r["pass"])
+        self.assertIsNone(r["exit_code"])
+        self.assertEqual(r["reason"], "timeout")
+        self.assertIsInstance(r["output_tail"], str)
+
+    def test_timeout_expired_bytes_output_decoded(self):
+        """CPython text=True 超时时 TimeoutExpired.stdout/stderr 是未解码 bytes →
+        _dec 解码不 TypeError,output_tail 含部分输出(锁内不炸)。"""
+        with mock.patch.object(
+                fc.subprocess, "run",
+                side_effect=fc.subprocess.TimeoutExpired(
+                    ["cmd"], 0.1, output=b"partial stdout", stderr=b"err line")):
+            r = fc._run_tests(self._tmp(), "echo hi", timeout=0.1)
+        self.assertFalse(r["pass"])
+        self.assertIsNone(r["exit_code"])
+        self.assertEqual(r["reason"], "timeout")
+        self.assertIn("partial stdout", r["output_tail"])
+        self.assertIn("err line", r["output_tail"])
+
+    def test_timeout_fast_command_still_passes(self):
+        """传 timeout 但命令按时完成 → 正常通过(超时不误伤快速命令)。"""
+        r = fc._run_tests(self._tmp(), "echo ok", timeout=10)
+        self.assertTrue(r["pass"])
+        self.assertEqual(r["exit_code"], 0)
+        self.assertIsNone(r["reason"])
+
+    def test_failed_command_reason_unchanged(self):
+        """非超时失败:reason=test_failed,exit_code 非零(与既有行为一致)。"""
+        r = fc._run_tests(self._tmp(), "exit 3", timeout=10)
+        self.assertFalse(r["pass"])
+        self.assertEqual(r["exit_code"], 3)
+        self.assertEqual(r["reason"], "test_failed")
+
+
 
 
 if __name__ == "__main__":

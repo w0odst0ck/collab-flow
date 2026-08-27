@@ -206,10 +206,55 @@ class TerminalHookTests(WbIsoBase):
         mr.assert_not_called()
         mv.assert_not_called()
 
-    def test_terminal_hook_exception_is_best_effort(self):
-        # E19:resolve_wi_dir 抛异常 → 终态钩子记 error 不抛(审计 + 返回 result)
+    def test_terminal_execute_done_no_transition(self):
+        # ocr medium F2:execute done 但 workitem 已转移(state != executed)→ 不触发
+        # chain(防重复 auto_verify:重复 LLM/测试 + spurious audit),返回 no_transition
+        wi_dir = self._make_wi("w1", "verified")
         t = {"id": "t-1", "kind": "execute", "workitem": "w1", "state": "done"}
-        with mock.patch.object(tc._fc, "resolve_wi_dir", side_effect=RuntimeError("boom")):
+        with mock.patch.object(tc._fc, "resolve_wi_dir", return_value=wi_dir), \
+             mock.patch.object(tc._fc, "load_status",
+                               return_value={"state": "verified"}), \
+             mock.patch.object(tc._fc, "_run_post_transition_hooks") as mh, \
+             mock.patch.object(tc._fc, "_hook_auto_verify") as mv:
+            res = tc.run_terminal_hooks(t, self._cfg(), "done")
+        self.assertEqual(res["action"], "execute_done_no_transition")
+        self.assertEqual(res["detail"], "verified")
+        mh.assert_not_called()
+        mv.assert_not_called()
+
+    def test_terminal_execute_done_no_transition_state_missing(self):
+        # ocr medium F2:state 读取失败(缺失/异常 → None)→ 同样不触发,detail=None
+        t = {"id": "t-1", "kind": "execute", "workitem": "w1", "state": "done"}
+        with mock.patch.object(tc, "_read_wi_state_safe", return_value=None), \
+             mock.patch.object(tc._fc, "_run_post_transition_hooks") as mh, \
+             mock.patch.object(tc._fc, "_hook_auto_verify") as mv:
+            res = tc.run_terminal_hooks(t, self._cfg(), "done")
+        self.assertEqual(res["action"], "execute_done_no_transition")
+        self.assertIsNone(res["detail"])
+        mh.assert_not_called()
+        mv.assert_not_called()
+
+    def test_terminal_execute_done_wi_resolve_error_no_transition(self):
+        # ocr medium F2/E19:execute done 时 resolve_wi_dir 抛异常 → _read_wi_state_safe
+        # 内部归 None → no_transition 不抛(异常被吞,终态钩子不中断)
+        t = {"id": "t-1", "kind": "execute", "workitem": "w1", "state": "done"}
+        with mock.patch.object(tc._fc, "resolve_wi_dir",
+                               side_effect=RuntimeError("boom")), \
+             mock.patch.object(tc._fc, "_run_post_transition_hooks") as mh, \
+             mock.patch.object(tc._fc, "_hook_auto_verify") as mv:
+            res = tc.run_terminal_hooks(t, self._cfg(), "done")
+        self.assertEqual(res["action"], "execute_done_no_transition")
+        self.assertIsNone(res["detail"])
+        mh.assert_not_called()
+        mv.assert_not_called()
+
+    def test_terminal_hook_exception_is_best_effort(self):
+        # E19:钩子执行异常 → 终态钩子记 error 不抛(审计 + 返回 result);
+        # ocr medium F2:execute done 先经状态守门(executed 通过)再触发钩子
+        t = {"id": "t-1", "kind": "execute", "workitem": "w1", "state": "done"}
+        with mock.patch.object(tc, "_read_wi_state_safe", return_value="executed"), \
+             mock.patch.object(tc, "_trigger_chain",
+                               return_value={"result": "error", "detail": "boom"}):
             res = tc.run_terminal_hooks(t, self._cfg(), "done")
         self.assertEqual(res["action"], "execute_done")
         self.assertEqual(res["result"]["result"], "error")

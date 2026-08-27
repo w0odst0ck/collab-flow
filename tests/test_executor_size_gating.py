@@ -332,6 +332,59 @@ class SizeGatingTests(unittest.TestCase):
             fc.resolve_execute_params(wi_dir, _cfg(), cli_size="huge")
         self.assertEqual(cm.exception.args[0], "invalid_size")
 
+    def test_build_execute_command_reuses_params(self):
+        """ocr medium F3:传 params → build_execute_command 不再二次 resolve_execute_params
+        (消除重复 design.md I/O + config 解析),命令串与自解析一致。"""
+        wi_dir = self._mk_wi("w1", size="large")
+        cfg = _cfg()
+        params = fc.resolve_execute_params(wi_dir, cfg)   # 调用方已解析(算 exp 用)
+        with mock.patch.object(fc, "resolve_execute_params",
+                               wraps=fc.resolve_execute_params) as m:
+            cmd = fc.build_execute_command(wi_dir, cfg, params=params)
+        m.assert_not_called()                       # 传入 params 后不再重复解析
+        self.assertIn("workitem execute w1 --sync", cmd)
+        self.assertIn("--size large", cmd)
+        self.assertIn("--timeout 2400", cmd)
+        self.assertIn("--model deepseek-v4-pro", cmd)
+
+    def test_build_execute_command_params_force_consistent(self):
+        """ocr medium F3:force 降级路径同样复用 params(命令串含 --force/--force-reason)。"""
+        wi_dir = self._mk_wi("w1", size="large")
+        cfg = _cfg()
+        params = fc.resolve_execute_params(wi_dir, cfg, force=True,
+                                           force_reason="debug downgrade 降级")
+        with mock.patch.object(fc, "resolve_execute_params",
+                               wraps=fc.resolve_execute_params) as m:
+            cmd = fc.build_execute_command(wi_dir, cfg, force=True,
+                                           force_reason="debug downgrade 降级",
+                                           params=params)
+        m.assert_not_called()
+        self.assertIn("--force", cmd)
+        self.assertIn("--force-reason", cmd)
+
+    def test_build_execute_command_without_params_backward_compat(self):
+        """ocr medium F3:不传 params(向后兼容)→ 内部照常解析一次,行为不变。"""
+        wi_dir = self._mk_wi("w1", size="large")
+        with mock.patch.object(fc, "resolve_execute_params",
+                               wraps=fc.resolve_execute_params) as m:
+            cmd = fc.build_execute_command(wi_dir, _cfg())
+        self.assertEqual(m.call_count, 1)
+        self.assertIn("--size large", cmd)
+        self.assertIn("--timeout 2400", cmd)
+
+    def test_hook_auto_enqueue_resolves_params_once(self):
+        """ocr medium F3:_hook_auto_enqueue 全程只 resolve_execute_params 一次
+        (算 exp 与 build_execute_command 共用同一 params,不再双解析)。"""
+        stub, cap = self._stub_flow()
+        fc._flow_bin = lambda: stub
+        wi_dir = self._mk_wi("w1", size="large")
+        with mock.patch.object(fc, "resolve_execute_params",
+                               wraps=fc.resolve_execute_params) as m:
+            fc._hook_auto_enqueue(wi_dir, _cfg(), False)
+        self.assertEqual(m.call_count, 1)
+        args = fc.read_file(cap).splitlines()
+        self.assertIn("--expected-seconds", args)
+
     def test_async_force_reason_whitespace_rejected(self):
         """ocr7-M4:async 入队命令串白名单(FLOW_WORKITEM_RE)每选项只吃一个无空白
         token,多词 --force-reason 会静默入队失败——含空白时显式拒绝(exit 2,不入队)。"""
