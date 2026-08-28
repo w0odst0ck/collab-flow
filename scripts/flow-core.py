@@ -236,9 +236,20 @@ def _parse_map(lines, idx, indent, src):
         rest = split_comment(content[colon + 1:]).strip()
         if rest == "":
             idx += 1
-            if idx < n and leading_spaces(lines[idx]) > cur:
-                child, idx = _parse_block(lines, idx, leading_spaces(lines[idx]), src)
-                node[key] = child
+            if idx < n:
+                nxt_indent = leading_spaces(lines[idx])
+                nxt_stripped = lines[idx].strip()
+                if nxt_indent >= cur and nxt_stripped.startswith("-") \
+                        and not nxt_stripped.startswith("--"):
+                    # YAML 合法：block sequence 与父键同缩进（如 diff_scope.allow 的
+                    # `  allow:` + `  - item`）——空值键 → 同缩进列表
+                    child, idx = _parse_list(lines, idx, nxt_indent, src)
+                    node[key] = child
+                elif nxt_indent > cur:
+                    child, idx = _parse_block(lines, idx, nxt_indent, src)
+                    node[key] = child
+                else:
+                    node[key] = None
             else:
                 node[key] = None
         else:
