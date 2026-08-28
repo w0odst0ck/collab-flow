@@ -49,11 +49,20 @@ bash tests/run-flow-smoke.sh         # C1-C21（flow CLI 冒烟，含 --async/--
 
 ```
 scripts/          # dsh-design(设计器 CLI) + flow-config(配置加载层) + stats(成本统计)
-config/           # defaults.yaml + example
+config/           # defaults.yaml + example + pricing.yaml（峰谷计价唯一真相源）
+executors/        # reasonix(主力) / local(本地模型档) / script / stub
+plan/             # 产品核心目标（北极星）+ 优化方案 + 运维方案（决策唯一真相源）
+archive/          # 历史产物归档（早期任务书/brief 存档，git 历史可恢复）
 tests/            # 冒烟测试（stub 模式，零 API 消耗）
 templates/        # 上下文包/任务书/审查清单模板（去标识，{{role}} 占位）
+memory/           # ocr 记录/任务书（审计）
+designs/          # dsh 设计输出（本地，不入仓）
+.flow/            # workitem 数据（本地，不入仓；已完成 workitem 归档于 .flow/archive/）
 learning/         # 协作方法论（symlink → 个人笔记区，Obsidian 可读改）
 ```
+
+> **北极星**：`plan/产品核心目标.md` —— 自动化 + 成本核算（降本增效），所有讨论/开发以此为准。
+> **优化路线**：`plan/优化方案-v1.0.md` —— P0/P1/P2 按 ROI 排序，长任务锁 offpeak。
 
 ## 方法论
 
