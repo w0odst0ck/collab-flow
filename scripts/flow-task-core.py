@@ -149,6 +149,7 @@ USAGE = """用法: flow task <sub> ...
   flow task log       <id> [--tail N] [--json]
   flow task run       [<id>] [--max-parallel N] [--json]
   flow task pump      [--json]
+  flow task budget    [--json]
   flow task reschedule <id> --at ISO|HH:MM [--json]
   flow task snapshot  <id> [--json]
   flow task reconcile [--json]
@@ -178,6 +179,11 @@ class QueueFull(Exception):
 
 class GateReject(Exception):
     """门禁校验拒绝(flow-cost-ledger §1.4,fail-closed)。args=(error_code, 友好文案)。"""
+
+
+class BudgetPaused(UsageError):
+    """预算门禁暂停(cost-budget-guard §1.2):args=(level, used_cny, limit_cny)。
+    add_task 锁内二次校验抛出,兼容既有 except UsageError 路径(exit 2)。"""
 
 
 class StoreError(Exception):
@@ -343,12 +349,13 @@ def plan_dispatch(reg, max_parallel, cfg=None):
     return _select_gated(ordered, running, free, cfg)
 
 
-def plan_pump(reg, max_parallel, now, cfg=None):
+def plan_pump(reg, max_parallel, now, cfg=None, exclude_ids=None):
     """纯函数(pump,flow-cost-ledger §1.5(2)):到期 scheduled 排序 P0<P1<P2 +
     scheduled_at 升序 + id 字典序;只取 scheduled(绝不碰 queued)。P0 无窗口判断,仅靠排序置前。
 
     空槽 = max_parallel − running;无窗口硬门控(D4):到点即升,槽满留 scheduled 下轮再试。
     cfg=None(三参调用)→ 旧切片行为;cfg 非空 → 走 _select_gated 亲和门控。
+    exclude_ids(可选):本轮跳过这些 id(预算暂停任务不占槽,§1.2 补选)。
     """
     def _due(t):
         sa = t.get("scheduled_at")
@@ -359,8 +366,9 @@ def plan_pump(reg, max_parallel, now, cfg=None):
         except (TypeError, ValueError):
             return False  # 时间戳损坏 → 保守不入
 
+    excl = set(exclude_ids or ())
     due = [t for t in reg["tasks"].values()
-           if t.get("state") == "scheduled" and _due(t)]
+           if t.get("state") == "scheduled" and _due(t) and t.get("id") not in excl]
     due.sort(key=lambda t: (PRIO_ORDER.get(t.get("priority"), 99),
                             t.get("scheduled_at", ""), t.get("id", "")))
     running = [t for t in reg["tasks"].values() if t.get("state") == "running"]
@@ -509,6 +517,15 @@ def gate_validate(opts, cfg):
             raise GateReject("command_not_whitelisted",
                              "command 不在命令模板白名单(flow workitem …/rx …/bash|python …/scripts/…)。"
                              "确需自由命令请显式 --force 并附 --force-reason。")
+    # 11) 预算门禁(cost-budget-guard §1.2;budget 未启用→bres[0]=False 直接通过;P0 永远放行)
+    #     gate 层主校验 + add_task 锁内二次校验(双保险,防 TOCTOU);fail-closed 不误杀短任务
+    bres = budget_exceeded(cfg)
+    if budget_blocks(exp, pri, bres, cfg):
+        pause_s = int(budget_limits(cfg)["pause_long_task_s"])
+        raise GateReject(
+            "budget_exceeded",
+            f"预算超限({bres[1]})：已用 {bres[2]}≥{bres[3]} CNY，"
+            f"长任务(≥{pause_s}s)暂停入队，P0 可放行")
     # audit.force_reason 由 add_task 统一维护(940 行),gate 不构造 patch(单一来源防分叉)
 
 
@@ -568,6 +585,17 @@ def _env_int(name):
         return None
 
 
+def _env_float(name):
+    """float 版 env 覆盖(cost-budget-guard §2.1);缺失/非数值 → None(对齐 _env_int)。"""
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return None
+    try:
+        return float(raw)
+    except ValueError:
+        return None
+
+
 def load_task_config():
     script_dir = os.path.dirname(os.path.abspath(__file__))
     defaults_path = os.environ.get("COLLABFLOW_DEFAULTS") or os.path.join(
@@ -578,6 +606,9 @@ def load_task_config():
     chain = dict(defaults.get("chain") or {})  # W-B §1.7:追加 chain 块(键缺失由调用方硬编码兜底)
     roles = dict(defaults.get("roles") or {})     # cost-opt-cache-dispatch §1.2:透传 roles/executor
     executor = dict(defaults.get("executor") or {})  # 供 pro 判定与 model 缺省解析(旧消费方只取 task/host/chain)
+    # cost-budget-guard §2.1:budget 段透传(非 dict(如列表/标量)→ 空段 = 不启用,fail-closed E1)
+    _b = defaults.get("budget")
+    budget = dict(_b) if isinstance(_b, dict) else {}
     user_path = os.environ.get("COLLABFLOW_CONFIG") or os.path.expanduser(
         "~/.config/collabflow/config.yaml")
     if os.path.isfile(user_path):
@@ -587,6 +618,8 @@ def load_task_config():
         chain = _merge(chain, dict(user.get("chain") or {}))
         roles = _merge(roles, dict(user.get("roles") or {}))
         executor = _merge(executor, dict(user.get("executor") or {}))
+        _ub = user.get("budget")
+        budget = _merge(budget, dict(_ub) if isinstance(_ub, dict) else {})
     mp = _env_int("FLOW_TASK_MAX_PARALLEL")
     if mp is not None:
         task["max_parallel"] = mp
@@ -632,8 +665,228 @@ def load_task_config():
             task[cfg_key] = v
         elif cfg_key not in task:
             task[cfg_key] = default
+    # cost-budget-guard §2.1:budget env 覆盖(仅 3 个,测试隔离用;非法/缺失 → 不覆盖)
+    _bm = _env_int("FLOW_BUDGET_MONTH_CNY")
+    if _bm is not None:
+        budget["month_cny"] = _bm
+    _bw = _env_int("FLOW_BUDGET_WEEK_CNY")
+    if _bw is not None:
+        budget["week_cny"] = _bw
+    _br = _env_float("FLOW_BUDGET_EXCHANGE_RATE")
+    if _br is not None:
+        budget["exchange_rate"] = _br
     return {"task": task, "host": host, "chain": chain,
-            "roles": roles, "executor": executor}
+            "roles": roles, "executor": executor, "budget": budget}
+
+
+# ---------------------------------------------------------------------------
+# cost-budget-guard:预算门禁模块(design .flow/workitems/cost-budget-guard/design.md §2.2)
+# 纯函数契约 + 告警状态机;全部只读 tasks.json,不改落账逻辑;
+# fail-closed:配置损坏 → 不启用;tasks.json 读不到 → 用量 0;告警失败 → 不阻断主流程。
+# ---------------------------------------------------------------------------
+
+# 预算标量硬编码兜底(§1.4 fail-closed 表;defaults.yaml 键缺失/非法时生效)
+_BUDGET_DEFAULT_RATE = 7.2        # exchange_rate 缺失/非法/≤0 → 7.2
+_BUDGET_DEFAULT_COOLDOWN_H = 24   # alert_cooldown_h 缺失/非法 → 24
+_BUDGET_DEFAULT_PAUSE_S = 600     # pause_long_task_s 缺失/非法 → 600
+
+
+def _budget_num(v, default):
+    """标量归一化(§1.4 fail-closed):None/非数值/NaN/±Inf/负数 → default。
+    0 与正数原样返回(0 是否启用由调用方按周期语义判定)。"""
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return default
+    if math.isnan(f) or math.isinf(f):
+        return default
+    if f < 0:
+        return default
+    return f
+
+
+def budget_limits(cfg):
+    """归一化预算标量(§2.2 契约):{month_cny, week_cny, exchange_rate,
+    alert_cooldown_h, pause_long_task_s};budget 段缺失/非 dict → 全默认(不启用)。"""
+    b = (cfg or {}).get("budget")
+    if not isinstance(b, dict):
+        b = {}
+    rate = _budget_num(b.get("exchange_rate"), _BUDGET_DEFAULT_RATE)
+    if rate <= 0:  # 0/负数按非法回退(E3);_budget_num 已回退负数,此处仅兜 0
+        rate = _BUDGET_DEFAULT_RATE
+    return {
+        "month_cny": _budget_num(b.get("month_cny"), 0.0),
+        "week_cny": _budget_num(b.get("week_cny"), 0.0),
+        "exchange_rate": rate,
+        "alert_cooldown_h": _budget_num(b.get("alert_cooldown_h"), float(_BUDGET_DEFAULT_COOLDOWN_H)),
+        "pause_long_task_s": _budget_num(b.get("pause_long_task_s"), float(_BUDGET_DEFAULT_PAUSE_S)),
+    }
+
+
+def budget_usage(now, cfg):
+    """用量统计(§1.1 口径,只读 tasks.json):返回 (month_used_cny, week_used_cny)。
+    仅 cost_usd 非 None 且 finished_at 合法(带时区)的任务计费;按 Asia/Shanghai 归
+    日历月 + ISO 周(周一起始);tasks.json 缺失/损坏 → (0.0, 0.0) fail-closed 不误杀(E4)。
+    used/limit 均 round(…,2) 后比较,避免浮点累计精度误判(E14)。"""
+    try:
+        reg = load_registry()
+    except (StoreError, OSError, ValueError):
+        return (0.0, 0.0)
+    tasks = reg.get("tasks")
+    if not isinstance(tasks, dict):
+        return (0.0, 0.0)
+    rate = budget_limits(cfg)["exchange_rate"]
+    month_usd = 0.0
+    week_usd = 0.0
+    cn_now = now.astimezone(TZ_CN)
+    now_iso_week = cn_now.isocalendar()[:2]  # (iso_year, iso_week),周一起始
+    for t in tasks.values():
+        if not isinstance(t, dict):
+            continue
+        cost = t.get("cost_usd")
+        if cost is None:               # null 未落账 → 跳过(E5)
+            continue
+        try:
+            c = float(cost)            # 非数值 → 跳过该条(E5)
+        except (TypeError, ValueError):
+            continue
+        ft = t.get("finished_at")
+        if not ft:                     # running/queued 未完成 → 不计(E6)
+            continue
+        try:
+            dt = datetime.fromisoformat(str(ft))
+        except (TypeError, ValueError):
+            continue                   # 非法时间戳 → 跳过(E6)
+        if dt.tzinfo is None:          # naive 无时区 → 无法归月/归周,保守跳过(E6/E15)
+            continue
+        dt = dt.astimezone(TZ_CN)
+        if dt.year == cn_now.year and dt.month == cn_now.month:
+            month_usd += c
+        if dt.isocalendar()[:2] == now_iso_week:
+            week_usd += c
+    return (round(month_usd * rate, 2), round(week_usd * rate, 2))
+
+
+def budget_exceeded(cfg):
+    """超限判定(§1.1):月优先;month_cny/week_cny == 0/缺失/非法 → 该周期不启用。
+    返回 (exceeded, level, used_cny, limit_cny);未超限 → (False, None, 0.0, 0.0)。
+    预算全未启用(月/周均 ≤0)→ 零扫描快速路径,免 tasks.json 全量读(ocr perf)。"""
+    L = budget_limits(cfg)
+    if L["month_cny"] <= 0 and L["week_cny"] <= 0:
+        return (False, None, 0.0, 0.0)
+    month_used, week_used = budget_usage(datetime.now(timezone.utc), cfg)
+    if L["month_cny"] > 0 and month_used >= round(L["month_cny"], 2):
+        return (True, "month", month_used, L["month_cny"])
+    if L["week_cny"] > 0 and week_used >= round(L["week_cny"], 2):
+        return (True, "week", week_used, L["week_cny"])
+    return (False, None, 0.0, 0.0)
+
+
+def budget_blocks(expected_seconds, priority, bres, cfg):
+    """门禁谓词(§1.1,纯函数):超限 且 expected_seconds ≥ pause_long_task_s 且
+    priority != P0 → True(拒绝/暂停);P0 永远放行;expected_seconds 缺失/非数值 → 0(E13)。"""
+    exceeded, _level, _used, _limit = bres
+    if not exceeded:
+        return False
+    if priority == "P0":
+        return False
+    pause_s = budget_limits(cfg)["pause_long_task_s"]
+    try:
+        exp = int(expected_seconds) if expected_seconds is not None else 0
+    except (TypeError, ValueError):
+        exp = 0
+    return exp >= pause_s
+
+
+def pause_long_due(chosen, bres, cfg):
+    """pump 过滤(§1.2 纯函数):超限长任务留在 scheduled(不提升、不删除),
+    短任务/P0 照常提升。返回 (promotable, paused)。"""
+    promotable, paused = [], []
+    for t in chosen or []:
+        if budget_blocks(t.get("expected_seconds"), t.get("priority"), bres, cfg):
+            paused.append(t)
+        else:
+            promotable.append(t)
+    return promotable, paused
+
+
+def _budget_state_path():
+    """告警状态文件(§1.3):task_dir()/budget-alert.json,尊重 FLOW_TASK_DIR 隔离。"""
+    return os.path.join(task_dir(), "budget-alert.json")
+
+
+def _read_budget_state(path):
+    """读告警状态;缺失/损坏/形状非法 → None(E7:视为无历史,下次进入超限重发)。"""
+    if not os.path.isfile(path):
+        return None
+    try:
+        st = json.loads(_fc.read_file(path))
+    except (ValueError, OSError):
+        return None
+    if not isinstance(st, dict):
+        return None
+    return st
+
+
+def _write_budget_state(path, st):
+    """写告警状态;失败静默(E8:告警已发送,状态写失败不阻断主流程)。"""
+    try:
+        _atomic_write_local(path, json.dumps(st, ensure_ascii=False))
+    except OSError:
+        pass
+
+
+def _budget_alert_payload(bres, cfg, now):
+    """告警负载(§1.3):{kind, level, used_cny, limit_cny, usage_ratio(3位),
+    pause_long_task_s, ts}。limit 恒 > 0(超限前提),ratio 安全。"""
+    _exceeded, level, used, limit = bres
+    return {
+        "kind": "budget_alert",
+        "level": level,
+        "used_cny": used,
+        "limit_cny": limit,
+        "usage_ratio": round(float(used) / float(limit), 3) if limit else 0.0,
+        "pause_long_task_s": int(budget_limits(cfg)["pause_long_task_s"]),
+        "ts": now.isoformat(timespec="seconds"),
+    }
+
+
+def should_alert(bres, cfg, state_path, now):
+    """告警判定(§1.3 状态机):返回 (alert_bool, payload_dict|None)。
+    未超限 → (False, None)(调用方负责重置状态,保证下次超限是干净「进入事件」);
+    超限:进入/换 level → 告警;同级且距上次 ≥ alert_cooldown_h → 周期刷新告警;其余静默。"""
+    exceeded, level, _used, _limit = bres
+    if not exceeded:
+        return (False, None)
+    cooldown_s = budget_limits(cfg)["alert_cooldown_h"] * 3600.0
+    prev = _read_budget_state(state_path)
+    if prev is None or prev.get("last_level") != level:
+        return (True, _budget_alert_payload(bres, cfg, now))
+    last_ts = prev.get("last_alert_ts")
+    try:
+        last_dt = datetime.fromisoformat(str(last_ts))
+    except (TypeError, ValueError):
+        return (True, _budget_alert_payload(bres, cfg, now))  # 无有效时间 → 视为首次(E7)
+    if last_dt.tzinfo is None:
+        last_dt = last_dt.replace(tzinfo=timezone.utc)
+    if (now - last_dt).total_seconds() >= cooldown_s:
+        return (True, _budget_alert_payload(bres, cfg, now))
+    return (False, None)
+
+
+def run_budget_alert(cfg):
+    """best-effort 告警编排(§1.2/§1.3):判定 → 进入/换级/冷却刷新经 _pipe_notify
+    (host.notify 通道)→ 写状态文件;任何失败仅 stderr 告警,不抛(调用方再兜一层 try)。"""
+    now = datetime.now(timezone.utc)
+    bres = budget_exceeded(cfg)
+    path = _budget_state_path()
+    alert, payload = should_alert(bres, cfg, path, now)
+    if alert and payload is not None:
+        _pipe_notify(cfg, payload)
+        _write_budget_state(path, {
+            "last_alert_ts": payload["ts"], "last_level": bres[1]})
+    elif not bres[0]:
+        _write_budget_state(path, {"last_alert_ts": None, "last_level": None})
 
 
 # ---------------------------------------------------------------------------
@@ -1313,6 +1566,12 @@ def add_task(cfg, command, workitem=None, priority="P2",
         cap = int((cfg["task"].get("queue_cap") if cfg.get("task") else None) or 50)
         if sum(1 for t in reg["tasks"].values() if t["state"] in NON_TERMINAL) >= cap:
             raise QueueFull(cap)
+        # cost-budget-guard §1.2:锁内二次预算校验(TOCTOU 双保险;CLI 门禁已过,
+        # 程序化直调(如 auto-enqueue/rescue requeue)由本层兜底;budget_blocks 内
+        # expected_seconds=None → 0 放行(E13),P0 放行,剩余超限长任务走 pump 门禁再兜)
+        _bres = budget_exceeded(cfg)
+        if budget_blocks(expected_seconds, priority, _bres, cfg):
+            raise BudgetPaused(_bres[1], _bres[2], _bres[3])
         # 写时自动清理 + 僵尸标记(§5.1/§5.2):同锁内跑,审计事件 best-effort
         pruned = auto_prune(reg, cfg)
         stale = mark_stale_running(reg, cfg)
@@ -1712,6 +1971,11 @@ def cmd_add(args, cfg):
         args, {"command", "workitem", "priority", "expected-seconds", "kind", "workdir",
                "at", "why", "force-reason", "model"})
     json_mode = bool(opts.get("json"))
+    # cost-budget-guard §2.3(4):预算告警 best-effort(失败仅 stderr,不阻断 add)
+    try:
+        run_budget_alert(cfg)
+    except Exception as e:  # noqa: BLE001
+        print(f"告警: budget alert 失败: {e}", file=sys.stderr)
     if pos:
         return fail(2, "add 不接受位置参数", None, json_mode)
     command = opts.get("command")
@@ -1755,6 +2019,12 @@ def cmd_add(args, cfg):
     except QueueFull as e:
         cap = e.args[0] if e.args else 50
         return fail(2, "queue_full", f"队列非终态已达上限 {cap},请先清理/完成后重试", json_mode)
+    except BudgetPaused as e:
+        # cost-budget-guard §1.2:锁内二次校验命中 → fail(2, "budget_exceeded", …)
+        level, used, limit = e.args
+        return fail(2, "budget_exceeded",
+                    f"预算超限({level})：已用 {used}≥{limit} CNY，长任务暂停入队，P0 可放行",
+                    json_mode)
     except UsageError as e:
         return fail(2, str(e), None, json_mode)
     except StoreError as e:
@@ -2002,6 +2272,11 @@ def cmd_pump(args, cfg):
     json_mode = bool(opts.get("json"))
     if pos:
         return fail(2, "pump 不接受位置参数", None, json_mode)
+    # cost-budget-guard §2.3(3):预算告警 best-effort(失败仅 stderr,不阻断 pump)
+    try:
+        run_budget_alert(cfg)
+    except Exception as e:  # noqa: BLE001
+        print(f"告警: budget alert 失败: {e}", file=sys.stderr)
     m = int(cfg["task"].get("max_parallel") or 2)
     lock_fd = _pump_lock_acquire()
     if lock_fd is None:
@@ -2013,15 +2288,39 @@ def cmd_pump(args, cfg):
             def _do():
                 reg = load_registry()
                 reconcile_running(reg)
-                chosen = plan_pump(reg, m, datetime.now(timezone.utc), cfg)
+                # cost-budget-guard §1.2:pump 门禁——超限长任务(非 P0)留在 scheduled,
+                # 不删除、不动 started_at/pid;预算解除后下一轮 pump 自然续跑(满足「不删除」红线)。
+                # 被暂停任务不占空槽(ocr M):exclude_ids 逐轮排除,循环补选直到无暂停或槽满。
+                bres = budget_exceeded(cfg)
+                promotable = []
+                excluded = set()
                 now = _now_ms()
-                for t in chosen:
+                free_slots = max(
+                    m - len([t for t in reg["tasks"].values()
+                             if t.get("state") == "running"]), 0)
+                while True:
+                    chosen = plan_pump(reg, m, datetime.now(timezone.utc), cfg,
+                                       exclude_ids=excluded)
+                    if not chosen:
+                        break
+                    cand, paused = pause_long_due(chosen, bres, cfg)
+                    room = free_slots - len(promotable)   # 剩余槽位,防超 max_parallel
+                    if room <= 0:
+                        break
+                    if len(cand) > room:
+                        cand = cand[:room]                # 超出部分留 scheduled 下轮再试
+                    promotable.extend(cand)
+                    excluded.update(t["id"] for t in cand)   # 已提升不重选
+                    excluded.update(t["id"] for t in paused)  # 已暂停不重选
+                    if not paused or len(promotable) >= free_slots:
+                        break
+                for t in promotable:
                     capture_and_write_snapshot(t)  # W-V1:先拍快照(execute),后写 registry running(E12)
                     t["state"] = "running"
                     t["started_at"] = now
                     t["pid"] = None
                 save_registry_atomic(reg)
-                return [(t["id"], dict(t)) for t in chosen]
+                return [(t["id"], dict(t)) for t in promotable]
 
             promoted = with_registry_flock(_do)
         except (StoreError, OSError) as e:
@@ -2053,6 +2352,36 @@ def cmd_pump(args, cfg):
         emit({"status": "ok", "promoted": [tid for tid, _ in promoted]})
     else:
         print(f"promoted: {len(promoted)}")
+    return 0
+
+
+def cmd_budget(args, cfg):
+    """预算查询(§2.4):打印 月/周用量与限、是否超限、暂停阈值、P0 放行说明。
+    tasks.json 读不到 → 用量 0(fail-closed),仍 exit 0;budget 未启用 → 限 0 不超限。"""
+    pos, opts = scan_args(args, set())
+    json_mode = bool(opts.get("json"))
+    if pos:
+        return fail(2, "budget 不接受位置参数", None, json_mode)
+    L = budget_limits(cfg)
+    month_used, week_used = budget_usage(datetime.now(timezone.utc), cfg)
+    month_ex = L["month_cny"] > 0 and month_used >= round(L["month_cny"], 2)
+    week_ex = L["week_cny"] > 0 and week_used >= round(L["week_cny"], 2)
+    pause_s = int(L["pause_long_task_s"])
+    if json_mode:
+        emit({
+            "status": "ok",
+            "month": {"used_cny": month_used, "limit_cny": L["month_cny"], "exceeded": month_ex},
+            "week": {"used_cny": week_used, "limit_cny": L["week_cny"], "exceeded": week_ex},
+            "overall_exceeded": month_ex or week_ex,
+            "level": "month" if month_ex else ("week" if week_ex else None),
+            "pause_long_task_s": pause_s,
+        })
+    else:
+        print(f"月用量/月限: {month_used} / {L['month_cny']} CNY"
+              + ("(超限)" if month_ex else ""))
+        print(f"周用量/周限: {week_used} / {L['week_cny']} CNY"
+              + ("(超限)" if week_ex else ""))
+        print(f"暂停阈值: ≥{pause_s}s 的非 P0 长任务在超限期间暂停入队/提升;P0 永远放行")
     return 0
 
 
@@ -3563,7 +3892,8 @@ def run_stale_gate(cfg, now=None, scan_roots=None):
 SUBCOMMANDS = {
     "add": cmd_add, "status": cmd_status, "list": cmd_list,
     "log": cmd_log, "run": cmd_run, "reconcile": cmd_reconcile,
-    "pump": cmd_pump, "reschedule": cmd_reschedule, "snapshot": cmd_snapshot,
+    "pump": cmd_pump, "budget": cmd_budget, "reschedule": cmd_reschedule,
+    "snapshot": cmd_snapshot,
     "wake-text": cmd_wake_text, "prune": cmd_prune,
 }
 

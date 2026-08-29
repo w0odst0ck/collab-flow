@@ -119,6 +119,15 @@ chain:                         # chain-on-transition 新增:post-transition 钩�
 # models 段(local-executor 新增):模型注册表,只登记结构,不存真实路径/明文 key;
 # 键名 = 注册表名(resolve_model 解析);本地条目 url/path 均为本机约定占位
 # (127.0.0.1 / ~/.cache/...),真实地址由 user config 覆盖;红线:零个人标识。
+budget:                        # cost-weekly-report + cost-budget-guard 新增(全标量,零个人标识)
+  exchange_rate: 7.2           # USD→CNY 唯一真相源:周报 env COST_EXCHANGE_RATE;guard env FLOW_BUDGET_EXCHANGE_RATE
+  week_start_dow: 0            # 周起始星期(0=周一,Python weekday 口径);env COST_WEEK_START_DOW(仅周报消费)
+  week_timezone: Asia/Shanghai # 周界时区;env COST_WEEK_TZ(仅周报消费)
+  month_cny: 600               # 月预算上限 CNY;0/缺失/非法=该周期不启用(仅 budget-guard 消费)
+  week_cny: 0                  # 周预算上限 CNY;0/缺失/非法=该周期不启用(仅 budget-guard 消费)
+  alert_cooldown_h: 24         # 超限告警冷却(小时);缺失/非法回退 24(仅 budget-guard 消费)
+  pause_long_task_s: 600       # 超限后暂停的长任务阈值(秒);缺失/非法回退 600(仅 budget-guard 消费)
+
 models:                        # 模型注册表
   qwen35-9b:                   # 本地 LLM 主力(GPU,52 tok/s)
     type: llm
