@@ -58,16 +58,16 @@ templates/        # 上下文包/任务书/审查清单模板（去标识，{{ro
 memory/           # ocr 记录/任务书（审计）
 designs/          # dsh 设计输出（本地，不入仓）
 .flow/            # workitem 数据（本地，不入仓；已完成 workitem 归档于 .flow/archive/）
-learning/         # 协作方法论（symlink → 个人笔记区，Obsidian 可读改）
 ```
 
 > **北极星**：`plan/产品核心目标.md` —— 自动化 + 成本核算（降本增效），所有讨论/开发以此为准。
 > **优化路线**：`plan/优化方案-v1.0.md` —— P0/P1/P2 按 ROI 排序，长任务锁 offpeak。
+> **学习仓**：`../learning/collab-flow/`（symlink → D 盘 Obsidian 区，学习笔记/方法论/复盘）
 
 ## 方法论
 
-- [长任务后台化与定时唤醒](learning/长任务后台化与定时唤醒.md) — 防上下文撑满：轮询上限 / 后台模式 / 定时唤醒协议 / 宿主集成示例（配合 flow workitem 的 `--async` / `--check`）
-- [架构测试清单](learning/架构测试清单.md) — 架构验收/回归手工用例（状态机/队列/异步/超时韧性/验证机制/门禁/宿主集成）；**测试用例存档纪律：新能力 → 补用例，技术沉淀**
+- [长任务后台化与定时唤醒](../learning/collab-flow/长任务后台化与定时唤醒.md) — 防上下文撑满：轮询上限 / 后台模式 / 定时唤醒协议 / 宿主集成示例（配合 flow workitem 的 `--async` / `--check`）
+- [架构测试清单](../learning/collab-flow/架构测试清单.md) — 架构验收/回归手工用例（状态机/队列/异步/超时韧性/验证机制/门禁/宿主集成）；**测试用例存档纪律：新能力 → 补用例，技术沉淀**
 
 ## workitem 长设计（后台化，--async / --check）
 

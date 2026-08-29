@@ -22,3 +22,4 @@
 ---
 
 *原始全在 archive/，这里只留"下次不再踩"的。*
+5. **execute 前必须走完 review→translate（状态机门禁，08-24 复盘 + 08-29 重演）**：design 后直接入队 execute 必秒退 exit 2（guard 要求 translated + taskbook.md 非空）。流程：`transition reviewed`（decision pass 前置）→ 生成 taskbook.md → `transition translated` → 才入队 execute。**taskbook 不生成的两个原因**：① design.md 缺「改动文件清单」声明（extract_change_list fail-closed → auto_translate 拒生成）② 章节标题不匹配机械审查正则（`^#+\s*(?:\d+[.、])*\d*\s*(测试策略|测试|测试方案)` 等——中文数字/「单元测试」都不匹配）。先例优先：新流程先翻 `.flow/archive/<同类>/events.jsonl`。失败先看 `flow task status <id> --json` 的 failure_tail，别翻 log。
